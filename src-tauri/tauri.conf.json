@@ -1,0 +1,57 @@
+{
+  "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-config-schema/schema.json",
+  "productName": "Copi",
+  "version": "0.1.0",
+  "identifier": "com.copi.app",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "label": "overlay",
+        "title": "Copi",
+        "width": 680,
+        "height": 520,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "visible": false,
+        "resizable": false,
+        "skipTaskbar": true,
+        "center": true,
+        "acceptFirstMouse": true
+      },
+      {
+        "label": "settings",
+        "title": "Copi Settings",
+        "width": 600,
+        "height": 450,
+        "resizable": false,
+        "visible": false,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": [
+      "resources/models/*"
+    ]
+  }
+}

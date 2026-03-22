@@ -1,0 +1,124 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body {
+  background: transparent !important;
+  overflow: hidden;
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Roboto, sans-serif;
+  font-size: 13px;
+  color: #f5f5f7;
+  user-select: none;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Everything interactive should NOT be draggable */
+input, button, .filter-pill {
+  -webkit-app-region: no-drag;
+}
+
+#root {
+  border-radius: 12px;
+  overflow: hidden;
+  background: transparent;
+  height: 100%;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.35);
+}
+
+/* Overlay open animation */
+@keyframes overlay-open {
+  0% { transform: scale(0.96); opacity: 0; }
+  100% { transform: scale(1); opacity: 1; }
+}
+
+.animate-overlay-open {
+  animation: overlay-open 120ms ease-out forwards;
+}
+
+/* Code block styling */
+.code-preview {
+  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.code-preview pre {
+  margin: 0;
+  padding: 0;
+  background: transparent !important;
+}
+
+/* Filter pill styles */
+.filter-pill {
+  @apply px-2.5 py-0.5 rounded-full text-xs font-medium transition-colors cursor-pointer;
+}
+
+.filter-pill.active {
+  @apply bg-white/20 text-white;
+}
+
+/* Input styling */
+input {
+  caret-color: #60a5fa;
+}
+
+input::placeholder {
+  color: rgba(255, 255, 255, 0.45);
+}
+
+/* Row number hint */
+.row-number {
+  color: rgba(255, 255, 255, 0.25);
+  font-family: 'SF Mono', monospace;
+  font-size: 10px;
+  width: 14px;
+  text-align: right;
+}
+
+/* Temporal badge */
+.temporal-badge {
+  @apply text-[10px] px-1.5 py-0.5 rounded-full;
+  background: rgba(96, 165, 250, 0.15);
+  color: rgba(147, 197, 253, 0.9);
+}
+
+/* Source app badge */
+.source-badge {
+  @apply text-[10px] px-1.5 py-0.5 rounded-full;
+  background: rgba(167, 139, 250, 0.15);
+  color: rgba(196, 181, 253, 0.9);
+}
+
+/* Line clamp (fallback if Tailwind plugin missing) */
+.line-clamp-2 {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-word;
+}

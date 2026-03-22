@@ -1,0 +1,48 @@
+[package]
+name = "copi"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }
+tauri-plugin-global-shortcut = "2"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+rusqlite = { version = "0.31", features = ["bundled"] }
+sqlite-vec = "0.1.7"
+zerocopy = "0.8"
+
+arboard = "3.6"
+sha2 = "0.10"
+hex = "0.4"
+regex = "1"
+png = "0.17"
+chrono = { version = "0.4", features = ["serde"] }
+chrono-english = "0.1"
+
+tokio = { version = "1", features = ["full"] }
+window-vibrancy = "0.6"
+
+ort = { version = "2.0.0-rc.11", features = ["download-binaries"] }
+tokenizers = "0.20"
+
+syntect = "5"
+
+# macOS: NSPanel overlay for fullscreen support (EcoPaste approach)
+[target."cfg(target_os = \"macos\")".dependencies]
+tauri-nspanel = { git = "https://github.com/ahkohd/tauri-nspanel", branch = "v2.1" }
+# Force relax-sign-encoding for macOS 26 Tahoe compatibility
+objc2 = { version = "0.6.1", features = ["relax-sign-encoding"] }
+# OCR via Apple Vision framework
+objc = "0.2"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
