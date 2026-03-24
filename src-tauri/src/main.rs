@@ -1,3 +1,4 @@
+use std::sync::atomic::AtomicU64;
 use std::sync::Mutex;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
@@ -5,6 +6,7 @@ use tauri::{Emitter, Manager};
 use tauri_plugin_global_shortcut::ShortcutState;
 
 mod clipboard;
+mod collections;
 mod db;
 mod embed;
 mod hotkey;
@@ -16,12 +18,15 @@ mod search;
 mod settings;
 
 pub struct AppState {
-    pub db: Mutex<rusqlite::Connection>,
+    pub db_read: Mutex<rusqlite::Connection>,
+    pub db_write: Mutex<rusqlite::Connection>,
     pub model: Option<std::sync::Arc<embed::EmbeddingModel>>,
     pub ocr_engine: Option<Box<dyn ocr::OcrEngine>>,
     pub clip_tx: tokio::sync::mpsc::Sender<i64>,
     pub clipboard_watcher_running: Mutex<bool>,
     pub previous_frontmost_app: Mutex<Option<String>>,
+    pub search_generation: AtomicU64,
+    pub search_status: Mutex<search::SearchStatusPayload>,
 }
 
 pub struct MenuBarState {
@@ -99,8 +104,8 @@ fn main() {
                 handle.plugin(tauri_plugin_autostart::Builder::new().build())?;
             }
 
-            // Initialize database
-            let conn = db::init_db(handle).expect("Failed to initialize database");
+            // Initialize database (dual connections for read/write separation)
+            let db_conns = db::init_db(handle).expect("Failed to initialize database");
 
             // Initialize ONNX model
             let model = embed::init_model(handle);
@@ -125,21 +130,48 @@ fn main() {
             };
 
             app.manage(AppState {
-                db: Mutex::new(conn),
+                db_read: Mutex::new(db_conns.read),
+                db_write: Mutex::new(db_conns.write),
                 model: model_arc.clone(),
                 ocr_engine,
                 clip_tx: clip_tx.clone(),
                 clipboard_watcher_running: Mutex::new(true),
                 previous_frontmost_app: Mutex::new(None),
+                search_generation: AtomicU64::new(0),
+                search_status: Mutex::new(search::SearchStatusPayload {
+                    phase: if model_arc.is_some() { "warming".into() } else { "idle".into() },
+                    queued_items: 0,
+                    completed_items: 0,
+                    total_items: 0,
+                    semantic_ready: model_arc.is_some(),
+                }),
             });
             app.manage(MenuBarState {
                 tray_icon: Mutex::new(None),
             });
 
-            // Backfill embeddings
-            if model_arc.is_some() {
-                embed::backfill_embeddings(handle, &clip_tx);
-            }
+            // Delay heavy historical repair slightly so launch and first search stay responsive.
+            let delayed_handle = handle.clone();
+            let delayed_clip_tx = clip_tx.clone();
+            let delayed_has_model = model_arc.is_some();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                if delayed_has_model {
+                    let _ = embed::backfill_embeddings(&delayed_handle, &delayed_clip_tx).await;
+                }
+            });
+
+            let delayed_handle = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+                clipboard::backfill_language_tags(&delayed_handle).await;
+            });
+
+            let delayed_handle = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(18)).await;
+                clipboard::backfill_image_metadata(&delayed_handle).await;
+            });
 
             // Spawn workers
             let ah = handle.clone();
@@ -209,11 +241,15 @@ fn main() {
             // Tray icon
             let settings_item =
                 MenuItem::with_id(handle, "settings", "Settings\u{2026}", true, None::<&str>)?;
+            let pause_item =
+                MenuItem::with_id(handle, "pause", "Pause Monitoring", true, None::<&str>)?;
             let quit = MenuItem::with_id(handle, "quit", "Quit Copi", true, None::<&str>)?;
             let menu = Menu::with_items(
                 handle,
                 &[
                     &settings_item,
+                    &PredefinedMenuItem::separator(handle)?,
+                    &pause_item,
                     &PredefinedMenuItem::separator(handle)?,
                     &quit,
                 ],
@@ -229,6 +265,16 @@ fn main() {
                             let _ = w.unminimize();
                             let _ = w.show();
                             let _ = w.set_focus();
+                        }
+                    }
+                    "pause" => {
+                        let state = app.state::<AppState>();
+                        let mut running = state.clipboard_watcher_running.lock().unwrap();
+                        *running = !*running;
+                        if *running {
+                            eprintln!("[Tray] Clipboard monitoring resumed");
+                        } else {
+                            eprintln!("[Tray] Clipboard monitoring paused");
                         }
                     }
                     "quit" => app.exit(0),
@@ -261,10 +307,12 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             search::search_clips,
             search::get_total_clip_count,
+            search::get_search_status,
             search::get_image_thumbnail,
             search::get_image_preview,
             search::toggle_pin,
             search::delete_clip,
+            search::update_clip_content,
             clipboard::copy_to_clipboard,
             show_overlay,
             hide_overlay,
@@ -273,6 +321,11 @@ fn main() {
             settings::get_db_size,
             settings::clear_all_history,
             settings::export_history_json,
+            collections::create_collection,
+            collections::delete_collection,
+            collections::rename_collection,
+            collections::list_collections,
+            collections::move_clip_to_collection,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -290,7 +343,7 @@ fn cleanup_old_clips(app: &tauri::AppHandle) {
     }
     let cutoff = chrono::Utc::now().timestamp() - (retention_days * 86400);
     let state = app.state::<AppState>();
-    let Ok(conn) = state.db.try_lock() else {
+    let Ok(conn) = state.db_write.try_lock() else {
         return;
     };
     let Ok(_) = conn.execute(

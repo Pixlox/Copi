@@ -1,13 +1,16 @@
+use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::value::Tensor;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use tokenizers::Tokenizer;
 
 pub struct EmbeddingModel {
     pub session: Mutex<Session>,
     pub tokenizer: Tokenizer,
     pub dimensions: usize,
+    pub query_cache: Mutex<HashMap<String, Vec<f32>>>,
 }
 
 pub fn init_model(app: &tauri::AppHandle) -> Result<Arc<EmbeddingModel>, String> {
@@ -52,8 +55,22 @@ pub fn init_model(app: &tauri::AppHandle) -> Result<Arc<EmbeddingModel>, String>
 
     ort::init().commit();
 
-    let session = Session::builder()
-        .map_err(|e| format!("Session builder failed: {}", e))?
+    let parallelism = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(4);
+    let intra_threads = parallelism.clamp(1, 4);
+    let mut builder = Session::builder().map_err(|e| format!("Session builder failed: {}", e))?;
+    builder = builder
+        .with_optimization_level(GraphOptimizationLevel::Level3)
+        .map_err(|e| format!("Optimization config failed: {}", e))?;
+    builder = builder
+        .with_intra_threads(intra_threads)
+        .map_err(|e| format!("Thread config failed: {}", e))?;
+    builder = builder
+        .with_inter_threads(1)
+        .map_err(|e| format!("Thread config failed: {}", e))?;
+
+    let session = builder
         .commit_from_file(&model_path)
         .map_err(|e| format!("Failed to load model: {}", e))?;
 
@@ -66,6 +83,7 @@ pub fn init_model(app: &tauri::AppHandle) -> Result<Arc<EmbeddingModel>, String>
         session: Mutex::new(session),
         tokenizer,
         dimensions: 768,
+        query_cache: Mutex::new(HashMap::new()),
     }))
 }
 
@@ -119,46 +137,75 @@ pub fn embed_text(model: &EmbeddingModel, text: &str) -> Result<Vec<f32>, String
 }
 
 pub fn embed_query(model: &EmbeddingModel, query: &str) -> Result<Vec<f32>, String> {
-    embed_text(model, query)
+    let key = query.trim().to_lowercase();
+    if key.is_empty() {
+        return Ok(vec![]);
+    }
+
+    if let Ok(cache) = model.query_cache.lock() {
+        if let Some(cached) = cache.get(&key) {
+            return Ok(cached.clone());
+        }
+    }
+
+    let embedding = embed_text(model, query)?;
+    if let Ok(mut cache) = model.query_cache.lock() {
+        if cache.len() > 128 {
+            cache.clear();
+        }
+        cache.insert(key, embedding.clone());
+    }
+    Ok(embedding)
 }
 
-/// Backfill: embed all clips that don't have embeddings yet
-pub fn backfill_embeddings(app: &tauri::AppHandle, clip_tx: &tokio::sync::mpsc::Sender<i64>) {
+fn collect_missing_embedding_ids(app: &tauri::AppHandle) -> Vec<i64> {
     let state = app.state::<crate::AppState>();
-    let conn = match state.db.try_lock() {
+    let conn = match state.db_read.try_lock() {
         Ok(c) => c,
-        Err(_) => return,
+        Err(_) => return vec![],
     };
 
-    let unembedded: Vec<i64> = conn
-        .prepare(
-            "SELECT c.id FROM clips c
-             LEFT JOIN clip_embeddings e ON c.id = e.rowid
-             WHERE e.rowid IS NULL
-               AND (c.content_type != 'image' OR c.ocr_text IS NOT NULL)
-               AND (c.content != '' OR c.ocr_text IS NOT NULL)
-             ORDER BY c.created_at DESC
-             LIMIT 500",
-        )
-        .ok()
-        .map(|mut stmt| {
-            stmt.query_map([], |row| row.get(0))
-                .map(|rows| rows.filter_map(|r| r.ok()).collect::<Vec<i64>>())
-                .unwrap_or_default()
-        })
+    conn.prepare(
+        "SELECT c.id FROM clips c
+         LEFT JOIN clip_embeddings e ON c.id = e.rowid
+         WHERE e.rowid IS NULL
+           AND (c.content_type != 'image' OR c.ocr_text IS NOT NULL)
+           AND (c.content != '' OR c.ocr_text IS NOT NULL)
+         ORDER BY c.created_at DESC",
+    )
+    .ok()
+    .map(|mut stmt| {
+        stmt.query_map([], |row| row.get(0))
+            .map(|rows| rows.filter_map(|r| r.ok()).collect::<Vec<i64>>())
+            .unwrap_or_default()
+    })
+    .unwrap_or_default()
+}
+
+/// Backfill: enqueue all clips that don't have embeddings yet.
+pub async fn backfill_embeddings(
+    app: &tauri::AppHandle,
+    clip_tx: &tokio::sync::mpsc::Sender<i64>,
+) -> usize {
+    let app_handle = app.clone();
+    let unembedded = tokio::task::spawn_blocking(move || collect_missing_embedding_ids(&app_handle))
+        .await
         .unwrap_or_default();
 
-    if !unembedded.is_empty() {
-        eprintln!(
-            "[Embed] Backfilling {} clips without embeddings",
-            unembedded.len()
-        );
+    let total = unembedded.len();
+    if total > 0 {
+        eprintln!("[Embed] Queuing {} clips without embeddings", total);
+        update_search_status(app, "backfill_embeddings", total, 0, total, false);
         for id in unembedded {
-            let _ = clip_tx.try_send(id);
+            if clip_tx.send(id).await.is_err() {
+                break;
+            }
         }
     } else {
         eprintln!("[Embed] All clips already embedded");
+        update_search_status(app, "idle", 0, 0, 0, true);
     }
+    total
 }
 
 pub async fn embedding_worker(
@@ -175,62 +222,110 @@ pub async fn embedding_worker(
         }
     };
 
+    // Process clips sequentially — each on a blocking thread to not starve the async runtime
     while let Some(clip_id) = rx.recv().await {
-        // Fetch content — for images, use OCR text instead of "[Image]"
-        let content: Option<String> = {
-            let state = app.state::<crate::AppState>();
-            let conn = match state.db.lock() {
-                Ok(c) => c,
-                Err(_) => continue,
+        let model = model.clone();
+        let app = app.clone();
+
+        // Use spawn_blocking so we don't block the async runtime during 17s inference
+        let handle = tokio::task::spawn_blocking(move || {
+            // 1. Read content (uses read connection)
+            let content: Option<String> = {
+                let state = app.state::<crate::AppState>();
+                let conn = match state.db_read.lock() {
+                    Ok(c) => c,
+                    Err(_) => return,
+                };
+                conn.query_row(
+                    "SELECT content, ocr_text FROM clips WHERE id = ?",
+                    [clip_id],
+                    |row| {
+                        let content: String = row.get(0).unwrap_or_default();
+                        let ocr_text: Option<String> = row.get(1).unwrap_or(None);
+                        if content == "[Image]" || content.is_empty() {
+                            Ok(ocr_text)
+                        } else {
+                            Ok(Some(content))
+                        }
+                    },
+                )
+                .unwrap_or(None)
             };
-            conn.query_row(
-                "SELECT content, ocr_text FROM clips WHERE id = ?",
-                [clip_id],
-                |row| {
-                    let content: String = row.get(0).unwrap_or_default();
-                    let ocr_text: Option<String> = row.get(1).unwrap_or(None);
-                    // For images, prefer OCR text. For non-images, use content directly.
-                    if content == "[Image]" {
-                        Ok(ocr_text)
-                    } else if content.is_empty() {
-                        Ok(ocr_text)
-                    } else {
-                        Ok(Some(content))
-                    }
-                },
-            )
-            .unwrap_or(None)
-        };
+            // DB lock released here
 
-        let content = match content {
-            Some(c) if !c.is_empty() => c,
-            _ => continue,
-        };
+            let content = match content {
+                Some(c) if !c.is_empty() => c,
+                _ => return,
+            };
 
-        match embed_text(&model, &content) {
-            Ok(embedding) => {
-                if embedding.len() != 768 {
-                    eprintln!("[Embed] Wrong dims: {} (expected 768)", embedding.len());
-                    continue;
-                }
+            // 2. Embed (NO DB lock held — runs on blocking thread)
+            let embedding = match embed_text(&model, &content) {
+                Ok(e) if e.len() == 768 => e,
+                Ok(e) => { eprintln!("[Embed] Wrong dims: {} (expected 768)", e.len()); return; }
+                Err(e) => { eprintln!("[Embed] Failed clip {}: {}", clip_id, e); return; }
+            };
 
-                let vec_bytes: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+            let vec_bytes: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
 
-                {
+            // 3. Write embedding (uses write connection)
+            {
+                let state = app.state::<crate::AppState>();
+                let conn = match state.db_write.lock() {
+                    Ok(c) => c,
+                    Err(_) => { eprintln!("[Embed] Write lock failed clip {}", clip_id); return; }
+                };
+                let _ = conn.execute("DELETE FROM clip_embeddings WHERE rowid = ?", [clip_id]);
+                if let Err(e) = conn.execute(
+                    "INSERT INTO clip_embeddings(rowid, embedding) VALUES (?1, ?2)",
+                    rusqlite::params![clip_id, vec_bytes],
+                ) {
+                    eprintln!("[Embed] Store failed clip {}: {}", clip_id, e);
+                } else {
                     let state = app.state::<crate::AppState>();
-                    let conn = match state.db.try_lock() {
-                        Ok(c) => c,
-                        Err(_) => continue,
+                    match state.search_status.lock() {
+                        Ok(mut status) => {
+                            if status.phase == "backfill_embeddings" && status.total_items > 0 {
+                                status.completed_items =
+                                    (status.completed_items + 1).min(status.total_items);
+                                status.queued_items =
+                                    status.total_items.saturating_sub(status.completed_items);
+                                if status.completed_items >= status.total_items {
+                                    status.phase = "idle".to_string();
+                                    status.semantic_ready = true;
+                                }
+                                let _ = app.emit("search-status-updated", status.clone());
+                            }
+                        }
+                        Err(_) => {}
                     };
-                    if let Err(e) = conn.execute(
-                        "INSERT OR REPLACE INTO clip_embeddings(rowid, embedding) VALUES (?1, ?2)",
-                        rusqlite::params![clip_id, vec_bytes],
-                    ) {
-                        eprintln!("[Embed] Store failed clip {}: {}", clip_id, e);
-                    }
                 }
             }
-            Err(e) => eprintln!("[Embed] Failed clip {}: {}", clip_id, e),
-        }
+        });
+
+        // Wait for this clip to finish before processing the next one
+        // This prevents multiple 17-second inferences from running concurrently
+        let _ = handle.await;
     }
+}
+
+fn update_search_status(
+    app: &tauri::AppHandle,
+    phase: &str,
+    queued_items: usize,
+    completed_items: usize,
+    total_items: usize,
+    semantic_ready: bool,
+) {
+    let state = app.state::<crate::AppState>();
+    match state.search_status.lock() {
+        Ok(mut status) => {
+            status.phase = phase.to_string();
+            status.queued_items = queued_items;
+            status.completed_items = completed_items;
+            status.total_items = total_items;
+            status.semantic_ready = semantic_ready;
+            let _ = app.emit("search-status-updated", status.clone());
+        }
+        Err(_) => {}
+    };
 }

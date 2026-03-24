@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, useEffect } from "react";
+import { useState, useCallback, useMemo, useRef, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useSearch, FilterType } from "../hooks/useSearch";
@@ -7,6 +7,8 @@ import ActionsSheet, { buildSheetActions } from "./ActionsSheet";
 import SearchBar from "./SearchBar";
 import ResultsList from "./ResultsList";
 import StatusBar from "./StatusBar";
+import CollectionSidebar from "./CollectionSidebar";
+import DetailPanel from "./DetailPanel";
 
 const FILTERS: FilterType[] = ["all", "text", "url", "code", "image", "pinned"];
 
@@ -18,6 +20,11 @@ function Overlay() {
     setActiveFilter,
     results,
     totalCount,
+    collectionId,
+    setCollectionId,
+    collections,
+    searchStatus,
+    fetchCollections,
     optimisticDelete,
     optimisticTogglePin,
   } = useSearch();
@@ -25,6 +32,8 @@ function Overlay() {
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [actionsOpen, setActionsOpen] = useState(false);
   const [selectedActionIndex, setSelectedActionIndex] = useState(0);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [detailOpen, setDetailOpen] = useState(false);
 
   // Drag tracking state
   const dragStart = useRef<{ x: number; y: number } | null>(null);
@@ -116,9 +125,69 @@ function Overlay() {
     [actionsOpen, results.length, selectedIndex]
   );
 
+  const handleEdit = useCallback(
+    async (clipId: number, newContent: string) => {
+      try {
+        await invoke("update_clip_content", { clipId, newContent });
+      } catch (error) {
+        console.error("Edit failed:", error);
+      }
+    },
+    []
+  );
+
+  const handleCreateCollection = useCallback(
+    async (name: string, color: string) => {
+      try {
+        await invoke("create_collection", { name, color });
+        await fetchCollections();
+      } catch (error) {
+        console.error("Create collection failed:", error);
+      }
+    },
+    [fetchCollections]
+  );
+
+  const handleRenameCollection = useCallback(
+    async (id: number, name: string) => {
+      try {
+        await invoke("rename_collection", { id, name });
+        await fetchCollections();
+      } catch (error) {
+        console.error("Rename collection failed:", error);
+      }
+    },
+    [fetchCollections]
+  );
+
+  const handleDeleteCollection = useCallback(
+    async (id: number) => {
+      try {
+        await invoke("delete_collection", { id });
+        await fetchCollections();
+        if (collectionId === id) {
+          setCollectionId(null);
+        }
+      } catch (error) {
+        console.error("Delete collection failed:", error);
+      }
+    },
+    [fetchCollections, collectionId, setCollectionId]
+  );
+
   const selectedResult =
     selectedIndex >= 0 && selectedIndex < results.length ? results[selectedIndex] : null;
-  const actions = selectedResult ? buildSheetActions(selectedResult) : [];
+  const actions = useMemo(
+    () => (selectedResult ? buildSheetActions(selectedResult) : []),
+    [selectedResult?.id, selectedResult?.pinned]
+  );
+
+  // Show detail panel when a clip is selected
+  useEffect(() => {
+    if (selectedResult) {
+      setDetailOpen(true);
+    }
+  }, [selectedResult?.id]);
 
   const triggerAction = useCallback(
     (actionIndex: number) => {
@@ -171,7 +240,8 @@ function Overlay() {
   useEffect(() => {
     setActionsOpen(false);
     setSelectedActionIndex(0);
-  }, [activeFilter, query]);
+    // Don't close detail panel on query change — only on filter change
+  }, [activeFilter]);
 
   const toggleActions = useCallback(() => {
     if (!selectedResult) return;
@@ -179,10 +249,9 @@ function Overlay() {
     setActionsOpen((open) => !open);
   }, [selectedResult]);
 
-  // Drag handlers — track mouse movement and start drag after 3px threshold
+  // Drag handlers
   const onMouseDown = useCallback((e: React.MouseEvent) => {
     const target = e.target as HTMLElement;
-    // Don't start drag on result rows or explicit no-drag elements
     if (target.closest("[data-no-drag]") || e.button !== 0) return;
     dragStart.current = { x: e.clientX, y: e.clientY };
     isDragging.current = false;
@@ -205,52 +274,100 @@ function Overlay() {
 
   return (
     <div
-      className="relative flex h-full min-h-0 flex-col overflow-hidden rounded-2xl border shadow-2xl animate-overlay-open"
+      className="relative flex h-full min-h-0 overflow-hidden rounded-2xl border shadow-2xl animate-overlay-open"
       style={{ background: "var(--overlay-bg)", borderColor: "var(--overlay-border)" }}
       onMouseDown={onMouseDown}
       onMouseMove={onMouseMove}
       onMouseUp={onMouseUp}
     >
-      <SearchBar
-        query={query}
-        onQueryChange={(q) => {
-          setQuery(q);
-          setSelectedIndex(0);
-          setActionsOpen(false);
-        }}
-        activeFilter={activeFilter}
-        onFilterChange={(f) => {
-          setActiveFilter(f);
-          setSelectedIndex(0);
-          setActionsOpen(false);
-        }}
-      />
+      {/* Sidebar */}
+      {sidebarOpen && (
+        <div className="w-[160px] shrink-0">
+          <CollectionSidebar
+            collections={collections}
+            selectedId={collectionId}
+            onSelect={(id) => {
+              setCollectionId(id);
+              setSelectedIndex(0);
+              setActionsOpen(false);
+            }}
+            onCreate={handleCreateCollection}
+            onRename={handleRenameCollection}
+            onDelete={handleDeleteCollection}
+          />
+        </div>
+      )}
 
-      <ResultsList
-        results={results}
-        selectedIndex={selectedIndex}
-        totalCount={totalCount}
-        onSelect={setSelectedIndex}
-        onCopy={handleCopy}
-      />
+      {/* Main content */}
+      <div className="flex min-w-0 flex-1 flex-col">
+        <SearchBar
+          query={query}
+          onQueryChange={(q) => {
+            setQuery(q);
+            setSelectedIndex(0);
+            setActionsOpen(false);
+          }}
+          activeFilter={activeFilter}
+          onFilterChange={(f) => {
+            setActiveFilter(f);
+            setSelectedIndex(0);
+            setActionsOpen(false);
+          }}
+          sidebarOpen={sidebarOpen}
+          onToggleSidebar={() => setSidebarOpen((o) => !o)}
+        />
+
+        <ResultsList
+          results={results}
+          selectedIndex={selectedIndex}
+          totalCount={totalCount}
+          onSelect={setSelectedIndex}
+          onCopy={handleCopy}
+        />
 
       <StatusBar
         totalCount={totalCount}
         query={query}
+        searchStatus={searchStatus}
         actionsOpen={actionsOpen}
         canOpenActions={!!selectedResult}
         onToggleActions={toggleActions}
-      />
+        />
 
       {actionsOpen && selectedResult && (
         <ActionsSheet
           clip={selectedResult}
           actions={actions}
           selectedIndex={selectedActionIndex}
+          collections={collections}
           onClose={() => setActionsOpen(false)}
           onSelect={setSelectedActionIndex}
           onActivate={(actionIndex) => triggerAction(actionIndex)}
+          onTransform={(_clipId, transformedContent) => {
+            void invoke("copy_to_clipboard", { clipId: selectedResult.id }).then(() => {
+              // Copy transformed content directly to clipboard instead
+              navigator.clipboard.writeText(transformedContent);
+            });
+          }}
+          onMoveToCollection={(clipId, collectionId) => {
+            void invoke("move_clip_to_collection", { clipId, collectionId });
+          }}
         />
+      )}
+      </div>
+
+      {/* Detail panel */}
+      {detailOpen && selectedResult && (
+        <div className="w-[280px] shrink-0">
+          <DetailPanel
+            clip={selectedResult}
+            onClose={() => setDetailOpen(false)}
+            onEdit={handleEdit}
+            onCopy={(clipId) => {
+              void invoke("copy_to_clipboard", { clipId });
+            }}
+          />
+        </div>
       )}
     </div>
   );

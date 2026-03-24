@@ -9,6 +9,12 @@ use crate::{
     AppState,
 };
 
+struct ClipboardImagePayload {
+    width: usize,
+    height: usize,
+    bytes: Vec<u8>,
+}
+
 pub async fn watch_clipboard(app: &tauri::AppHandle) {
     let mut clipboard = match Clipboard::new() {
         Ok(c) => c,
@@ -56,21 +62,7 @@ pub async fn watch_clipboard(app: &tauri::AppHandle) {
                     continue;
                 }
 
-                let content_type = detect_content_type(&text, None);
-                let highlighted = if content_type == "code" {
-                    Some(highlight_code(&text))
-                } else {
-                    None
-                };
-
-                insert_clip(
-                    app,
-                    &text,
-                    &hash,
-                    &content_type,
-                    &source_app,
-                    highlighted.as_deref(),
-                );
+                queue_text_capture(app, text, hash, source_app.clone());
             }
         }
 
@@ -90,44 +82,12 @@ pub async fn watch_clipboard(app: &tauri::AppHandle) {
                         return;
                     }
                     last_image_hash = hash.clone();
-
-                    let thumbnail = image_to_thumbnail(&image_data);
-
-                    // Run OCR on the image
-                    let ocr_text = {
-                        let state = app.state::<AppState>();
-                        if let Some(ref ocr) = state.ocr_engine {
-                            match ocr.recognize_text(
-                                pixels,
-                                image_data.width as u32,
-                                image_data.height as u32,
-                            ) {
-                                Ok(text) if !text.trim().is_empty() => {
-                                    eprintln!("[OCR] Recognized {} chars", text.len());
-                                    Some(text)
-                                }
-                                Ok(_) => {
-                                    eprintln!("[OCR] No text found in image");
-                                    None
-                                }
-                                Err(e) => {
-                                    eprintln!("[OCR] Failed: {}", e);
-                                    None
-                                }
-                            }
-                        } else {
-                            None
-                        }
+                    let payload = ClipboardImagePayload {
+                        width: image_data.width,
+                        height: image_data.height,
+                        bytes: pixels.to_vec(),
                     };
-
-                    insert_image_clip(
-                        app,
-                        &image_data,
-                        thumbnail.as_deref(),
-                        &hash,
-                        &source_app,
-                        ocr_text.as_deref(),
-                    );
+                    queue_image_capture(app, payload, hash, source_app.clone());
                 }
                 Err(_) => {} // No image on clipboard — normal
             }
@@ -142,14 +102,132 @@ pub async fn watch_clipboard(app: &tauri::AppHandle) {
             eprintln!("[Image] Processing failed: {}", msg);
         }
 
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(140)).await;
+    }
+}
+
+pub async fn backfill_image_metadata(app: &tauri::AppHandle) {
+    loop {
+        let app_handle = app.clone();
+        let repair_ids = tokio::task::spawn_blocking(move || {
+            let state = app_handle.state::<AppState>();
+            let conn = match state.db_read.try_lock() {
+                Ok(conn) => conn,
+                Err(_) => return vec![],
+            };
+            conn.prepare(
+                "SELECT id
+                 FROM clips
+                 WHERE content_type = 'image'
+                   AND (
+                     ocr_text IS NULL OR TRIM(ocr_text) = ''
+                     OR image_thumbnail IS NULL OR length(image_thumbnail) = 0
+                   )
+                 ORDER BY created_at DESC
+                 LIMIT 24",
+            )
+            .ok()
+            .map(|mut stmt| {
+                stmt.query_map([], |row| row.get(0))
+                    .map(|rows| rows.filter_map(|row| row.ok()).collect::<Vec<i64>>())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default();
+
+        if repair_ids.is_empty() {
+            break;
+        }
+
+        for clip_id in repair_ids {
+            let app_for_task = app.clone();
+            let _ = tokio::task::spawn_blocking(move || repair_image_clip(&app_for_task, clip_id)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        }
+        let _ = app.emit("clips-changed", ());
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    }
+}
+
+pub async fn backfill_language_tags(app: &tauri::AppHandle) {
+    loop {
+        let app_handle = app.clone();
+        let updated = tokio::task::spawn_blocking(move || {
+            let state = app_handle.state::<AppState>();
+            let rows: Vec<(i64, String)> = {
+                let conn = match state.db_read.lock() {
+                    Ok(conn) => conn,
+                    Err(_) => return 0_usize,
+                };
+                conn.prepare(
+                    "SELECT id,
+                            CASE
+                              WHEN content_type = 'image' THEN COALESCE(ocr_text, '')
+                              ELSE content
+                            END AS language_source
+                     FROM clips
+                     WHERE language IS NULL OR TRIM(language) = ''
+                     ORDER BY created_at DESC
+                     LIMIT 250",
+                )
+                .ok()
+                .map(|mut stmt| {
+                    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                        .map(|rows| rows.filter_map(|row| row.ok()).collect::<Vec<_>>())
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default()
+            };
+
+            let updates: Vec<(i64, &'static str)> = rows
+                .into_iter()
+                .filter_map(|(id, text)| {
+                    crate::query_parser::detect_language(&text).map(|lang| (id, lang))
+                })
+                .collect();
+
+            if updates.is_empty() {
+                return 0_usize;
+            }
+
+            let conn = match state.db_write.lock() {
+                Ok(conn) => conn,
+                Err(_) => return 0_usize,
+            };
+            let mut applied = 0;
+            for (clip_id, language) in updates {
+                if conn
+                    .execute(
+                        "UPDATE clips SET language = ?1 WHERE id = ?2 AND (language IS NULL OR TRIM(language) = '')",
+                        rusqlite::params![language, clip_id],
+                    )
+                    .ok()
+                    .unwrap_or(0)
+                    > 0
+                {
+                    applied += 1;
+                }
+            }
+            applied
+        })
+        .await
+        .unwrap_or(0);
+
+        if updated == 0 {
+            break;
+        }
+
+        let _ = app.emit("clips-changed", ());
+        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
     }
 }
 
 #[tauri::command]
 pub async fn copy_to_clipboard(app: tauri::AppHandle, clip_id: i64) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db_write.lock().map_err(|e| e.to_string())?;
 
     let content_type: String = conn
         .query_row(
@@ -158,6 +236,12 @@ pub async fn copy_to_clipboard(app: tauri::AppHandle, clip_id: i64) -> Result<()
             |row| row.get(0),
         )
         .map_err(|e| e.to_string())?;
+
+    // Increment copy count
+    let _ = conn.execute(
+        "UPDATE clips SET copy_count = COALESCE(copy_count, 0) + 1 WHERE id = ?",
+        [clip_id],
+    );
 
     let mut clipboard = Clipboard::new().map_err(|e| e.to_string())?;
 
@@ -196,6 +280,7 @@ pub async fn copy_to_clipboard(app: tauri::AppHandle, clip_id: i64) -> Result<()
         clipboard.set_text(&content).map_err(|e| e.to_string())?;
     }
 
+    let _ = app.emit("clips-changed", ());
     Ok(())
 }
 
@@ -211,6 +296,153 @@ fn compute_hash_bytes(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
     format!("{:x}", hasher.finalize())
+}
+
+fn queue_text_capture(app: &tauri::AppHandle, text: String, hash: String, source_app: FrontmostApp) {
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = tokio::task::spawn_blocking(move || process_text_capture(&app_handle, text, hash, source_app)).await;
+    });
+}
+
+fn process_text_capture(app: &tauri::AppHandle, text: String, hash: String, source_app: FrontmostApp) {
+    let content_type = detect_content_type(&text, None);
+    let highlighted = if content_type == "code" {
+        Some(highlight_code(&text))
+    } else {
+        None
+    };
+    let language = crate::query_parser::detect_language(&text);
+
+    insert_clip(
+        app,
+        &text,
+        &hash,
+        &content_type,
+        &source_app,
+        highlighted.as_deref(),
+        language,
+    );
+}
+
+fn queue_image_capture(
+    app: &tauri::AppHandle,
+    payload: ClipboardImagePayload,
+    hash: String,
+    source_app: FrontmostApp,
+) {
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = tokio::task::spawn_blocking(move || process_image_capture(&app_handle, payload, hash, source_app)).await;
+    });
+}
+
+fn process_image_capture(
+    app: &tauri::AppHandle,
+    payload: ClipboardImagePayload,
+    hash: String,
+    source_app: FrontmostApp,
+) {
+    let image = ImageData {
+        width: payload.width,
+        height: payload.height,
+        bytes: Cow::Owned(payload.bytes),
+    };
+    let thumbnail = image_to_thumbnail(&image);
+    let ocr_text = run_ocr(app, image.bytes.as_ref(), image.width as u32, image.height as u32);
+    let language = ocr_text
+        .as_ref()
+        .and_then(|text| crate::query_parser::detect_language(text));
+
+    insert_image_clip(
+        app,
+        &image,
+        thumbnail.as_deref(),
+        &hash,
+        &source_app,
+        ocr_text.as_deref(),
+        language,
+    );
+}
+
+fn repair_image_clip(app: &tauri::AppHandle, clip_id: i64) {
+    let state = app.state::<AppState>();
+    let (bytes, width, height, existing_ocr, has_thumbnail): (Vec<u8>, i64, i64, Option<String>, bool) = {
+        let conn = match state.db_read.lock() {
+            Ok(conn) => conn,
+            Err(_) => return,
+        };
+        match conn.query_row(
+            "SELECT image_data, image_width, image_height, ocr_text, length(COALESCE(image_thumbnail, X'')) > 0
+             FROM clips
+             WHERE id = ? AND content_type = 'image'",
+            [clip_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        ) {
+            Ok(data) => data,
+            Err(_) => return,
+        }
+    };
+
+    if bytes.is_empty() || width <= 0 || height <= 0 {
+        return;
+    }
+
+    let image = ImageData {
+        width: width as usize,
+        height: height as usize,
+        bytes: Cow::Owned(bytes),
+    };
+    let thumbnail = if has_thumbnail {
+        None
+    } else {
+        image_to_thumbnail(&image)
+    };
+    let ocr_text = if existing_ocr.as_deref().is_some_and(|text| !text.trim().is_empty()) {
+        existing_ocr.clone()
+    } else {
+        run_ocr(app, image.bytes.as_ref(), width as u32, height as u32)
+    };
+    let language = ocr_text.as_ref().and_then(|text| crate::query_parser::detect_language(text));
+
+    let conn = match state.db_write.lock() {
+        Ok(conn) => conn,
+        Err(_) => return,
+    };
+    let ocr_for_db = ocr_text.as_deref().filter(|text| !text.trim().is_empty());
+    let thumb_bytes = thumbnail.as_deref().unwrap_or(&[]);
+    if conn
+        .execute(
+            "UPDATE clips
+             SET ocr_text = COALESCE(?1, ocr_text),
+                 language = COALESCE(?2, language),
+                 image_thumbnail = CASE
+                     WHEN length(COALESCE(image_thumbnail, X'')) = 0 AND length(?3) > 0 THEN ?3
+                     ELSE image_thumbnail
+                 END
+             WHERE id = ?4",
+            rusqlite::params![ocr_for_db, language, thumb_bytes, clip_id],
+        )
+        .is_ok()
+    {
+        drop(conn);
+        if ocr_for_db.is_some() {
+            let _ = state.clip_tx.try_send(clip_id);
+        }
+    }
+}
+
+fn run_ocr(app: &tauri::AppHandle, bytes: &[u8], width: u32, height: u32) -> Option<String> {
+    let state = app.state::<AppState>();
+    let ocr = state.ocr_engine.as_ref()?;
+    match ocr.recognize_text(bytes, width, height) {
+        Ok(text) if !text.trim().is_empty() => Some(text),
+        Ok(_) => None,
+        Err(error) => {
+            eprintln!("[OCR] Failed: {}", error);
+            None
+        }
+    }
 }
 
 fn detect_content_type(content: &str, _source_app: Option<&str>) -> String {
@@ -275,6 +507,7 @@ fn insert_clip(
     content_type: &str,
     source_app: &FrontmostApp,
     highlighted: Option<&str>,
+    language: Option<&str>,
 ) {
     let state = app.state::<AppState>();
     let now = SystemTime::now()
@@ -293,11 +526,12 @@ fn insert_clip(
     };
 
     let icon = fetch_app_icon(&state, source_app);
-    let conn = state.db.lock().unwrap();
+    let _hold = std::time::Instant::now();
+    let conn = state.db_write.lock().unwrap();
 
     let result = conn.execute(
-        "INSERT INTO clips (content, content_hash, content_type, source_app, source_app_icon, content_highlighted, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "INSERT INTO clips (content, content_hash, content_type, source_app, source_app_icon, content_highlighted, language, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          ON CONFLICT(content_hash) DO UPDATE SET
             source_app = CASE
                 WHEN excluded.source_app <> '' THEN excluded.source_app
@@ -309,7 +543,7 @@ fn insert_clip(
             END,
             content_highlighted = COALESCE(excluded.content_highlighted, clips.content_highlighted),
             created_at = excluded.created_at",
-        rusqlite::params![capped, hash, content_type, source_app.name, icon, highlighted, now],
+        rusqlite::params![capped, hash, content_type, source_app.name, icon, highlighted, language, now],
     );
 
     if result.is_ok() {
@@ -335,6 +569,7 @@ fn insert_image_clip(
     hash: &str,
     source_app: &FrontmostApp,
     ocr_text: Option<&str>,
+    language: Option<&str>,
 ) {
     let state = app.state::<AppState>();
     let now = SystemTime::now()
@@ -349,10 +584,11 @@ fn insert_image_clip(
 
     let icon = fetch_app_icon(&state, source_app);
 
-    let conn = state.db.lock().unwrap();
+    let _hold = std::time::Instant::now();
+    let conn = state.db_write.lock().unwrap();
     let result = conn.execute(
-        "INSERT INTO clips (content, content_hash, content_type, source_app, source_app_icon, ocr_text, image_data, image_thumbnail, image_width, image_height, created_at)
-         VALUES ('[Image]', ?1, 'image', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "INSERT INTO clips (content, content_hash, content_type, source_app, source_app_icon, ocr_text, language, image_data, image_thumbnail, image_width, image_height, created_at)
+         VALUES ('[Image]', ?1, 'image', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT(content_hash) DO UPDATE SET
             source_app = CASE
                 WHEN excluded.source_app <> '' THEN excluded.source_app
@@ -363,6 +599,7 @@ fn insert_image_clip(
                 ELSE clips.source_app_icon
             END,
             ocr_text = COALESCE(excluded.ocr_text, clips.ocr_text),
+            language = COALESCE(excluded.language, clips.language),
             image_data = COALESCE(excluded.image_data, clips.image_data),
             image_thumbnail = CASE
                 WHEN length(excluded.image_thumbnail) > 0 THEN excluded.image_thumbnail
@@ -377,7 +614,7 @@ fn insert_image_clip(
                 ELSE clips.image_height
             END,
             created_at = excluded.created_at",
-        rusqlite::params![hash, source_app.name, icon, ocr_text, raw_bytes, thumb, width, height, now],
+        rusqlite::params![hash, source_app.name, icon, ocr_text, language, raw_bytes, thumb, width, height, now],
     );
 
     if result.is_ok() {

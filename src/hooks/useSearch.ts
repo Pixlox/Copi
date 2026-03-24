@@ -1,4 +1,4 @@
-import { startTransition, useState, useCallback, useEffect, useRef } from "react";
+import { useState, useCallback, useEffect, useRef, useDeferredValue } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
@@ -13,25 +13,57 @@ export interface ClipResult {
   content_highlighted: string | null;
   ocr_text: string | null;
   image_thumbnail: string | null;
+  copy_count: number;
+}
+
+export interface CollectionInfo {
+  id: number;
+  name: string;
+  color: string;
+  clip_count: number;
+  created_at: number;
+}
+
+export interface SearchStatus {
+  phase: string;
+  queuedItems: number;
+  completedItems: number;
+  totalItems: number;
+  semanticReady: boolean;
+}
+
+interface SearchUpdatedEvent {
+  query: string;
+  filter: FilterType;
+  collectionId: number | null;
+  results: ClipResult[];
 }
 
 export type FilterType = "all" | "text" | "url" | "code" | "image" | "pinned";
 
 export function useSearch() {
   const [query, setQuery] = useState("");
+  const deferredQuery = useDeferredValue(query);
   const [activeFilter, setActiveFilter] = useState<FilterType>("all");
   const [results, setResults] = useState<ClipResult[]>([]);
-  const [isSearching, setIsSearching] = useState(false);
   const [totalCount, setTotalCount] = useState(0);
+  const [collectionId, setCollectionId] = useState<number | null>(null);
+  const [collections, setCollections] = useState<CollectionInfo[]>([]);
+  const [searchStatus, setSearchStatus] = useState<SearchStatus>({
+    phase: "idle",
+    queuedItems: 0,
+    completedItems: 0,
+    totalItems: 0,
+    semanticReady: false,
+  });
   const requestIdRef = useRef(0);
   const resultsRef = useRef<ClipResult[]>([]);
   const totalCountRef = useRef(0);
+  const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const applyResults = useCallback((nextResults: ClipResult[]) => {
     resultsRef.current = nextResults;
-    startTransition(() => {
-      setResults(nextResults);
-    });
+    setResults(nextResults);
   }, []);
 
   const applyTotalCount = useCallback((nextTotalCount: number) => {
@@ -39,36 +71,28 @@ export function useSearch() {
     setTotalCount(nextTotalCount);
   }, []);
 
-  useEffect(() => {
-    resultsRef.current = results;
-  }, [results]);
+  const fetchCollections = useCallback(async () => {
+    try {
+      const cols = await invoke<CollectionInfo[]>("list_collections");
+      setCollections(cols);
+    } catch (error) {
+      console.error("Failed to list collections:", error);
+    }
+  }, []);
 
-  useEffect(() => {
-    totalCountRef.current = totalCount;
-  }, [totalCount]);
-
-  const fetchResults = useCallback(async (searchQuery: string, filter: FilterType) => {
+  const fetchResults = useCallback(async (searchQuery: string, filter: FilterType, colId: number | null) => {
     const requestId = ++requestIdRef.current;
-    setIsSearching(true);
     try {
       const clips = await invoke<ClipResult[]>("search_clips", {
         query: searchQuery,
         filter,
+        collectionId: colId,
       });
-      if (requestId !== requestIdRef.current) {
-        return;
-      }
+      if (requestId !== requestIdRef.current) return;
       applyResults(clips);
     } catch (error) {
       console.error("Search failed:", error);
-      if (requestId !== requestIdRef.current) {
-        return;
-      }
-      applyResults([]);
-    } finally {
-      if (requestId === requestIdRef.current) {
-        setIsSearching(false);
-      }
+      // Don't clear results on error — keep previous results visible
     }
   }, [applyResults]);
 
@@ -81,41 +105,73 @@ export function useSearch() {
     }
   }, [applyTotalCount]);
 
+  const fetchSearchStatus = useCallback(async () => {
+    try {
+      const status = await invoke<SearchStatus>("get_search_status");
+      setSearchStatus(status);
+    } catch (error) {
+      console.error("Failed to get search status:", error);
+    }
+  }, []);
+
   // Store latest values in refs for the event listener
   const queryRef = useRef(query);
   const filterRef = useRef(activeFilter);
+  const collectionIdRef = useRef(collectionId);
   queryRef.current = query;
   filterRef.current = activeFilter;
+  collectionIdRef.current = collectionId;
+
+  const scheduleRefresh = useCallback((includeCollections: boolean) => {
+    if (refreshTimerRef.current) {
+      clearTimeout(refreshTimerRef.current);
+    }
+    refreshTimerRef.current = setTimeout(() => {
+      fetchResults(queryRef.current, filterRef.current, collectionIdRef.current);
+      fetchCount();
+      fetchSearchStatus();
+      if (includeCollections) {
+        fetchCollections();
+      }
+    }, 90);
+  }, [fetchCollections, fetchCount, fetchResults, fetchSearchStatus]);
 
   // Debounced search
   useEffect(() => {
     const timer = setTimeout(() => {
-      fetchResults(query, activeFilter);
-    }, 80);
+      fetchResults(deferredQuery, activeFilter, collectionId);
+    }, 140);
 
     return () => clearTimeout(timer);
-  }, [query, activeFilter, fetchResults]);
+  }, [deferredQuery, activeFilter, collectionId, fetchResults]);
 
-  // Listen for new-clip events from clipboard watcher
   useEffect(() => {
-    const refresh = () => {
-      fetchResults(queryRef.current, filterRef.current);
-      fetchCount();
-    };
-
-    const unlistenNew = listen("new-clip", refresh);
-    const unlistenChanged = listen("clips-changed", refresh);
+    const unlistenNew = listen("new-clip", () => scheduleRefresh(false));
+    const unlistenChanged = listen("clips-changed", () => scheduleRefresh(false));
+    const unlistenCollections = listen("collections-changed", () => scheduleRefresh(true));
 
     return () => {
+      if (refreshTimerRef.current) {
+        clearTimeout(refreshTimerRef.current);
+      }
       unlistenNew.then((fn) => fn());
       unlistenChanged.then((fn) => fn());
+      unlistenCollections.then((fn) => fn());
     };
-  }, [fetchResults, fetchCount]);
+  }, [scheduleRefresh]);
 
-  // Listen for search-updated events from semantic search
   useEffect(() => {
-    const unlisten = listen<ClipResult[]>("search-updated", (event) => {
-      applyResults(event.payload);
+    const unlisten = listen<SearchUpdatedEvent>("search-updated", (event) => {
+      const payload = event.payload;
+      if (
+        payload.query !== queryRef.current ||
+        payload.filter !== filterRef.current ||
+        payload.collectionId !== collectionIdRef.current
+      ) {
+        return;
+      }
+      requestIdRef.current += 1;
+      applyResults(payload.results);
     });
 
     return () => {
@@ -123,10 +179,20 @@ export function useSearch() {
     };
   }, [applyResults]);
 
-  // Fetch total count on mount
+  useEffect(() => {
+    const unlisten = listen<SearchStatus>("search-status-updated", (event) => {
+      setSearchStatus(event.payload);
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
   useEffect(() => {
     fetchCount();
-  }, [fetchCount]);
+    fetchCollections();
+    fetchSearchStatus();
+  }, [fetchCount, fetchCollections, fetchSearchStatus]);
 
   const optimisticDelete = useCallback(
     (clipId: number) => {
@@ -183,10 +249,14 @@ export function useSearch() {
     activeFilter,
     setActiveFilter,
     results,
-    isSearching,
     totalCount,
+    collectionId,
+    setCollectionId,
+    collections,
+    searchStatus,
+    fetchCollections,
     optimisticDelete,
     optimisticTogglePin,
-    refresh: () => fetchResults(query, activeFilter),
+    refresh: () => fetchResults(queryRef.current, filterRef.current, collectionIdRef.current),
   };
 }

@@ -31,11 +31,14 @@ function ResultsList({ results, selectedIndex, totalCount, onSelect, onCopy }: R
     overscan: 5,
   });
 
+  // Scroll to selected item (in useEffect, not during render)
   const prevSelected = useRef(selectedIndex);
-  if (selectedIndex !== prevSelected.current) {
-    prevSelected.current = selectedIndex;
-    virtualizer.scrollToIndex(selectedIndex, { align: "auto" });
-  }
+  useEffect(() => {
+    if (selectedIndex !== prevSelected.current) {
+      prevSelected.current = selectedIndex;
+      virtualizer.scrollToIndex(selectedIndex, { align: "auto" });
+    }
+  }, [selectedIndex, virtualizer]);
 
   return (
     <div ref={parentRef} className="flex-1 min-h-0 overflow-y-auto">

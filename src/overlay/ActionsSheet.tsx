@@ -1,7 +1,8 @@
-import { useState, useEffect, type ReactNode } from "react";
+import { useState, useEffect, useCallback, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Copy, Pin, PinOff, Trash2, X } from "lucide-react";
-import { ClipResult } from "../hooks/useSearch";
+import { Copy, Pin, PinOff, Trash2, X, Shuffle, FolderOpen, ExternalLink } from "lucide-react";
+import { ClipResult, CollectionInfo } from "../hooks/useSearch";
+import { transforms } from "../utils/transforms";
 
 export interface SheetAction {
   id: string;
@@ -9,15 +10,19 @@ export interface SheetAction {
   label: string;
   shortcut: string;
   tone?: "default" | "danger";
+  children?: SheetAction[];
 }
 
 interface ActionsSheetProps {
   clip: ClipResult;
   actions: SheetAction[];
   selectedIndex: number;
+  collections: CollectionInfo[];
   onClose: () => void;
   onSelect: (index: number) => void;
   onActivate: (index: number) => void;
+  onTransform: (clipId: number, transformedContent: string) => void;
+  onMoveToCollection: (clipId: number, collectionId: number | null) => void;
 }
 
 function previewText(clip: ClipResult): string {
@@ -82,14 +87,13 @@ function ImagePreview({ clipId, thumbnail }: { clipId: number; thumbnail: string
 
   useEffect(() => {
     let cancelled = false;
+    setPreview(null);
     invoke<string | null>("get_image_preview", { clipId, maxSize: 400 })
       .then((result) => {
         if (!cancelled) setPreview(result);
       })
       .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
+    return () => { cancelled = true; };
   }, [clipId]);
 
   const imgSrc = preview
@@ -117,15 +121,215 @@ function ImagePreview({ clipId, thumbnail }: { clipId: number; thumbnail: string
   );
 }
 
+type SubMenu = "none" | "transform" | "collection";
+
 function ActionsSheet({
   clip,
   actions,
   selectedIndex,
+  collections,
   onClose,
   onSelect,
   onActivate,
+  onTransform,
+  onMoveToCollection,
 }: ActionsSheetProps) {
+  const [subMenu, setSubMenu] = useState<SubMenu>("none");
+  const [subMenuIndex, setSubMenuIndex] = useState(0);
+
   const isImage = clip.content_type === "image";
+
+  const handleTransformSelect = useCallback(
+    (transformId: string) => {
+      const t = transforms.find((tr) => tr.id === transformId);
+      if (t && !isImage) {
+        const content = clip.content_highlighted
+          ? clip.content.replace(/<[^>]*>/g, "") // strip HTML from highlighted
+          : clip.content;
+        const transformed = t.fn(content);
+        if (transformed) {
+          onTransform(clip.id, transformed);
+        }
+      }
+      setSubMenu("none");
+      onClose();
+    },
+    [clip, isImage, onTransform, onClose]
+  );
+
+  const handleCollectionSelect = useCallback(
+    (collectionId: number | null) => {
+      onMoveToCollection(clip.id, collectionId);
+      setSubMenu("none");
+      onClose();
+    },
+    [clip.id, onMoveToCollection, onClose]
+  );
+
+  // Submenu view
+  if (subMenu === "transform" && !isImage) {
+    return (
+      <div className="absolute inset-0 z-30 flex items-end justify-end p-4" style={{ background: "rgba(0,0,0,0.08)" }}>
+        <button type="button" className="absolute inset-0 cursor-default" onClick={() => setSubMenu("none")} />
+        <div
+          data-no-drag
+          className="relative w-full max-w-[348px] rounded-[20px] border p-3 backdrop-blur-2xl"
+          style={{
+            background: "var(--overlay-bg)",
+            borderColor: "var(--border-default)",
+            boxShadow: "var(--overlay-shadow)",
+          }}
+        >
+          <div className="mb-2 flex items-center justify-between px-1">
+            <span className="text-[11px] uppercase tracking-[0.10em]" style={{ color: "var(--text-tertiary)" }}>
+              Transform
+            </span>
+            <button
+              type="button"
+              data-no-drag
+              onClick={() => setSubMenu("none")}
+              className="rounded-full p-1"
+              style={{ color: "var(--text-tertiary)" }}
+            >
+              <X size={12} />
+            </button>
+          </div>
+          <div className="space-y-1 max-h-[320px] overflow-y-auto">
+            {transforms.map((t, i) => (
+              <button
+                key={t.id}
+                type="button"
+                data-no-drag
+                onMouseEnter={() => setSubMenuIndex(i)}
+                onClick={() => handleTransformSelect(t.id)}
+                className="flex w-full items-center rounded-lg px-3 py-2 text-left transition-colors"
+                style={{
+                  background: i === subMenuIndex ? "var(--accent-bg)" : "transparent",
+                  color: i === subMenuIndex ? "var(--accent-text)" : "var(--text-secondary)",
+                }}
+              >
+                <span className="text-[12px]">{t.label}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (subMenu === "collection") {
+    return (
+      <div className="absolute inset-0 z-30 flex items-end justify-end p-4" style={{ background: "rgba(0,0,0,0.08)" }}>
+        <button type="button" className="absolute inset-0 cursor-default" onClick={() => setSubMenu("none")} />
+        <div
+          data-no-drag
+          className="relative w-full max-w-[348px] rounded-[20px] border p-3 backdrop-blur-2xl"
+          style={{
+            background: "var(--overlay-bg)",
+            borderColor: "var(--border-default)",
+            boxShadow: "var(--overlay-shadow)",
+          }}
+        >
+          <div className="mb-2 flex items-center justify-between px-1">
+            <span className="text-[11px] uppercase tracking-[0.10em]" style={{ color: "var(--text-tertiary)" }}>
+              Move to Collection
+            </span>
+            <button
+              type="button"
+              data-no-drag
+              onClick={() => setSubMenu("none")}
+              className="rounded-full p-1"
+              style={{ color: "var(--text-tertiary)" }}
+            >
+              <X size={12} />
+            </button>
+          </div>
+          <div className="space-y-1 max-h-[320px] overflow-y-auto">
+            <button
+              type="button"
+              data-no-drag
+              onClick={() => handleCollectionSelect(null)}
+              className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left transition-colors"
+              style={{
+                background: subMenuIndex === 0 ? "var(--accent-bg)" : "transparent",
+                color: "var(--text-secondary)",
+              }}
+            >
+              <span className="text-[12px]">No Collection</span>
+            </button>
+            {collections.map((col, i) => (
+              <button
+                key={col.id}
+                type="button"
+                data-no-drag
+                onMouseEnter={() => setSubMenuIndex(i + 1)}
+                onClick={() => handleCollectionSelect(col.id)}
+                className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left transition-colors"
+                style={{
+                  background: i + 1 === subMenuIndex ? "var(--accent-bg)" : "transparent",
+                  color: i + 1 === subMenuIndex ? "var(--accent-text)" : "var(--text-secondary)",
+                }}
+              >
+                <FolderOpen size={12} style={{ color: col.color }} />
+                <span className="text-[12px] flex-1">{col.name}</span>
+                <span className="text-[10px]" style={{ color: "var(--text-muted)" }}>
+                  {col.clip_count}
+                </span>
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Main actions view
+  const allActions: SheetAction[] = [
+    ...actions,
+    {
+      id: "transform",
+      icon: <Shuffle size={16} />,
+      label: "Transform",
+      shortcut: "⌘T",
+    },
+    {
+      id: "move-collection",
+      icon: <FolderOpen size={16} />,
+      label: "Move to Collection",
+      shortcut: "⌘M",
+    },
+  ];
+
+  if (clip.content_type === "url") {
+    allActions.splice(1, 0, {
+      id: "open-url",
+      icon: <ExternalLink size={16} />,
+      label: "Open in Browser",
+      shortcut: "⌘O",
+    });
+  }
+
+  const handleMainActivate = (actionIndex: number) => {
+    const action = allActions[actionIndex];
+    if (!action) return;
+
+    switch (action.id) {
+      case "transform":
+        setSubMenu("transform");
+        setSubMenuIndex(0);
+        return;
+      case "move-collection":
+        setSubMenu("collection");
+        setSubMenuIndex(0);
+        return;
+      case "open-url":
+        window.open(clip.content, "_blank");
+        onClose();
+        return;
+      default:
+        onActivate(actionIndex);
+    }
+  };
 
   return (
     <div className="absolute inset-0 z-30 flex items-end justify-end p-4" style={{ background: "rgba(0,0,0,0.08)" }}>
@@ -147,7 +351,6 @@ function ActionsSheet({
                 Actions
               </div>
 
-              {/* Image preview for image clips */}
               {isImage && (
                 <div className="mb-2">
                   <ImagePreview clipId={clip.id} thumbnail={clip.image_thumbnail} />
@@ -181,7 +384,7 @@ function ActionsSheet({
 
         {/* Actions */}
         <div className="space-y-1.5">
-          {actions.map((action, index) => (
+          {allActions.map((action, index) => (
             <ActionButton
               key={action.id}
               icon={action.icon}
@@ -190,7 +393,7 @@ function ActionsSheet({
               tone={action.tone}
               selected={index === selectedIndex}
               onMouseEnter={() => onSelect(index)}
-              onClick={() => onActivate(index)}
+              onClick={() => handleMainActivate(index)}
             />
           ))}
         </div>

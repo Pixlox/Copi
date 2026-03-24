@@ -159,7 +159,7 @@ pub async fn get_db_size(app: tauri::AppHandle) -> Result<u64, String> {
 #[tauri::command]
 pub async fn clear_all_history(app: tauri::AppHandle) -> Result<(), String> {
     let state = app.state::<crate::AppState>();
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db_write.lock().map_err(|e| e.to_string())?;
     conn.execute_batch("DELETE FROM clip_embeddings; DELETE FROM clips_fts; DELETE FROM clips;")
         .map_err(|e| e.to_string())
 }
@@ -167,7 +167,7 @@ pub async fn clear_all_history(app: tauri::AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub async fn export_history_json(app: tauri::AppHandle) -> Result<String, String> {
     let state = app.state::<crate::AppState>();
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db_read.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare("SELECT id, content, content_type, source_app, created_at, pinned FROM clips ORDER BY created_at DESC")
         .map_err(|e| e.to_string())?;

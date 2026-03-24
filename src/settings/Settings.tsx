@@ -13,6 +13,7 @@ import {
   Trash2,
   Download,
   RefreshCw,
+  FolderOpen,
 } from "lucide-react";
 import { useThemeContext } from "../contexts/ThemeContext";
 import type { ThemePreference } from "../hooks/useTheme";
@@ -169,13 +170,30 @@ export default function Settings() {
   const [confirmClear, setConfirmClear] = useState(false);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
 
+  // Collections
+  interface CollectionInfo {
+    id: number;
+    name: string;
+    color: string;
+    clip_count: number;
+    created_at: number;
+  }
+  const [collections, setCollections] = useState<CollectionInfo[]>([]);
+
+  const fetchCollections = useCallback(() => {
+    invoke<CollectionInfo[]>("list_collections")
+      .then(setCollections)
+      .catch(() => {});
+  }, []);
+
   useEffect(() => {
     invoke<CopiConfig>("get_config")
       .then(setConfig)
       .catch((e) => console.error("Config load failed:", e));
     invoke<number>("get_db_size").then(setDbSize).catch(() => {});
     invoke<number>("get_total_clip_count").then(setClipCount).catch(() => {});
-  }, []);
+    fetchCollections();
+  }, [fetchCollections]);
 
   const showSaved = useCallback((field: string) => {
     if (saveTimer.current) clearTimeout(saveTimer.current);
@@ -710,6 +728,45 @@ export default function Settings() {
               Clear
             </button>
           </Row>
+        </Card>
+
+        {/* ── Collections ───────────────────────────────────────────── */}
+        <SectionHeader icon={<FolderOpen size={14} />} title="Collections" />
+        <Card>
+          {collections.length === 0 ? (
+            <Row label="No collections yet" description="Create collections from the overlay sidebar">
+              <span />
+            </Row>
+          ) : (
+            collections.map((col, i) => (
+              <div key={col.id}>
+                {i > 0 && <Divider />}
+                <Row label={col.name} description={`${col.clip_count} clip${col.clip_count !== 1 ? "s" : ""}`}>
+                  <div className="flex items-center gap-1">
+                    <div
+                      className="w-3 h-3 rounded-full"
+                      style={{ background: col.color }}
+                    />
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        try {
+                          await invoke("delete_collection", { id: col.id });
+                          fetchCollections();
+                        } catch (e) {
+                          console.error("Delete collection failed:", e);
+                        }
+                      }}
+                      className="rounded p-1 transition-colors"
+                      style={{ color: "var(--text-tertiary)" }}
+                    >
+                      <Trash2 size={11} />
+                    </button>
+                  </div>
+                </Row>
+              </div>
+            ))
+          )}
         </Card>
 
         {/* Footer */}

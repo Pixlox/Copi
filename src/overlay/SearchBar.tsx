@@ -1,5 +1,5 @@
 import { useRef, useEffect, useCallback } from "react";
-import { Search, X } from "lucide-react";
+import { Search, X, PanelLeft } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import { FilterType } from "../hooks/useSearch";
 
@@ -8,6 +8,8 @@ interface SearchBarProps {
   onQueryChange: (query: string) => void;
   activeFilter: FilterType;
   onFilterChange: (filter: FilterType) => void;
+  sidebarOpen: boolean;
+  onToggleSidebar: () => void;
 }
 
 const FILTER_LABELS: Record<FilterType, string> = {
@@ -19,7 +21,7 @@ const FILTER_LABELS: Record<FilterType, string> = {
   pinned: "Pinned",
 };
 
-function SearchBar({ query, onQueryChange, activeFilter, onFilterChange }: SearchBarProps) {
+function SearchBar({ query, onQueryChange, activeFilter, onFilterChange, sidebarOpen, onToggleSidebar }: SearchBarProps) {
   const inputRef = useRef<HTMLInputElement>(null);
 
   const focusInput = useCallback(() => {
@@ -53,6 +55,18 @@ function SearchBar({ query, onQueryChange, activeFilter, onFilterChange }: Searc
   return (
     <div style={{ borderBottom: "1px solid var(--border-default)" }}>
       <div className="flex items-center gap-2 px-4 py-3">
+        <button
+          type="button"
+          data-no-drag
+          onClick={onToggleSidebar}
+          className="rounded p-0.5 transition-colors"
+          style={{
+            color: sidebarOpen ? "var(--accent-text)" : "var(--text-tertiary)",
+          }}
+          title="Toggle sidebar"
+        >
+          <PanelLeft size={15} />
+        </button>
         <Search size={16} style={{ color: "var(--text-tertiary)" }} className="shrink-0" />
         <input
           ref={inputRef}

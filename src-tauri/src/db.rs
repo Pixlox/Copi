@@ -2,7 +2,12 @@ use rusqlite::{Connection, OptionalExtension, Result};
 use sqlite_vec::sqlite3_vec_init;
 use tauri::Manager;
 
-pub fn init_db(app: &tauri::AppHandle) -> Result<Connection> {
+pub struct DbConnections {
+    pub read: Connection,
+    pub write: Connection,
+}
+
+pub fn init_db(app: &tauri::AppHandle) -> Result<DbConnections> {
     unsafe {
         rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
             sqlite3_vec_init as *const (),
@@ -19,10 +24,21 @@ pub fn init_db(app: &tauri::AppHandle) -> Result<Connection> {
         std::fs::create_dir_all(parent).ok();
     }
 
-    let conn = Connection::open(&db_path)?;
-    conn.pragma_update(None, "journal_mode", "WAL")?;
+    // Writer connection — holds the WAL lock for writes
+    let write = Connection::open(&db_path)?;
+    write.pragma_update(None, "journal_mode", "WAL")?;
+    write.pragma_update(None, "synchronous", "NORMAL")?;
+    write.pragma_update(None, "busy_timeout", 5000)?;
+    write.pragma_update(None, "temp_store", "MEMORY")?;
 
-    conn.execute_batch(
+    // Reader connection — reads from WAL snapshot, never blocks on writes
+    let read = Connection::open(&db_path)?;
+    read.pragma_update(None, "journal_mode", "WAL")?;
+    read.pragma_update(None, "busy_timeout", 5000)?;
+    read.pragma_update(None, "temp_store", "MEMORY")?;
+
+    // Schema + migrations (use writer connection)
+    write.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS collections (
             id INTEGER PRIMARY KEY,
@@ -53,12 +69,34 @@ pub fn init_db(app: &tauri::AppHandle) -> Result<Connection> {
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
+        ",
+    )?;
 
+    // FTS5 table with prefix indexes for search-as-you-type
+    // Check if we need to rebuild (missing prefix config)
+    let fts_needs_rebuild: bool = write
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='clips_fts'",
+            [],
+            |row| {
+                let sql: String = row.get(0).unwrap_or_default();
+                Ok(!sql.contains("prefix='2 3 4'"))
+            },
+        )
+        .unwrap_or(true);
+
+    if fts_needs_rebuild {
+        write.execute_batch("DROP TABLE IF EXISTS clips_fts")?;
+    }
+
+    write.execute_batch(
+        "
         CREATE VIRTUAL TABLE IF NOT EXISTS clips_fts USING fts5(
             content,
             ocr_text,
             content='clips',
-            content_rowid='id'
+            content_rowid='id',
+            prefix='2 3 4'
         );
 
         CREATE TRIGGER IF NOT EXISTS clips_ai AFTER INSERT ON clips BEGIN
@@ -80,35 +118,65 @@ pub fn init_db(app: &tauri::AppHandle) -> Result<Connection> {
         ",
     )?;
 
-    // Only recreate vec table if it doesn't exist or has wrong dimensions
-    let needs_recreate: bool = conn
+    // Vector embeddings table
+    let needs_recreate: bool = write
         .query_row(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='clip_embeddings'",
             [],
             |row| {
                 let sql: String = row.get(0).unwrap_or_default();
-                // Check if it contains float[768]
                 Ok(!sql.contains("float[768]"))
             },
         )
         .unwrap_or(true);
 
     if needs_recreate {
-        eprintln!("[DB] Recreating vec0 table (dim mismatch or missing)");
-        conn.execute("DROP TABLE IF EXISTS clip_embeddings", [])?;
-        conn.execute(
+        write.execute("DROP TABLE IF EXISTS clip_embeddings", [])?;
+        write.execute(
             "CREATE VIRTUAL TABLE clip_embeddings USING vec0(embedding float[768])",
             [],
         )?;
-    } else {
-        eprintln!("[DB] vec0 table exists with correct dimensions");
     }
 
-    run_migrations(&conn)?;
+    run_migrations(&write)?;
+    write.execute_batch(
+        "
+        CREATE INDEX IF NOT EXISTS idx_clips_sort ON clips(pinned DESC, copy_count DESC, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_clips_created_at ON clips(created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_clips_collection_created ON clips(collection_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_clips_content_type_created ON clips(content_type, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_clips_language_created ON clips(language, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_clips_source_app_nocase ON clips(source_app COLLATE NOCASE);
+        ",
+    )?;
 
-    eprintln!("[DB] Database ready");
+    const SEARCH_SCHEMA_VERSION_KEY: &str = "search_schema_version";
+    const SEARCH_SCHEMA_VERSION: &str = "v3";
+    let recorded_schema_version: Option<String> = write
+        .query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            [SEARCH_SCHEMA_VERSION_KEY],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let should_force_rebuild = fts_needs_rebuild
+        || recorded_schema_version
+            .as_deref()
+            .map(|value| value != SEARCH_SCHEMA_VERSION)
+            .unwrap_or(true);
 
-    Ok(conn)
+    if should_force_rebuild {
+        write.execute_batch("INSERT INTO clips_fts(clips_fts) VALUES('rebuild');")?;
+        write.execute(
+            "INSERT OR REPLACE INTO settings(key, value) VALUES (?1, ?2)",
+            [SEARCH_SCHEMA_VERSION_KEY, SEARCH_SCHEMA_VERSION],
+        )?;
+        eprintln!("[DB] FTS5 index rebuilt and search schema version refreshed");
+    }
+
+    eprintln!("[DB] Database ready (dual connections, WAL mode)");
+
+    Ok(DbConnections { read, write })
 }
 
 fn run_migrations(conn: &Connection) -> Result<()> {
@@ -126,6 +194,8 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         ("image_width", "INTEGER DEFAULT 0"),
         ("image_height", "INTEGER DEFAULT 0"),
         ("pinned", "INTEGER DEFAULT 0"),
+        ("language", "TEXT"),
+        ("copy_count", "INTEGER DEFAULT 0"),
     ];
 
     for (col, col_type) in &needed {

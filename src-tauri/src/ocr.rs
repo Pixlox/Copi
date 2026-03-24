@@ -74,32 +74,39 @@ struct OcrPassResult {
 }
 
 #[cfg(target_os = "macos")]
-const DESIRED_LANGUAGE_GROUPS: &[(&str, &[&str], bool)] = &[
-    ("arabic", &["ar-SA", "ar"], false),
-    ("chinese_simplified", &["zh-Hans", "zh-CN", "zh"], false),
-    ("chinese_traditional", &["zh-Hant", "zh-TW"], false),
-    ("danish", &["da-DK", "da"], true),
-    ("dutch", &["nl-NL", "nl"], true),
-    ("english", &["en-US", "en-GB", "en"], true),
-    ("french", &["fr-FR", "fr"], true),
-    ("german", &["de-DE", "de"], true),
-    ("italian", &["it-IT", "it"], true),
-    ("japanese", &["ja-JP", "ja"], false),
-    ("korean", &["ko-KR", "ko"], false),
-    (
-        "norwegian",
-        &["nb-NO", "nn-NO", "no-NO", "nb", "nn", "no"],
-        true,
-    ),
-    ("portuguese_brazil", &["pt-BR", "pt"], true),
-    ("portuguese_portugal", &["pt-PT", "pt"], true),
-    ("russian", &["ru-RU", "ru"], false),
-    ("spanish", &["es-ES", "es-MX", "es"], true),
-    ("swedish", &["sv-SE", "sv"], true),
-    ("thai", &["th-TH", "th"], false),
-    ("turkish", &["tr-TR", "tr"], true),
-    ("ukrainian", &["uk-UA", "uk"], false),
-    ("vietnamese", &["vi-VN", "vi"], false),
+const PRIMARY_LANGUAGE_GROUPS: &[&[&str]] = &[
+    &["en-US", "en-GB", "en"],
+    &["es-ES", "es-MX", "es"],
+    &["fr-FR", "fr"],
+    &["de-DE", "de"],
+    &["it-IT", "it"],
+    &["pt-BR", "pt-PT", "pt"],
+    &["nl-NL", "nl"],
+    &["da-DK", "da"],
+    &["sv-SE", "sv"],
+    &["nb-NO", "nn-NO", "no-NO", "nb", "nn", "no"],
+    &["ja-JP", "ja"],
+    &["ko-KR", "ko"],
+    &["zh-Hans", "zh-Hant", "zh-CN", "zh-TW", "zh"],
+    &["ru-RU", "ru"],
+    &["uk-UA", "uk"],
+    &["ar-SA", "ar"],
+    &["th-TH", "th"],
+    &["vi-VN", "vi"],
+];
+
+const LATIN_CORRECTION_GROUPS: &[&[&str]] = &[
+    &["en-US", "en-GB", "en"],
+    &["es-ES", "es-MX", "es"],
+    &["fr-FR", "fr"],
+    &["de-DE", "de"],
+    &["it-IT", "it"],
+    &["pt-BR", "pt-PT", "pt"],
+    &["nl-NL", "nl"],
+    &["da-DK", "da"],
+    &["sv-SE", "sv"],
+    &["nb-NO", "nn-NO", "no-NO", "nb", "nn", "no"],
+    &["tr-TR", "tr"],
 ];
 
 #[cfg(target_os = "macos")]
@@ -148,47 +155,40 @@ fn load_supported_languages() -> Option<HashSet<String>> {
 
 #[cfg(target_os = "macos")]
 fn build_ocr_passes(supported_languages: Option<&HashSet<String>>) -> Vec<OcrPass> {
-    let mut selected_languages = Vec::new();
+    let multilingual_languages = collect_supported_languages(supported_languages, PRIMARY_LANGUAGE_GROUPS);
+    let latin_languages = collect_supported_languages(supported_languages, LATIN_CORRECTION_GROUPS);
     let mut passes = Vec::new();
+    if !multilingual_languages.is_empty() {
+        passes.push(OcrPass {
+            name: "multilingual",
+            languages: multilingual_languages,
+            use_language_correction: false,
+        });
+    }
+    if !latin_languages.is_empty() {
+        passes.push(OcrPass {
+            name: "latin_corrected",
+            languages: latin_languages,
+            use_language_correction: true,
+        });
+    }
+    passes
+}
 
-    for (name, candidates, use_language_correction) in DESIRED_LANGUAGE_GROUPS {
-        if let Some(language) = select_supported_language(supported_languages, candidates) {
-            selected_languages.push(language.clone());
-            passes.push(OcrPass {
-                name,
-                languages: vec![language],
-                use_language_correction: *use_language_correction,
-            });
+#[cfg(target_os = "macos")]
+fn collect_supported_languages(
+    supported_languages: Option<&HashSet<String>>,
+    groups: &[&[&str]],
+) -> Vec<String> {
+    let mut selected = Vec::new();
+    for group in groups {
+        if let Some(language) = select_supported_language(supported_languages, group) {
+            if !selected.iter().any(|existing| existing == &language) {
+                selected.push(language);
+            }
         }
     }
-
-    if !selected_languages.is_empty() {
-        let mut multilingual_languages = selected_languages.clone();
-        multilingual_languages.sort();
-        multilingual_languages.dedup();
-        let mut corrected_languages = selected_languages;
-        corrected_languages.sort();
-        corrected_languages.dedup();
-
-        passes.insert(
-            0,
-            OcrPass {
-                name: "multilingual",
-                languages: multilingual_languages,
-                use_language_correction: false,
-            },
-        );
-        passes.insert(
-            1,
-            OcrPass {
-                name: "multilingual_corrected",
-                languages: corrected_languages,
-                use_language_correction: true,
-            },
-        );
-    }
-
-    passes
+    selected
 }
 
 #[cfg(target_os = "macos")]
@@ -270,13 +270,15 @@ fn run_vision_ocr(
                         .map(|best| score > ocr_result_score(best))
                         .unwrap_or(true);
 
-                    eprintln!(
-                        "[OCR] Pass {} recognized {} chars (avg confidence {:.3})",
-                        pass.name, result.char_count, result.avg_confidence
-                    );
-
                     if replace {
                         best_result = Some(result);
+                    }
+
+                    if best_result
+                        .as_ref()
+                        .is_some_and(|best| best.avg_confidence >= 0.86 && best.meaningful_char_count >= 24)
+                    {
+                        break;
                     }
                 }
                 Err(error) => {
@@ -287,6 +289,10 @@ fn run_vision_ocr(
         }
 
         if let Some(result) = best_result {
+            eprintln!(
+                "[OCR] Selected result: {} chars, confidence {:.3}",
+                result.char_count, result.avg_confidence
+            );
             Ok(result.text)
         } else if let Some(error) = last_error {
             Err(error)

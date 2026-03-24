@@ -1,6 +1,9 @@
+import type { SearchStatus } from "../hooks/useSearch";
+
 interface StatusBarProps {
   totalCount: number;
   query: string;
+  searchStatus: SearchStatus;
   actionsOpen: boolean;
   canOpenActions: boolean;
   onToggleActions: () => void;
@@ -34,8 +37,19 @@ function detectFilters(query: string): string[] {
   return badges;
 }
 
-function StatusBar({ totalCount, query, actionsOpen, canOpenActions, onToggleActions }: StatusBarProps) {
+function formatSearchStatus(status: SearchStatus): string | null {
+  if (status.phase === "backfill_embeddings" && status.totalItems > 0) {
+    return `Semantic ${status.completedItems}/${status.totalItems}`;
+  }
+  if (!status.semanticReady) {
+    return "Semantic warming";
+  }
+  return null;
+}
+
+function StatusBar({ totalCount, query, searchStatus, actionsOpen, canOpenActions, onToggleActions }: StatusBarProps) {
   const filters = detectFilters(query);
+  const statusLabel = formatSearchStatus(searchStatus);
 
   return (
     <div
@@ -44,6 +58,9 @@ function StatusBar({ totalCount, query, actionsOpen, canOpenActions, onToggleAct
     >
       <div className="flex items-center gap-2">
         <span>{formatCount(totalCount)} clips</span>
+        {statusLabel && (
+          <span className="temporal-badge">{statusLabel}</span>
+        )}
         {filters.map((f) => (
           <span key={f} className="temporal-badge">{f}</span>
         ))}

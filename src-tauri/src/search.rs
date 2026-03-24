@@ -1,10 +1,20 @@
-use rusqlite::OptionalExtension;
+use crate::query_parser::{self, Ordering, ParsedQuery};
+use crate::AppState;
+use rusqlite::{OptionalExtension, ToSql};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::Ordering as AtomicOrdering;
 use tauri::{Emitter, Manager};
 
-use crate::query_parser;
-use crate::AppState;
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchStatusPayload {
+    pub phase: String,
+    pub queued_items: usize,
+    pub completed_items: usize,
+    pub total_items: usize,
+    pub semantic_ready: bool,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClipResult {
@@ -18,6 +28,47 @@ pub struct ClipResult {
     pub content_highlighted: Option<String>,
     pub ocr_text: Option<String>,
     pub image_thumbnail: Option<String>,
+    pub copy_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchUpdatedPayload {
+    query: String,
+    filter: String,
+    collection_id: Option<i64>,
+    results: Vec<ClipResult>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SearchPhase {
+    Fast,
+    Semantic,
+}
+
+#[derive(Default, Clone)]
+struct ScoreEntry {
+    score: f64,
+}
+
+const SEL: &str = "id, content, content_type, source_app, created_at, pinned, content_highlighted, source_app_icon, ocr_text, image_thumbnail, COALESCE(copy_count, 0)";
+
+fn row_to_clip(r: &rusqlite::Row) -> rusqlite::Result<ClipResult> {
+    let icon: Option<Vec<u8>> = r.get(7).unwrap_or(None);
+    let thumb: Option<Vec<u8>> = r.get(9).unwrap_or(None);
+    Ok(ClipResult {
+        id: r.get(0)?,
+        content: trunc(&r.get::<_, String>(1).unwrap_or_default()),
+        content_type: r.get(2)?,
+        source_app: r.get(3)?,
+        created_at: r.get(4)?,
+        pinned: r.get::<_, i64>(5)? != 0,
+        content_highlighted: r.get(6)?,
+        source_app_icon: icon.filter(|bytes| !bytes.is_empty()).map(|bytes| b64(&bytes)),
+        ocr_text: r.get(8).unwrap_or(None),
+        image_thumbnail: thumb.filter(|bytes| !bytes.is_empty()).map(|bytes| b64(&bytes)),
+        copy_count: r.get(10).unwrap_or(0),
+    })
 }
 
 #[tauri::command]
@@ -25,90 +76,59 @@ pub async fn search_clips(
     app: tauri::AppHandle,
     query: String,
     filter: String,
+    collection_id: Option<i64>,
 ) -> Result<Vec<ClipResult>, String> {
-    let state = app.state::<AppState>();
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let token = app
+        .state::<AppState>()
+        .search_generation
+        .fetch_add(1, AtomicOrdering::Relaxed)
+        + 1;
 
-    if query.trim().is_empty() {
-        return search_empty(&conn, &filter);
-    }
-
-    let parsed = query_parser::parse_query(&query);
-    let sq = if parsed.semantic.is_empty() {
-        &query
-    } else {
-        &parsed.semantic
+    let fast_results = {
+        let app_handle = app.clone();
+        let query_clone = query.clone();
+        let filter_clone = filter.clone();
+        tokio::task::spawn_blocking(move || {
+            search_sync(&app_handle, &query_clone, &filter_clone, collection_id, SearchPhase::Fast)
+        })
+        .await
+        .map_err(|e| e.to_string())??
     };
 
-    // Build WHERE clauses
-    let tc_join = match (parsed.temporal_after, parsed.temporal_before) {
-        (Some(a), Some(b)) => format!(" AND c.created_at >= {} AND c.created_at <= {}", a, b),
-        (Some(a), None) => format!(" AND c.created_at >= {}", a),
-        (None, Some(b)) => format!(" AND c.created_at <= {}", b),
-        (None, None) => String::new(),
-    };
-    let tc_plain = tc_join.replace("c.", "");
+    schedule_semantic_update(&app, token, query.clone(), filter.clone(), collection_id);
 
-    let sa_join = parsed
-        .source_app
-        .as_ref()
-        .map(|a| format!(" AND LOWER(c.source_app) LIKE '%{}%'", a.to_lowercase()))
-        .unwrap_or_default();
-    let sa_plain = sa_join.replace("c.", "");
-
-    let ef = parsed.content_type.as_deref().unwrap_or(&filter);
-
-    // Source-app-only query (e.g., "from Slack" with no other search terms)
-    if sq.trim().is_empty() && parsed.source_app.is_some() {
-        return search_by_source_app(&conn, parsed.source_app.as_deref().unwrap(), ef, &tc_plain);
-    }
-
-    // Run all search strategies in parallel
-    let fts_results = do_search_fts(&conn, sq, ef, &tc_join, &sa_join);
-
-    let vec_results = if let Some(ref model) = state.model {
-        do_search_vec(model, &conn, sq, ef, &tc_join, &sa_join)
-    } else {
-        if !query.trim().is_empty() {
-            eprintln!("[Search] Model not loaded — semantic search disabled");
-        }
-        vec![]
-    };
-
-    // LIKE fallback only if we have few results
-    let like_results = if fts_results.len() + vec_results.len() < 10 {
-        do_search_like(&conn, sq, ef, &tc_plain, &sa_plain)
-    } else {
-        vec![]
-    };
-
-    Ok(rrf(vec![fts_results, vec_results, like_results]))
+    Ok(fast_results)
 }
 
 #[tauri::command]
 pub async fn get_total_clip_count(app: tauri::AppHandle) -> Result<i64, String> {
+    tokio::task::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let conn = state.db_read.lock().map_err(|e| e.to_string())?;
+        conn.query_row("SELECT COUNT(*) FROM clips", [], |row| row.get(0))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn get_search_status(app: tauri::AppHandle) -> Result<SearchStatusPayload, String> {
     let state = app.state::<AppState>();
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
-    conn.query_row("SELECT COUNT(*) FROM clips", [], |row| row.get(0))
-        .map_err(|e| e.to_string())
+    let status = state.search_status.lock().map_err(|e| e.to_string())?;
+    Ok(status.clone())
 }
 
 #[tauri::command]
 pub async fn toggle_pin(app: tauri::AppHandle, clip_id: i64) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
-    let updated = conn
-        .execute(
-            "UPDATE clips SET pinned = CASE WHEN pinned = 1 THEN 0 ELSE 1 END WHERE id = ?",
-            [clip_id],
-        )
-        .map_err(|e| e.to_string())?;
+    let conn = state.db_write.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE clips SET pinned = CASE WHEN pinned = 1 THEN 0 ELSE 1 END WHERE id = ?",
+        [clip_id],
+    )
+    .map_err(|e| e.to_string())?;
     drop(conn);
-
-    if updated == 0 {
-        return Err("Clip not found".into());
-    }
-
     let _ = app.emit("clips-changed", ());
     Ok(())
 }
@@ -116,18 +136,57 @@ pub async fn toggle_pin(app: tauri::AppHandle, clip_id: i64) -> Result<(), Strin
 #[tauri::command]
 pub async fn delete_clip(app: tauri::AppHandle, clip_id: i64) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db_write.lock().map_err(|e| e.to_string())?;
     conn.execute("DELETE FROM clip_embeddings WHERE rowid = ?", [clip_id])
-        .map_err(|e| e.to_string())?;
-    let deleted = conn
-        .execute("DELETE FROM clips WHERE id = ?", [clip_id])
+        .ok();
+    conn.execute("DELETE FROM clips WHERE id = ?", [clip_id])
         .map_err(|e| e.to_string())?;
     drop(conn);
+    let _ = app.emit("clips-changed", ());
+    Ok(())
+}
 
-    if deleted == 0 {
-        return Err("Clip not found".into());
-    }
+#[tauri::command]
+pub async fn update_clip_content(
+    app: tauri::AppHandle,
+    clip_id: i64,
+    new_content: String,
+) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
 
+    let mut hasher = Sha256::new();
+    hasher.update(new_content.as_bytes());
+    let hash = format!("{:x}", hasher.finalize());
+    let content_type = if new_content.starts_with("http") {
+        "url"
+    } else if new_content.contains('\n')
+        && (new_content.contains('{')
+            || new_content.contains("fn ")
+            || new_content.contains("function "))
+    {
+        "code"
+    } else {
+        "text"
+    };
+
+    let detected_language = query_parser::detect_language(&new_content).map(str::to_string);
+    let state = app.state::<AppState>();
+    let conn = state.db_write.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE clips
+         SET content = ?1, content_hash = ?2, content_type = ?3, language = COALESCE(?5, language)
+         WHERE id = ?4",
+        rusqlite::params![
+            new_content,
+            hash,
+            content_type,
+            clip_id,
+            detected_language
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    drop(conn);
+    let _ = state.clip_tx.try_send(clip_id);
     let _ = app.emit("clips-changed", ());
     Ok(())
 }
@@ -138,23 +197,22 @@ pub async fn get_image_thumbnail(
     clip_id: i64,
 ) -> Result<Option<String>, String> {
     let state = app.state::<AppState>();
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
-
-    // Read the stored raw image data
+    let conn = state.db_read.lock().map_err(|e| e.to_string())?;
     let result: Option<(Vec<u8>, Vec<u8>, i64, i64)> = conn
         .query_row(
-            "SELECT COALESCE(image_thumbnail, X''), image_data, image_width, image_height FROM clips WHERE id = ? AND content_type = 'image'",
+            "SELECT COALESCE(image_thumbnail, X''), image_data, image_width, image_height
+             FROM clips
+             WHERE id = ? AND content_type = 'image'",
             [clip_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()
         .map_err(|e| e.to_string())?;
-
     match result {
-        Some((thumbnail, _, _, _)) if !thumbnail.is_empty() => Ok(Some(b64(&thumbnail))),
-        Some((_, raw_bytes, width, height)) if !raw_bytes.is_empty() => {
-            let thumbnail = generate_thumbnail(&raw_bytes, width as u32, height as u32);
-            Ok(thumbnail.map(|t| b64(&t)))
+        Some((thumb, _, _, _)) if !thumb.is_empty() => Ok(Some(b64(&thumb))),
+        Some((_, raw, width, height)) if !raw.is_empty() => {
+            drop(conn);
+            Ok(gen_thumb(&raw, width as u32, height as u32, 64).map(|data| b64(&data)))
         }
         _ => Ok(None),
     }
@@ -167,49 +225,804 @@ pub async fn get_image_preview(
     max_size: u32,
 ) -> Result<Option<String>, String> {
     let state = app.state::<AppState>();
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
-
+    let conn = state.db_read.lock().map_err(|e| e.to_string())?;
     let result: Option<(Vec<u8>, i64, i64)> = conn
         .query_row(
-            "SELECT image_data, image_width, image_height FROM clips WHERE id = ? AND content_type = 'image'",
+            "SELECT image_data, image_width, image_height
+             FROM clips
+             WHERE id = ? AND content_type = 'image'",
             [clip_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()
         .map_err(|e| e.to_string())?;
-
     match result {
-        Some((raw_bytes, width, height)) if !raw_bytes.is_empty() => {
-            let preview = generate_thumbnail_sized(&raw_bytes, width as u32, height as u32, max_size);
-            Ok(preview.map(|p| b64(&p)))
+        Some((raw, width, height)) if !raw.is_empty() => {
+            drop(conn);
+            Ok(gen_thumb(&raw, width as u32, height as u32, max_size).map(|data| b64(&data)))
         }
         _ => Ok(None),
     }
 }
 
-fn generate_thumbnail(data: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
-    generate_thumbnail_sized(data, width, height, 64)
+fn schedule_semantic_update(
+    app: &tauri::AppHandle,
+    token: u64,
+    query: String,
+    filter: String,
+    collection_id: Option<i64>,
+) {
+    let Some(_) = app.state::<AppState>().model.as_ref() else {
+        return;
+    };
+    if query.trim().len() < 2 {
+        return;
+    }
+    let parsed = query_parser::parse_query(&query);
+    if parsed.query_is_empty_after_parse
+        || parsed.semantic.trim().len() < 3
+        || parsed.keywords.is_empty()
+    {
+        return;
+    }
+
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(110)).await;
+        let state = app_handle.state::<AppState>();
+        if state.search_generation.load(AtomicOrdering::Relaxed) != token {
+            return;
+        }
+
+        let results = tokio::task::spawn_blocking({
+            let app_handle = app_handle.clone();
+            let query = query.clone();
+            let filter = filter.clone();
+            move || search_sync(&app_handle, &query, &filter, collection_id, SearchPhase::Semantic)
+        })
+        .await;
+
+        let Ok(Ok(results)) = results else {
+            return;
+        };
+
+        let state = app_handle.state::<AppState>();
+        if state.search_generation.load(AtomicOrdering::Relaxed) != token {
+            return;
+        }
+
+        let payload = SearchUpdatedPayload {
+            query,
+            filter,
+            collection_id,
+            results,
+        };
+        let _ = app_handle.emit("search-updated", payload);
+    });
 }
 
-fn generate_thumbnail_sized(data: &[u8], width: u32, height: u32, max_size: u32) -> Option<Vec<u8>> {
-    let scale = if width > max_size || height > max_size {
-        max_size as f32 / width.max(height) as f32
+fn search_sync(
+    app: &tauri::AppHandle,
+    query: &str,
+    filter: &str,
+    collection_id: Option<i64>,
+    phase: SearchPhase,
+) -> Result<Vec<ClipResult>, String> {
+    let state = app.state::<AppState>();
+    let conn = state.db_read.lock().map_err(|e| e.to_string())?;
+
+    if query.trim().is_empty() {
+        return do_empty_search(&conn, filter, collection_id);
+    }
+
+    let parsed = query_parser::parse_query(query);
+
+    if let Some(ordering) = parsed.ordering.as_ref() {
+        return do_ordering(&conn, ordering, filter, collection_id);
+    }
+
+    if parsed.query_is_empty_after_parse || parsed.semantic.is_empty() {
+        return do_filter_search(&conn, &parsed, filter, collection_id);
+    }
+
+    let semantic_results = match phase {
+        SearchPhase::Fast => None,
+        SearchPhase::Semantic => state.model.as_ref().map(|model| do_vector_candidates(&conn, model, &parsed, filter, collection_id)),
+    };
+
+    do_ranked_search(&conn, &parsed, filter, collection_id, semantic_results.as_deref())
+}
+
+fn do_empty_search(
+    conn: &rusqlite::Connection,
+    filter: &str,
+    collection_id: Option<i64>,
+) -> Result<Vec<ClipResult>, String> {
+    let mut sql = format!(
+        "SELECT {SEL} FROM clips WHERE 1=1{}{} ORDER BY created_at DESC LIMIT 50",
+        type_filter(filter, ""),
+        coll_filter(collection_id)
+    );
+    if filter == "pinned" {
+        sql = sql.replacen("WHERE 1=1", "WHERE 1=1 AND pinned = 1", 1);
+    }
+    query_rows(conn, &sql, &[])
+}
+
+fn do_filter_search(
+    conn: &rusqlite::Connection,
+    parsed: &ParsedQuery,
+    filter: &str,
+    collection_id: Option<i64>,
+) -> Result<Vec<ClipResult>, String> {
+    let strict = run_filter_search(conn, parsed, filter, collection_id, true)?;
+    if !strict.is_empty() || !parsed.has_temporal {
+        return Ok(strict);
+    }
+
+    run_filter_search(conn, parsed, filter, collection_id, false)
+}
+
+fn run_filter_search(
+    conn: &rusqlite::Connection,
+    parsed: &ParsedQuery,
+    filter: &str,
+    collection_id: Option<i64>,
+    include_temporal: bool,
+) -> Result<Vec<ClipResult>, String> {
+    let mut conditions = vec!["1=1".to_string()];
+    let mut params: Vec<Box<dyn ToSql>> = vec![];
+    apply_filters(
+        &mut conditions,
+        &mut params,
+        parsed,
+        filter,
+        collection_id,
+        "",
+        include_temporal,
+    );
+    if !parsed.languages.is_empty() {
+        let placeholders = (0..parsed.languages.len())
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(", ");
+        conditions.push(format!("language IN ({placeholders})"));
+        for language in &parsed.languages {
+            params.push(Box::new(language.clone()));
+        }
+    }
+
+    let sql = if include_temporal {
+        format!(
+            "SELECT {SEL} FROM clips WHERE {} ORDER BY pinned DESC, COALESCE(copy_count, 0) DESC, created_at DESC LIMIT 50",
+            conditions.join(" AND ")
+        )
+    } else if let Some(center) = temporal_center(parsed) {
+        params.push(Box::new(center));
+        format!(
+            "SELECT {SEL} FROM clips WHERE {} ORDER BY pinned DESC, ABS(created_at - ?) ASC, COALESCE(copy_count, 0) DESC, created_at DESC LIMIT 50",
+            conditions.join(" AND ")
+        )
+    } else {
+        format!(
+            "SELECT {SEL} FROM clips WHERE {} ORDER BY pinned DESC, COALESCE(copy_count, 0) DESC, created_at DESC LIMIT 50",
+            conditions.join(" AND ")
+        )
+    };
+    let param_refs: Vec<&dyn ToSql> = params.iter().map(|param| param.as_ref()).collect();
+    query_rows(conn, &sql, &param_refs)
+}
+
+fn do_ordering(
+    conn: &rusqlite::Connection,
+    ordering: &Ordering,
+    filter: &str,
+    collection_id: Option<i64>,
+) -> Result<Vec<ClipResult>, String> {
+    let order = match ordering {
+        Ordering::Newest | Ordering::SecondNewest => "created_at DESC",
+        Ordering::Oldest => "created_at ASC",
+    };
+    let limit = if *ordering == Ordering::SecondNewest { 2 } else { 1 };
+    let sql = format!(
+        "SELECT {SEL} FROM clips WHERE 1=1{}{}{} ORDER BY {order} LIMIT {limit}",
+        pinned_filter(filter),
+        type_filter(filter, ""),
+        coll_filter(collection_id)
+    );
+    let mut results = query_rows(conn, &sql, &[])?;
+    if *ordering == Ordering::SecondNewest && results.len() == 2 {
+        return Ok(vec![results.remove(1)]);
+    }
+    Ok(results)
+}
+
+fn do_ranked_search(
+    conn: &rusqlite::Connection,
+    parsed: &ParsedQuery,
+    filter: &str,
+    collection_id: Option<i64>,
+    semantic_candidates: Option<&[(i64, f64)]>,
+) -> Result<Vec<ClipResult>, String> {
+    let (mut scores, mut temporal_relaxed) =
+        collect_ranked_scores(conn, parsed, filter, collection_id, semantic_candidates, true)?;
+
+    if scores.is_empty() && parsed.has_temporal {
+        let (fallback_scores, _) =
+            collect_ranked_scores(conn, parsed, filter, collection_id, semantic_candidates, false)?;
+        scores = fallback_scores;
+        temporal_relaxed = true;
+    }
+
+    if scores.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let initial_ids = sort_scored_ids(scores.clone(), 80);
+    let clips = fetch_clips_by_ids(conn, &initial_ids)?;
+    apply_clip_boosts(&mut scores, &clips, parsed, temporal_relaxed);
+
+    let ids = sort_scored_ids(scores, 50);
+    fetch_clips_by_ids(conn, &ids)
+}
+
+fn do_phrase_candidates(
+    conn: &rusqlite::Connection,
+    parsed: &ParsedQuery,
+    filter: &str,
+    collection_id: Option<i64>,
+    include_temporal: bool,
+) -> Result<Vec<(i64, f64)>, String> {
+    if parsed.semantic.len() < 2 {
+        return Ok(vec![]);
+    }
+
+    let mut params: Vec<Box<dyn ToSql>> = vec![
+        Box::new(format!("%{}%", parsed.semantic.to_lowercase())),
+        Box::new(format!("%{}%", parsed.semantic.to_lowercase())),
+    ];
+    let mut conditions = vec![
+        "(LOWER(content) LIKE ? OR LOWER(COALESCE(ocr_text, '')) LIKE ?)".to_string(),
+    ];
+    apply_filters(
+        &mut conditions,
+        &mut params,
+        parsed,
+        filter,
+        collection_id,
+        "",
+        include_temporal,
+    );
+    let sql = format!(
+        "SELECT id, 1.0 AS score
+         FROM clips
+         WHERE {}
+         ORDER BY pinned DESC, COALESCE(copy_count, 0) DESC, created_at DESC
+         LIMIT 40",
+        conditions.join(" AND ")
+    );
+    let param_refs: Vec<&dyn ToSql> = params.iter().map(|param| param.as_ref()).collect();
+    query_id_scores(conn, &sql, &param_refs)
+}
+
+fn do_fts_candidates(
+    conn: &rusqlite::Connection,
+    parsed: &ParsedQuery,
+    filter: &str,
+    collection_id: Option<i64>,
+    include_temporal: bool,
+) -> Result<Vec<(i64, f64)>, String> {
+    let query = fts_query(parsed);
+    if query.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut params: Vec<Box<dyn ToSql>> = vec![Box::new(query)];
+    let mut conditions = vec!["clips_fts MATCH ?".to_string()];
+    apply_filters(
+        &mut conditions,
+        &mut params,
+        parsed,
+        filter,
+        collection_id,
+        "c.",
+        include_temporal,
+    );
+    let sql = format!(
+        "SELECT c.id, -bm25(clips_fts, 1.0, 1.3) AS score
+         FROM clips_fts
+         JOIN clips c ON c.id = clips_fts.rowid
+         WHERE {}
+         ORDER BY score DESC, c.pinned DESC, COALESCE(c.copy_count, 0) DESC, c.created_at DESC
+         LIMIT 60",
+        conditions.join(" AND ")
+    );
+    let param_refs: Vec<&dyn ToSql> = params.iter().map(|param| param.as_ref()).collect();
+    query_id_scores(conn, &sql, &param_refs)
+}
+
+fn do_like_candidates(
+    conn: &rusqlite::Connection,
+    parsed: &ParsedQuery,
+    filter: &str,
+    collection_id: Option<i64>,
+    include_temporal: bool,
+) -> Result<Vec<(i64, f64)>, String> {
+    if parsed.keywords.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut conditions = Vec::new();
+    let mut params: Vec<Box<dyn ToSql>> = Vec::new();
+    for keyword in &parsed.keywords {
+        conditions.push(
+            "(LOWER(content) LIKE ? OR LOWER(COALESCE(ocr_text, '')) LIKE ? OR LOWER(source_app) LIKE ?)"
+                .to_string(),
+        );
+        let pattern = format!("%{}%", keyword.to_lowercase());
+        params.push(Box::new(pattern.clone()));
+        params.push(Box::new(pattern.clone()));
+        params.push(Box::new(pattern));
+    }
+
+    let mut filters = vec![format!("({})", conditions.join(" OR "))];
+    apply_filters(
+        &mut filters,
+        &mut params,
+        parsed,
+        filter,
+        collection_id,
+        "",
+        include_temporal,
+    );
+
+    let score_sql = parsed
+        .keywords
+        .iter()
+        .map(|_| {
+            "(CASE WHEN LOWER(content) LIKE ? THEN 1.2 ELSE 0 END
+              + CASE WHEN LOWER(COALESCE(ocr_text, '')) LIKE ? THEN 1.0 ELSE 0 END
+              + CASE WHEN LOWER(source_app) LIKE ? THEN 0.6 ELSE 0 END)"
+                .replace('\n', " ")
+        })
+        .collect::<Vec<_>>()
+        .join(" + ");
+    for keyword in &parsed.keywords {
+        let pattern = format!("%{}%", keyword.to_lowercase());
+        params.push(Box::new(pattern.clone()));
+        params.push(Box::new(pattern));
+        params.push(Box::new(format!("%{}%", keyword.to_lowercase())));
+    }
+
+    let sql = format!(
+        "SELECT id, ({score_sql}) AS score
+         FROM clips
+         WHERE {}
+         ORDER BY score DESC, pinned DESC, COALESCE(copy_count, 0) DESC, created_at DESC
+         LIMIT 50",
+        filters.join(" AND ")
+    );
+    let param_refs: Vec<&dyn ToSql> = params.iter().map(|param| param.as_ref()).collect();
+    query_id_scores(conn, &sql, &param_refs)
+}
+
+fn do_vector_candidates(
+    conn: &rusqlite::Connection,
+    model: &std::sync::Arc<crate::embed::EmbeddingModel>,
+    parsed: &ParsedQuery,
+    filter: &str,
+    collection_id: Option<i64>,
+) -> Vec<(i64, f64)> {
+    let Ok(embedding) = crate::embed::embed_query(model, &parsed.semantic) else {
+        return vec![];
+    };
+    if embedding.len() != model.dimensions {
+        return vec![];
+    }
+
+    let bytes: Vec<u8> = embedding.iter().flat_map(|value| value.to_le_bytes()).collect();
+    let mut params: Vec<Box<dyn ToSql>> = vec![Box::new(bytes), Box::new(60_i64)];
+    let mut conditions = vec!["e.embedding MATCH ?".to_string(), "e.k = ?".to_string()];
+    apply_filters(
+        &mut conditions,
+        &mut params,
+        parsed,
+        filter,
+        collection_id,
+        "c.",
+        true,
+    );
+
+    let sql = format!(
+        "SELECT c.id, e.distance
+         FROM clip_embeddings e
+         JOIN clips c ON c.id = e.rowid
+         WHERE {}
+         ORDER BY e.distance ASC
+         LIMIT 60",
+        conditions.join(" AND ")
+    );
+    let param_refs: Vec<&dyn ToSql> = params.iter().map(|param| param.as_ref()).collect();
+    query_id_scores(conn, &sql, &param_refs).unwrap_or_default()
+}
+
+fn apply_filters(
+    conditions: &mut Vec<String>,
+    params: &mut Vec<Box<dyn ToSql>>,
+    parsed: &ParsedQuery,
+    filter: &str,
+    collection_id: Option<i64>,
+    prefix: &str,
+    include_temporal: bool,
+) {
+    let content_type = parsed
+        .content_type
+        .as_ref()
+        .cloned()
+        .or_else(|| match filter {
+            "all" | "pinned" => None,
+            other => Some(other.to_string()),
+        });
+    if let Some(content_type) = content_type {
+        conditions.push(format!("{prefix}content_type = ?"));
+        params.push(Box::new(content_type));
+    }
+
+    if parsed.is_pinned == Some(true) || filter == "pinned" {
+        conditions.push(format!("{prefix}pinned = 1"));
+    }
+
+    if include_temporal {
+        if let Some(after) = parsed.temporal_after {
+            conditions.push(format!("{prefix}created_at >= ?"));
+            params.push(Box::new(after));
+        }
+        if let Some(before) = parsed.temporal_before {
+            conditions.push(format!("{prefix}created_at <= ?"));
+            params.push(Box::new(before));
+        }
+    }
+
+    if !parsed.source_apps.is_empty() {
+        let app_conditions: Vec<String> = parsed
+            .source_apps
+            .iter()
+            .map(|_| format!("LOWER({prefix}source_app) LIKE ?"))
+            .collect();
+        conditions.push(format!("({})", app_conditions.join(" OR ")));
+        for app in &parsed.source_apps {
+            params.push(Box::new(format!("%{}%", app.to_lowercase())));
+        }
+    }
+
+    if let Some(min_length) = parsed.min_length {
+        conditions.push(format!(
+            "LENGTH(CASE WHEN {prefix}content_type = 'image' THEN COALESCE({prefix}ocr_text, '') ELSE {prefix}content END) >= ?"
+        ));
+        params.push(Box::new(min_length as i64));
+    }
+
+    if parsed.is_multiline == Some(true) {
+        conditions.push(format!(
+            "(INSTR({prefix}content, CHAR(10)) > 0 OR INSTR(COALESCE({prefix}ocr_text, ''), CHAR(10)) > 0)"
+        ));
+    }
+
+    if let Some(collection_id) = collection_id {
+        conditions.push(format!("{prefix}collection_id = ?"));
+        params.push(Box::new(collection_id));
+    }
+}
+
+fn add_ranked_scores(scores: &mut HashMap<i64, ScoreEntry>, ranked: &[(i64, f64)], weight: f64) {
+    for (idx, (id, raw_score)) in ranked.iter().enumerate() {
+        let rank_score = weight / (idx as f64 + 8.0);
+        let normalized = weight * raw_score.max(0.0) * 0.04;
+        scores.entry(*id).or_default().score += rank_score + normalized;
+    }
+}
+
+fn add_distance_scores(scores: &mut HashMap<i64, ScoreEntry>, ranked: &[(i64, f64)], weight: f64) {
+    let Some((_, best_distance)) = ranked.first() else {
+        return;
+    };
+    let best_distance = *best_distance;
+    for (idx, (id, distance)) in ranked.iter().enumerate() {
+        let rank_score = weight / (idx as f64 + 10.0);
+        let distance_score = weight * (1.0 / (1.0 + (distance - best_distance).max(0.0)));
+        scores.entry(*id).or_default().score += rank_score + distance_score;
+    }
+}
+
+fn sort_scored_ids(scores: HashMap<i64, ScoreEntry>, limit: usize) -> Vec<i64> {
+    let mut ranked = scores.into_iter().collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        right
+            .1
+            .score
+            .partial_cmp(&left.1.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    ranked
+        .into_iter()
+        .take(limit)
+        .map(|(id, _)| id)
+        .collect()
+}
+
+fn query_rows(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    params: &[&dyn ToSql],
+) -> Result<Vec<ClipResult>, String> {
+    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+    let rows = stmt.query_map(params, row_to_clip).map_err(|e| e.to_string())?;
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row.map_err(|e| e.to_string())?);
+    }
+    Ok(results)
+}
+
+fn query_id_scores(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    params: &[&dyn ToSql],
+) -> Result<Vec<(i64, f64)>, String> {
+    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params, |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?)))
+        .map_err(|e| e.to_string())?;
+    let mut results = Vec::new();
+    for row in rows {
+        let (id, score) = row.map_err(|e| e.to_string())?;
+        results.push((id, score));
+    }
+    Ok(results)
+}
+
+fn fetch_clips_by_ids(conn: &rusqlite::Connection, ids: &[i64]) -> Result<Vec<ClipResult>, String> {
+    if ids.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let placeholders = (0..ids.len()).map(|_| "?").collect::<Vec<_>>().join(", ");
+    let sql = format!("SELECT {SEL} FROM clips WHERE id IN ({placeholders})");
+    let params: Vec<&dyn ToSql> = ids.iter().map(|id| id as &dyn ToSql).collect();
+    let rows = query_rows(conn, &sql, &params)?;
+    let mut by_id: HashMap<i64, ClipResult> = rows.into_iter().map(|clip| (clip.id, clip)).collect();
+
+    let mut ordered = Vec::new();
+    for id in ids {
+        if let Some(clip) = by_id.remove(id) {
+            ordered.push(clip);
+        }
+    }
+    Ok(ordered)
+}
+
+fn fts_query(parsed: &ParsedQuery) -> String {
+    let mut tokens = if !parsed.keywords.is_empty() {
+        parsed.keywords.clone()
+    } else {
+        parsed
+            .semantic
+            .split_whitespace()
+            .map(|part| part.to_lowercase())
+            .collect()
+    };
+    if tokens.is_empty() {
+        return String::new();
+    }
+    for token in &mut tokens {
+        token.retain(|c| c.is_alphanumeric() || c == '_' || c == '-');
+    }
+    tokens.retain(|token| !token.is_empty());
+    if tokens.is_empty() {
+        return String::new();
+    }
+    tokens.truncate(12);
+
+    let mut query_parts = Vec::new();
+    if parsed.semantic.contains(' ') {
+        let phrase = parsed
+            .semantic
+            .chars()
+            .filter(|c| c.is_alphanumeric() || c.is_whitespace() || *c == '_' || *c == '-')
+            .collect::<String>();
+        let phrase = phrase.trim();
+        if !phrase.is_empty() {
+            query_parts.push(format!("\"{phrase}\""));
+        }
+    }
+    for token in tokens {
+        query_parts.push(format!("{token}*"));
+    }
+    query_parts.join(" OR ")
+}
+
+fn collect_ranked_scores(
+    conn: &rusqlite::Connection,
+    parsed: &ParsedQuery,
+    filter: &str,
+    collection_id: Option<i64>,
+    semantic_candidates: Option<&[(i64, f64)]>,
+    include_temporal: bool,
+) -> Result<(HashMap<i64, ScoreEntry>, bool), String> {
+    let fts = do_fts_candidates(conn, parsed, filter, collection_id, include_temporal)?;
+    let phrase = if fts.len() >= 18 || parsed.semantic.len() > 96 {
+        Vec::new()
+    } else {
+        do_phrase_candidates(conn, parsed, filter, collection_id, include_temporal)?
+    };
+    let like = if phrase.len() >= 12 || fts.len() >= 24 || parsed.keywords.len() > 10 {
+        Vec::new()
+    } else {
+        do_like_candidates(conn, parsed, filter, collection_id, include_temporal)?
+    };
+
+    let mut scores: HashMap<i64, ScoreEntry> = HashMap::new();
+    add_ranked_scores(&mut scores, &phrase, 4.8);
+    add_ranked_scores(&mut scores, &fts, 4.4);
+    add_ranked_scores(&mut scores, &like, 3.0);
+    if let Some(vec_candidates) = semantic_candidates {
+        add_distance_scores(&mut scores, vec_candidates, 5.0);
+    }
+
+    Ok((scores, !include_temporal))
+}
+
+fn apply_clip_boosts(
+    scores: &mut HashMap<i64, ScoreEntry>,
+    clips: &[ClipResult],
+    parsed: &ParsedQuery,
+    temporal_relaxed: bool,
+) {
+    let semantic_lower = parsed.semantic.to_lowercase();
+    let temporal_center = temporal_center(parsed);
+
+    for clip in clips {
+        let text = format!(
+            "{} {} {}",
+            clip.content.to_lowercase(),
+            clip.ocr_text.as_deref().unwrap_or("").to_lowercase(),
+            clip.source_app.to_lowercase()
+        );
+        let entry = scores.entry(clip.id).or_default();
+        let mut keyword_hits = 0.0;
+
+        for keyword in parsed.keywords.iter().take(16) {
+            if text.contains(keyword) {
+                keyword_hits += 1.0;
+                entry.score += 0.7;
+            }
+        }
+
+        if !parsed.keywords.is_empty() {
+            entry.score += (keyword_hits / parsed.keywords.len() as f64) * 3.2;
+        }
+
+        if !semantic_lower.is_empty() && text.contains(&semantic_lower) {
+            entry.score += 2.8;
+        }
+
+        if let Some(content_type) = parsed.content_type.as_deref() {
+            if clip.content_type == content_type {
+                entry.score += 1.8;
+            }
+        }
+
+        if !parsed.source_apps.is_empty()
+            && parsed
+                .source_apps
+                .iter()
+                .any(|app| clip.source_app.to_lowercase().contains(&app.to_lowercase()))
+        {
+            entry.score += 1.6;
+        }
+
+        if parsed.content_type.as_deref() == Some("image")
+            && clip.ocr_text.as_deref().is_some_and(|text| !text.trim().is_empty())
+        {
+            entry.score += 0.5;
+        }
+
+        if clip.pinned {
+            entry.score += 0.18;
+        }
+        entry.score += ((clip.copy_count as f64) + 1.0).ln() * 0.18;
+
+        if temporal_relaxed {
+            if let Some(center) = temporal_center {
+                let distance = (clip.created_at - center).abs() as f64;
+                entry.score += 2.4 / (1.0 + distance / 86_400.0);
+            }
+        }
+    }
+}
+
+fn temporal_center(parsed: &ParsedQuery) -> Option<i64> {
+    match (parsed.temporal_after, parsed.temporal_before) {
+        (Some(after), Some(before)) => Some(after + ((before - after) / 2)),
+        (Some(after), None) => Some(after),
+        (None, Some(before)) => Some(before),
+        (None, None) => None,
+    }
+}
+
+fn type_filter(filter: &str, prefix: &str) -> String {
+    match filter {
+        "all" | "pinned" => String::new(),
+        value => format!(" AND {prefix}content_type = '{value}'"),
+    }
+}
+
+fn pinned_filter(filter: &str) -> &'static str {
+    if filter == "pinned" {
+        " AND pinned = 1"
+    } else {
+        ""
+    }
+}
+
+fn coll_filter(collection_id: Option<i64>) -> String {
+    match collection_id {
+        Some(collection_id) => format!(" AND collection_id = {collection_id}"),
+        None => String::new(),
+    }
+}
+
+fn trunc(text: &str) -> String {
+    if text.len() <= 500 {
+        return text.to_string();
+    }
+    match text.char_indices().nth(500) {
+        Some((index, _)) => format!("{}…", &text[..index]),
+        None => text.to_string(),
+    }
+}
+
+fn b64(data: &[u8]) -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let a = chunk[0] as u32;
+        let b = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let c = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (a << 16) | (b << 8) | c;
+        encoded.push(CHARS[((triple >> 18) & 0x3F) as usize] as char);
+        encoded.push(CHARS[((triple >> 12) & 0x3F) as usize] as char);
+        encoded.push(if chunk.len() > 1 {
+            CHARS[((triple >> 6) & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+        encoded.push(if chunk.len() > 2 {
+            CHARS[(triple & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+    }
+    encoded
+}
+
+fn gen_thumb(data: &[u8], width: u32, height: u32, max: u32) -> Option<Vec<u8>> {
+    let scale = if width > max || height > max {
+        max as f32 / width.max(height) as f32
     } else {
         1.0
     };
-
     let new_width = (width as f32 * scale) as u32;
     let new_height = (height as f32 * scale) as u32;
     if new_width == 0 || new_height == 0 {
         return None;
     }
 
-    let mut png_data = Vec::new();
+    let mut png = Vec::new();
     {
-        let mut encoder = png::Encoder::new(&mut png_data, new_width, new_height);
+        let mut encoder = png::Encoder::new(&mut png, new_width, new_height);
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
-
         if let Ok(mut writer) = encoder.write_header() {
             let mut resized = vec![0u8; (new_width * new_height * 4) as usize];
             for y in 0..new_height {
@@ -227,327 +1040,415 @@ fn generate_thumbnail_sized(data: &[u8], width: u32, height: u32, max_size: u32)
         }
     }
 
-    if png_data.is_empty() {
-        None
-    } else {
-        Some(png_data)
-    }
+    if png.is_empty() { None } else { Some(png) }
 }
 
-// ─── Search Strategies ────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+    use std::time::Instant;
 
-fn search_empty(conn: &rusqlite::Connection, filter: &str) -> Result<Vec<ClipResult>, String> {
-    let sql = match filter {
-        "all" => format!(
-            "SELECT {} FROM clips ORDER BY {} LIMIT 50",
-            SEL,
-            list_order("")
-        ),
-        "pinned" => format!(
-            "SELECT {} FROM clips WHERE pinned = 1 ORDER BY {} LIMIT 50",
-            SEL,
-            list_order("")
-        ),
-        f => format!(
-            "SELECT {} FROM clips WHERE content_type = '{}' ORDER BY {} LIMIT 50",
-            SEL,
-            f,
-            list_order("")
-        ),
-    };
-    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
-    let mut results = Vec::new();
-    let rows = stmt.query_map([], row_to_clip).map_err(|e| e.to_string())?;
-    for r in rows {
-        results.push(r.map_err(|e| e.to_string())?);
+    fn setup_test_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE clips (
+                id INTEGER PRIMARY KEY,
+                content TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                content_type TEXT NOT NULL,
+                source_app TEXT DEFAULT '',
+                source_app_icon BLOB,
+                content_highlighted TEXT,
+                ocr_text TEXT,
+                image_data BLOB,
+                image_thumbnail BLOB,
+                image_width INTEGER DEFAULT 0,
+                image_height INTEGER DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                pinned INTEGER DEFAULT 0,
+                collection_id INTEGER,
+                language TEXT,
+                copy_count INTEGER DEFAULT 0
+            );
+            CREATE VIRTUAL TABLE clips_fts USING fts5(content, ocr_text);
+            CREATE INDEX idx_test_clips_created ON clips(created_at DESC);
+            ",
+        )
+        .unwrap();
+        conn
     }
-    Ok(results)
-}
 
-fn search_by_source_app(
-    conn: &rusqlite::Connection,
-    app_name: &str,
-    filter: &str,
-    temporal: &str,
-) -> Result<Vec<ClipResult>, String> {
-    let tc = if filter != "all" && filter != "pinned" {
-        format!(" AND content_type = '{}'", filter)
-    } else {
-        String::new()
-    };
-    let pc = if filter == "pinned" {
-        " AND pinned = 1"
-    } else {
-        ""
-    };
-
-    let sql = format!(
-        "SELECT {} FROM clips WHERE LOWER(source_app) LIKE '%{}%'{}{}{}
-         ORDER BY {} LIMIT 50",
-        SEL,
-        app_name.to_lowercase(),
-        tc,
-        pc,
-        temporal,
-        list_order("")
-    );
-    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
-    let mut results = Vec::new();
-    let rows = stmt.query_map([], row_to_clip).map_err(|e| e.to_string())?;
-    for r in rows {
-        results.push(r.map_err(|e| e.to_string())?);
+    fn insert_clip(
+        conn: &Connection,
+        id: i64,
+        content: &str,
+        content_type: &str,
+        source_app: &str,
+        created_at: i64,
+        ocr_text: Option<&str>,
+    ) {
+        insert_clip_with_language(conn, id, content, content_type, source_app, created_at, ocr_text, None);
     }
-    Ok(results)
-}
 
-fn do_search_fts(
-    conn: &rusqlite::Connection,
-    query: &str,
-    filter: &str,
-    temporal: &str,
-    sa: &str,
-) -> Vec<ClipResult> {
-    let fq = fts_q(query);
-    if fq.is_empty() {
-        return vec![];
-    }
-    let tc = if filter != "all" && filter != "pinned" {
-        format!(" AND c.content_type = '{}'", filter)
-    } else {
-        String::new()
-    };
-    let pc = if filter == "pinned" {
-        " AND c.pinned = 1"
-    } else {
-        ""
-    };
-    let sql = format!(
-        "SELECT c.id, c.content, c.content_type, c.source_app, c.created_at, c.pinned, c.content_highlighted, c.source_app_icon, c.ocr_text, c.image_thumbnail
-         FROM clips_fts fts JOIN clips c ON c.id = fts.rowid
-         WHERE clips_fts MATCH ?1{}{}{}{} ORDER BY fts.rank, {} LIMIT 50",
-        tc,
-        pc,
-        temporal,
-        sa,
-        list_order("c.")
-    );
-    let mut stmt = match conn.prepare(&sql) {
-        Ok(s) => s,
-        Err(_) => return vec![],
-    };
-    let rows = match stmt.query_map([&fq], row_to_clip) {
-        Ok(r) => r,
-        Err(_) => return vec![],
-    };
-    rows.filter_map(|r| r.ok()).collect()
-}
-
-fn do_search_vec(
-    model: &crate::embed::EmbeddingModel,
-    conn: &rusqlite::Connection,
-    query: &str,
-    filter: &str,
-    temporal: &str,
-    sa: &str,
-) -> Vec<ClipResult> {
-    let qv = match crate::embed::embed_query(model, query) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("[Search] Embed failed: {}", e);
-            return vec![];
+    fn insert_clip_with_language(
+        conn: &Connection,
+        id: i64,
+        content: &str,
+        content_type: &str,
+        source_app: &str,
+        created_at: i64,
+        ocr_text: Option<&str>,
+        language: Option<&str>,
+    ) {
+        conn.execute(
+            "INSERT INTO clips (
+                id, content, content_hash, content_type, source_app, ocr_text, created_at, pinned, language, copy_count
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, NULL, 0)",
+            rusqlite::params![
+                id,
+                content,
+                format!("hash-{id}"),
+                content_type,
+                source_app,
+                ocr_text,
+                created_at
+            ],
+        )
+        .unwrap();
+        if let Some(language) = language {
+            conn.execute(
+                "UPDATE clips SET language = ?1 WHERE id = ?2",
+                rusqlite::params![language, id],
+            )
+            .unwrap();
         }
-    };
-    if qv.len() != 768 {
-        return vec![];
+        conn.execute(
+            "INSERT INTO clips_fts(rowid, content, ocr_text) VALUES (?1, ?2, ?3)",
+            rusqlite::params![id, content, ocr_text.unwrap_or("")],
+        )
+        .unwrap();
     }
-    let vb: Vec<u8> = qv.iter().flat_map(|f| f.to_le_bytes()).collect();
-    let tc = if filter != "all" && filter != "pinned" {
-        format!(" AND c.content_type = '{}'", filter)
-    } else {
-        String::new()
-    };
-    let pc = if filter == "pinned" {
-        " AND c.pinned = 1"
-    } else {
-        ""
-    };
-    let sql = format!(
-        "WITH knn AS (SELECT rowid, distance FROM clip_embeddings WHERE embedding MATCH ?1 AND k = 200)
-         SELECT c.id, c.content, c.content_type, c.source_app, c.created_at, c.pinned, c.content_highlighted, c.source_app_icon, c.ocr_text, c.image_thumbnail
-         FROM knn vec JOIN clips c ON c.id = vec.rowid
-         WHERE 1=1{}{}{}{} ORDER BY vec.distance, {} LIMIT 50",
-        tc,
-        pc,
-        temporal,
-        sa,
-        list_order("c.")
-    );
-    let mut stmt = match conn.prepare(&sql) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("[Search] Vec SQL: {}", e);
-            return vec![];
-        }
-    };
-    let rows = match stmt.query_map([vb], row_to_clip) {
-        Ok(r) => r,
-        Err(_) => return vec![],
-    };
-    rows.filter_map(|r| r.ok()).collect()
-}
 
-fn do_search_like(
-    conn: &rusqlite::Connection,
-    query: &str,
-    filter: &str,
-    temporal: &str,
-    sa: &str,
-) -> Vec<ClipResult> {
-    let p = format!("%{}%", query);
-    let tc = if filter != "all" && filter != "pinned" {
-        format!(" AND content_type = '{}'", filter)
-    } else {
-        String::new()
-    };
-    let pc = if filter == "pinned" {
-        " AND pinned = 1"
-    } else {
-        ""
-    };
-    let sql = format!(
-        "SELECT id, content, content_type, source_app, created_at, pinned, content_highlighted, source_app_icon, ocr_text, image_thumbnail
-         FROM clips WHERE content LIKE ?1{}{}{}{} ORDER BY {} LIMIT 30",
-        tc,
-        pc,
-        temporal,
-        sa,
-        list_order("")
-    );
-    let mut stmt = match conn.prepare(&sql) {
-        Ok(s) => s,
-        Err(_) => return vec![],
-    };
-    let rows = match stmt.query_map([&p], row_to_clip) {
-        Ok(r) => r,
-        Err(_) => return vec![],
-    };
-    rows.filter_map(|r| r.ok()).collect()
-}
-
-// ─── Helpers ──────────────────────────────────────────────────────
-
-const SEL: &str = "id, content, content_type, source_app, created_at, pinned, content_highlighted, source_app_icon, ocr_text, image_thumbnail";
-
-fn list_order(prefix: &str) -> String {
-    format!("{prefix}pinned DESC, {prefix}created_at DESC")
-}
-
-fn row_to_clip(r: &rusqlite::Row) -> rusqlite::Result<ClipResult> {
-    let ic: Option<Vec<u8>> = r.get(7).unwrap_or(None);
-    let thumbnail: Option<Vec<u8>> = r.get(9).unwrap_or(None);
-    Ok(ClipResult {
-        id: r.get(0)?,
-        content: trunc(&r.get::<_, String>(1).unwrap_or_default()),
-        content_type: r.get(2)?,
-        source_app: r.get(3)?,
-        created_at: r.get(4)?,
-        pinned: r.get::<_, i64>(5)? != 0,
-        source_app_icon: ic.filter(|b| !b.is_empty()).map(|b| b64(&b)),
-        content_highlighted: r.get(6)?,
-        ocr_text: r.get(8).unwrap_or(None),
-        image_thumbnail: thumbnail.filter(|b| !b.is_empty()).map(|b| b64(&b)),
-    })
-}
-
-fn fts_q(query: &str) -> String {
-    let w: Vec<&str> = query.split_whitespace().collect();
-    if w.is_empty() {
-        return String::new();
-    }
-    if w.len() == 1 {
-        return format!("{}*", w[0]);
-    }
-    w.iter()
-        .enumerate()
-        .map(|(i, w)| {
-            if i == w.len() - 1 {
-                format!("{}*", w)
-            } else {
-                w.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn trunc(s: &str) -> String {
-    if s.len() > 500 {
-        let e = s
-            .char_indices()
-            .map(|(i, _)| i)
-            .take_while(|&i| i <= 500)
-            .last()
-            .unwrap_or(0);
-        format!("{}…", &s[..e])
-    } else {
-        s.to_string()
-    }
-}
-
-fn b64(data: &[u8]) -> String {
-    const C: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut r = String::with_capacity((data.len() + 2) / 3 * 4);
-    for c in data.chunks(3) {
-        let (a, b, c2) = (
-            c[0] as u32,
-            if c.len() > 1 { c[1] as u32 } else { 0 },
-            if c.len() > 2 { c[2] as u32 } else { 0 },
+    #[test]
+    fn meaning_query_finds_boarding_pass() {
+        let conn = setup_test_db();
+        insert_clip(
+            &conn,
+            1,
+            "Boarding pass for QF12 to Los Angeles. Gate A12. Terminal 3.",
+            "text",
+            "Mail",
+            1_710_000_000,
+            None,
         );
-        let t = (a << 16) | (b << 8) | c2;
-        r.push(C[((t >> 18) & 0x3F) as usize] as char);
-        r.push(C[((t >> 12) & 0x3F) as usize] as char);
-        r.push(if c.len() > 1 {
-            C[((t >> 6) & 0x3F) as usize] as char
-        } else {
-            '='
-        });
-        r.push(if c.len() > 2 {
-            C[(t & 0x3F) as usize] as char
-        } else {
-            '='
-        });
-    }
-    r
-}
+        insert_clip(
+            &conn,
+            2,
+            "Grocery list for tonight",
+            "text",
+            "Notes",
+            1_710_000_100,
+            None,
+        );
 
-fn rrf(lists: Vec<Vec<ClipResult>>) -> Vec<ClipResult> {
-    let k = 60.0;
-    let mut sc: HashMap<i64, f64> = HashMap::new();
-    let mut cm: HashMap<i64, ClipResult> = HashMap::new();
-    for l in &lists {
-        for (r, c) in l.iter().enumerate() {
-            *sc.entry(c.id).or_insert(0.0) += 1.0 / (k + r as f64 + 1.0);
-            cm.entry(c.id).or_insert_with(|| c.clone());
-        }
+        let parsed = query_parser::parse_query("flight info");
+        let results = do_ranked_search(&conn, &parsed, "all", None, None).unwrap();
+        assert_eq!(results.first().map(|clip| clip.id), Some(1));
     }
-    let mut rv: Vec<(i64, f64)> = sc.into_iter().collect();
-    rv.sort_by(|a, b| {
-        let score_order = b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal);
-        if score_order != std::cmp::Ordering::Equal {
-            return score_order;
-        }
 
-        let left = cm.get(&a.0);
-        let right = cm.get(&b.0);
-        match (left, right) {
-            (Some(left), Some(right)) => right
-                .pinned
-                .cmp(&left.pinned)
-                .then_with(|| right.created_at.cmp(&left.created_at)),
-            _ => std::cmp::Ordering::Equal,
+    #[test]
+    fn natural_filter_query_finds_slack_url() {
+        let conn = setup_test_db();
+        insert_clip(
+            &conn,
+            1,
+            "https://slack.com/archives/C123/p456",
+            "url",
+            "Slack",
+            1_710_000_000,
+            None,
+        );
+        insert_clip(
+            &conn,
+            2,
+            "https://example.com/docs",
+            "url",
+            "Safari",
+            1_720_000_000,
+            None,
+        );
+
+        let parsed = query_parser::parse_query("url from slack yesterday");
+        let results = do_filter_search(&conn, &parsed, "all", None).unwrap();
+        assert_eq!(results.first().map(|clip| clip.id), Some(1));
+    }
+
+    #[test]
+    fn code_block_query_finds_code_clip() {
+        let conn = setup_test_db();
+        insert_clip(
+            &conn,
+            1,
+            "fn main() {\n    println!(\"hello\");\n}",
+            "code",
+            "Code",
+            1_710_000_000,
+            None,
+        );
+        insert_clip(
+            &conn,
+            2,
+            "hello there",
+            "text",
+            "Messages",
+            1_710_000_050,
+            None,
+        );
+
+        let parsed = query_parser::parse_query("code block");
+        let results = do_filter_search(&conn, &parsed, "all", None).unwrap();
+        assert_eq!(results.first().map(|clip| clip.id), Some(1));
+    }
+
+    #[test]
+    fn empty_query_defaults_to_latest_first() {
+        let conn = setup_test_db();
+        insert_clip(
+            &conn,
+            1,
+            "older pinned item",
+            "text",
+            "Notes",
+            1_710_000_000,
+            None,
+        );
+        conn.execute("UPDATE clips SET pinned = 1, copy_count = 99 WHERE id = 1", [])
+            .unwrap();
+        insert_clip(
+            &conn,
+            2,
+            "newest item",
+            "text",
+            "Notes",
+            1_720_000_000,
+            None,
+        );
+
+        let results = do_empty_search(&conn, "all", None).unwrap();
+        assert_eq!(results.first().map(|clip| clip.id), Some(2));
+    }
+
+    #[test]
+    fn ocr_text_is_ranked_for_image_searches() {
+        let conn = setup_test_db();
+        insert_clip(
+            &conn,
+            1,
+            "[Image]",
+            "image",
+            "Photos",
+            1_710_000_000,
+            Some("Boarding pass for SQ221 gate B7 terminal 1"),
+        );
+        insert_clip(
+            &conn,
+            2,
+            "[Image]",
+            "image",
+            "Photos",
+            1_710_000_100,
+            Some("Random screenshot of a recipe"),
+        );
+
+        let parsed = query_parser::parse_query("boarding pass screenshot");
+        let results = do_ranked_search(&conn, &parsed, "all", None, None).unwrap();
+        assert_eq!(results.first().map(|clip| clip.id), Some(1));
+    }
+
+    #[test]
+    fn language_and_type_filters_find_multilingual_images() {
+        let conn = setup_test_db();
+        insert_clip_with_language(
+            &conn,
+            1,
+            "[Image]",
+            "image",
+            "Photos",
+            1_710_000_000,
+            Some("搭乗券 ゲート B7"),
+            Some("ja"),
+        );
+        insert_clip_with_language(
+            &conn,
+            2,
+            "[Image]",
+            "image",
+            "Photos",
+            1_710_000_100,
+            Some("boarding pass gate B7"),
+            Some("en"),
+        );
+
+        let parsed = query_parser::parse_query("japanese screenshot");
+        let results = do_filter_search(&conn, &parsed, "all", None).unwrap();
+        assert_eq!(results.first().map(|clip| clip.id), Some(1));
+    }
+
+    #[test]
+    #[ignore]
+    fn search_stress_benchmark() {
+        let conn = setup_test_db();
+        let now = 1_720_000_000_i64;
+        for id in 1..=5000_i64 {
+            let content = format!("noise clip {id} lorem ipsum dolor sit amet {id}");
+            let content_type = if id % 9 == 0 { "url" } else if id % 13 == 0 { "code" } else { "text" };
+            let source_app = if id % 7 == 0 { "Slack" } else { "Notes" };
+            insert_clip(&conn, id, &content, content_type, source_app, now - id, None);
         }
-    });
-    rv.into_iter()
-        .filter_map(|(id, _)| cm.remove(&id))
-        .collect()
+        insert_clip(
+            &conn,
+            9001,
+            "Boarding pass for SQ221 with gate B7 and terminal details",
+            "text",
+            "Mail",
+            now + 1,
+            None,
+        );
+        insert_clip(
+            &conn,
+            9002,
+            "https://slack.com/archives/C123/p12345",
+            "url",
+            "Slack",
+            now - 86_400,
+            None,
+        );
+        insert_clip(
+            &conn,
+            9003,
+            "fn render_card() {\n    return view;\n}",
+            "code",
+            "Code",
+            now,
+            None,
+        );
+
+        let queries = [
+            "flight info",
+            "url from slack",
+            "code block",
+            "boarding pass",
+            "url from slack yesterday",
+        ];
+
+        let started = Instant::now();
+        for _ in 0..25 {
+            for query in queries {
+                let parsed = query_parser::parse_query(query);
+                if parsed.query_is_empty_after_parse || parsed.semantic.is_empty() {
+                    let _ = do_filter_search(&conn, &parsed, "all", None).unwrap();
+                } else {
+                    let _ = do_ranked_search(&conn, &parsed, "all", None, None).unwrap();
+                }
+            }
+        }
+        let elapsed = started.elapsed();
+        eprintln!(
+            "[search-stress] {} searches over 5003 clips in {:?} ({:.2} ms/search)",
+            25 * queries.len(),
+            elapsed,
+            elapsed.as_secs_f64() * 1000.0 / (25.0 * queries.len() as f64)
+        );
+        assert!(elapsed.as_millis() < 15_000);
+    }
+
+    #[test]
+    #[ignore]
+    fn search_large_dataset_benchmark() {
+        let conn = setup_test_db();
+        let now = 1_720_000_000_i64;
+        for id in 1..=20_000_i64 {
+            let content = format!("noise clip {id} lorem ipsum dolor sit amet {id}");
+            let content_type = if id % 11 == 0 {
+                "url"
+            } else if id % 17 == 0 {
+                "code"
+            } else if id % 23 == 0 {
+                "image"
+            } else {
+                "text"
+            };
+            let source_app = if id % 7 == 0 {
+                "Slack"
+            } else if id % 5 == 0 {
+                "Mail"
+            } else {
+                "Notes"
+            };
+            let ocr = if content_type == "image" {
+                Some("Boarding pass receipt code snippet link screenshot")
+            } else {
+                None
+            };
+            insert_clip(&conn, id, &content, content_type, source_app, now - id, ocr);
+        }
+        insert_clip(
+            &conn,
+            30_001,
+            "Boarding pass for SQ221 with gate B7 and terminal details",
+            "text",
+            "Mail",
+            now + 1,
+            None,
+        );
+        insert_clip(
+            &conn,
+            30_002,
+            "https://slack.com/archives/C123/p12345",
+            "url",
+            "Slack",
+            now - 86_400,
+            None,
+        );
+        insert_clip(
+            &conn,
+            30_003,
+            "[Image]",
+            "image",
+            "Photos",
+            now,
+            Some("搭乗券 ゲート B7"),
+        );
+
+        let queries = [
+            "flight info",
+            "url from slack",
+            "code block",
+            "boarding pass",
+            "url from slack yesterday",
+            "japanese screenshot",
+        ];
+
+        let started = Instant::now();
+        for _ in 0..20 {
+            for query in queries {
+                let parsed = query_parser::parse_query(query);
+                if parsed.query_is_empty_after_parse || parsed.semantic.is_empty() {
+                    let _ = do_filter_search(&conn, &parsed, "all", None).unwrap();
+                } else {
+                    let _ = do_ranked_search(&conn, &parsed, "all", None, None).unwrap();
+                }
+            }
+        }
+        let elapsed = started.elapsed();
+        eprintln!(
+            "[search-large] {} searches over 20003 clips in {:?} ({:.2} ms/search)",
+            20 * queries.len(),
+            elapsed,
+            elapsed.as_secs_f64() * 1000.0 / (20.0 * queries.len() as f64)
+        );
+        assert!(elapsed.as_millis() < 20_000);
+    }
 }
