@@ -55,3 +55,5 @@ core-graphics = "0.25"
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+
+
