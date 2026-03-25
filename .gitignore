@@ -2,12 +2,24 @@ node_modules/
 
 dist/
 src-tauri/target/
+target/
 
 .vscode/
 .idea/
 
 .DS_Store
 Thumbs.db
+
+.env
+.env.*
+!.env.example
+
+.tauri/
+release-helper.sh
+*.key
+*.pem
+*.p12
+*.pfx
 
 src-tauri/gen/
 

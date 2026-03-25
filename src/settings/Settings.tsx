@@ -1,4 +1,5 @@
 import { useEffect, useState, useCallback, useRef } from "react";
+import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import {
   Keyboard,
@@ -160,6 +161,7 @@ export default function Settings() {
   const [config, setConfig] = useState<CopiConfig | null>(null);
   const [dbSize, setDbSize] = useState(0);
   const [clipCount, setClipCount] = useState(0);
+  const [appVersion, setAppVersion] = useState<string | null>(null);
 
   const [savedField, setSavedField] = useState<string | null>(null);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -192,6 +194,7 @@ export default function Settings() {
       .catch((e) => console.error("Config load failed:", e));
     invoke<number>("get_db_size").then(setDbSize).catch(() => {});
     invoke<number>("get_total_clip_count").then(setClipCount).catch(() => {});
+    getVersion().then(setAppVersion).catch(() => {});
     fetchCollections();
   }, [fetchCollections]);
 
@@ -671,6 +674,14 @@ export default function Settings() {
 
           <Divider />
 
+          <Row label="Current Version">
+            <span className="text-[12px]" style={{ color: "var(--text-secondary)" }}>
+              {appVersion ? `v${appVersion}` : "Unknown"}
+            </span>
+          </Row>
+
+          <Divider />
+
           <Row label="Check for Updates">
             <button
               type="button"
@@ -678,7 +689,7 @@ export default function Settings() {
               onClick={async () => {
                 setCheckingUpdate(true);
                 try {
-                  await checkForUpdates(false);
+                  await checkForUpdates("interactive");
                 } finally {
                   setCheckingUpdate(false);
                 }

@@ -25,7 +25,7 @@ function App() {
           general: { auto_check_updates: boolean };
         }>("get_config");
         if (config.general.auto_check_updates) {
-          await checkForUpdates(true);
+          await checkForUpdates("background");
         }
       } catch (e) {
         console.error("[Updater] Check failed:", e);
