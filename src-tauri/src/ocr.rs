@@ -389,12 +389,13 @@ fn extract_result(request: &vn::RecognizeTextRequest) -> Result<OcrPassResult, S
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[cfg(target_os = "windows")]
+use windows_core::Interface;
+
+#[cfg(target_os = "windows")]
 use windows::{
     core::HSTRING,
     Globalization::Language,
-    Graphics::Imaging::{
-        BitmapAlphaMode, BitmapBufferAccessMode, BitmapPixelFormat, SoftwareBitmap,
-    },
+    Graphics::Imaging::{BitmapBufferAccessMode, BitmapPixelFormat, SoftwareBitmap},
     Media::Ocr::{OcrEngine as WinOcrEngine, OcrResult},
 };
 
@@ -415,22 +416,19 @@ impl WindowsMediaOcr {
     fn new() -> Result<Self, String> {
         // Try to create OCR engine from user's preferred languages
         if let Ok(engine) = WinOcrEngine::TryCreateFromUserProfileLanguages() {
-            if let Some(engine) = engine {
-                let lang_tag = engine
-                    .RecognizerLanguage()
-                    .ok()
-                    .and_then(|lang| lang.LanguageTag().ok())
-                    .map(|tag| tag.to_string_lossy())
-                    .unwrap_or_else(|| "unknown".to_string());
-                eprintln!(
-                    "[OCR] Windows engine initialized with language: {}",
-                    lang_tag
-                );
-                return Ok(Self {
-                    engine,
-                    language_tag: lang_tag,
-                });
-            }
+            let lang_tag = engine
+                .RecognizerLanguage()
+                .ok()
+                .and_then(|lang| lang.LanguageTag().ok().map(|tag| tag.to_string_lossy()))
+                .unwrap_or_else(|| "unknown".to_string());
+            eprintln!(
+                "[OCR] Windows engine initialized with language: {}",
+                lang_tag
+            );
+            return Ok(Self {
+                engine,
+                language_tag: lang_tag,
+            });
         }
 
         // Fall back to specific languages in order of preference
@@ -438,7 +436,7 @@ impl WindowsMediaOcr {
         for lang_tag in fallback_languages {
             if let Ok(lang) = Language::CreateLanguage(&HSTRING::from(lang_tag)) {
                 if WinOcrEngine::IsLanguageSupported(&lang).unwrap_or(false) {
-                    if let Ok(Some(engine)) = WinOcrEngine::TryCreateFromLanguage(&lang) {
+                    if let Ok(engine) = WinOcrEngine::TryCreateFromLanguage(&lang) {
                         eprintln!(
                             "[OCR] Windows engine initialized with fallback: {}",
                             lang_tag
@@ -456,7 +454,7 @@ impl WindowsMediaOcr {
         if let Ok(langs) = WinOcrEngine::AvailableRecognizerLanguages() {
             for i in 0..langs.Size().unwrap_or(0) {
                 if let Ok(lang) = langs.GetAt(i) {
-                    if let Ok(Some(engine)) = WinOcrEngine::TryCreateFromLanguage(&lang) {
+                    if let Ok(engine) = WinOcrEngine::TryCreateFromLanguage(&lang) {
                         let tag = lang
                             .LanguageTag()
                             .ok()
@@ -507,7 +505,6 @@ impl OcrEngine for WindowsMediaOcr {
             BitmapPixelFormat::Bgra8,
             width as i32,
             height as i32,
-            BitmapAlphaMode::Premultiplied,
         )
         .map_err(|e| format!("Failed to create SoftwareBitmap: {}", e))?;
 

@@ -254,12 +254,12 @@ fn main() {
             }
 
             // Apply vibrancy to setup window
-            if let Some(setup) = handle.get_webview_window("setup") {
+            if let Some(_setup) = handle.get_webview_window("setup") {
                 #[cfg(target_os = "macos")]
                 {
                     use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial};
                     let _ = apply_vibrancy(
-                        &setup,
+                        &_setup,
                         NSVisualEffectMaterial::HudWindow,
                         None,
                         Some(16.0),
@@ -269,12 +269,12 @@ fn main() {
             }
 
             // Apply vibrancy to settings window
-            if let Some(settings) = handle.get_webview_window("settings") {
+            if let Some(_settings) = handle.get_webview_window("settings") {
                 #[cfg(target_os = "macos")]
                 {
                     use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial};
                     let _ = apply_vibrancy(
-                        &settings,
+                        &_settings,
                         NSVisualEffectMaterial::Sidebar,
                         None,
                         Some(12.0),
