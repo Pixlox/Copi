@@ -30,12 +30,123 @@ const INITIAL_STATUS: ModelSetupStatus = {
   setupRequired: true,
 };
 
-function formatBytes(bytes: number): string {
-  if (!bytes) return "0 MB";
-  const units = ["B", "KB", "MB", "GB"];
-  const power = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
-  const value = bytes / Math.pow(1024, power);
-  return `${value.toFixed(power === 0 ? 0 : 1)} ${units[power]}`;
+type SetupState = "initial" | "downloading" | "installing" | "ready" | "error";
+
+function deriveState(status: ModelSetupStatus): SetupState {
+  if (status.error) return "error";
+  if (status.ready) return "ready";
+  if (status.phase === "installing") return "installing";
+  if (status.phase === "downloading") return "downloading";
+  return "initial";
+}
+
+// Inline SVG logo (extracted from icons/copi-logo.svg, simplified for setup)
+function Logo({ className }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      width="80"
+      height="80"
+      viewBox="0 0 512 512"
+      xmlns="http://www.w3.org/2000/svg"
+    >
+      <defs>
+        <linearGradient id="setup-bg" x1="0%" y1="0%" x2="100%" y2="100%">
+          <stop offset="0%" stopColor="#1a1a1f" />
+          <stop offset="100%" stopColor="#111114" />
+        </linearGradient>
+        <linearGradient id="setup-front" x1="0%" y1="0%" x2="100%" y2="100%">
+          <stop offset="0%" stopColor="#ffffff" stopOpacity="1" />
+          <stop offset="100%" stopColor="#c8c8d0" stopOpacity="1" />
+        </linearGradient>
+        <linearGradient id="setup-back" x1="0%" y1="0%" x2="100%" y2="100%">
+          <stop offset="0%" stopColor="#ffffff" stopOpacity="0.22" />
+          <stop offset="100%" stopColor="#ffffff" stopOpacity="0.10" />
+        </linearGradient>
+      </defs>
+      <g transform="translate(56, 56) scale(0.781)">
+        <rect width="512" height="512" rx="112" ry="112" fill="url(#setup-bg)" />
+        <rect
+          x="190" y="170"
+          width="196" height="236"
+          rx="28" ry="28"
+          fill="url(#setup-back)"
+          stroke="rgba(255,255,255,0.12)"
+          strokeWidth="1.5"
+        />
+        <rect
+          x="158" y="138"
+          width="196" height="236"
+          rx="28" ry="28"
+          fill="url(#setup-front)"
+        />
+        <rect x="188" y="186" width="80" height="8" rx="4" fill="#1a1a1f" opacity="0.18" />
+        <rect x="188" y="206" width="136" height="8" rx="4" fill="#1a1a1f" opacity="0.12" />
+        <rect x="188" y="226" width="112" height="8" rx="4" fill="#1a1a1f" opacity="0.12" />
+      </g>
+    </svg>
+  );
+}
+
+// Download icon for initial/downloading states
+function DownloadIcon({ className, animated }: { className?: string; animated?: boolean }) {
+  return (
+    <svg
+      className={`${className ?? ""} ${animated ? "setup-icon-pulse" : ""}`}
+      width="32"
+      height="32"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+      <polyline points="7 10 12 15 17 10" />
+      <line x1="12" y1="15" x2="12" y2="3" />
+    </svg>
+  );
+}
+
+// Checkmark icon for ready state
+function CheckIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      width="32"
+      height="32"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <polyline points="20 6 9 17 4 12" />
+    </svg>
+  );
+}
+
+// Warning icon for error state
+function WarningIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      width="32"
+      height="32"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <circle cx="12" cy="12" r="10" />
+      <line x1="12" y1="8" x2="12" y2="12" />
+      <line x1="12" y1="16" x2="12.01" y2="16" />
+    </svg>
+  );
 }
 
 export default function Setup() {
@@ -71,8 +182,8 @@ export default function Setup() {
     return Math.min((status.completedFiles + fileProgress) / status.totalFiles, 1);
   }, [status]);
 
-  const canDownload = !["downloading", "installing", "ready"].includes(status.phase);
-  const fileLabel = status.currentFile ? status.currentFile.replace(/_/g, " ") : null;
+  const state = deriveState(status);
+  const canDownload = state === "initial" || state === "error";
 
   const handleDownload = async () => {
     try {
@@ -88,94 +199,105 @@ export default function Setup() {
 
   const handleWindowDrag = (event: MouseEvent<HTMLDivElement>) => {
     const target = event.target as HTMLElement;
-    if (target.closest("[data-no-drag]")) {
-      return;
-    }
+    if (target.closest("[data-no-drag]")) return;
     void getCurrentWindow().startDragging();
   };
 
+  // Status text based on state
+  const statusText = useMemo(() => {
+    switch (state) {
+      case "initial":
+        return "One-time download required";
+      case "downloading":
+        return "Downloading search model...";
+      case "installing":
+        return "Almost ready...";
+      case "ready":
+        return "Ready";
+      case "error":
+        return "Something went wrong";
+    }
+  }, [state]);
+
+  // Brief explanation based on state
+  const explanation = useMemo(() => {
+    switch (state) {
+      case "initial":
+        return "Copi uses a small AI model (~300 MB) to search your clipboard intelligently.";
+      case "downloading":
+        return `${Math.round(progress * 100)}%`;
+      case "installing":
+        return "Preparing model for first use";
+      case "ready":
+        return `Press ${formatShortcut(hotkey)} to open`;
+      case "error":
+        return status.error ?? "Download failed";
+    }
+  }, [state, progress, hotkey, status.error]);
+
   return (
-    <div className="setup-window">
-      <div className="setup-backdrop" />
-      <div className="setup-card setup-enter" onMouseDown={handleWindowDrag}>
-        <div className="setup-header">
-          <span className="setup-eyebrow">Welcome screen</span>
-        </div>
+    <div className="setup-window" onMouseDown={handleWindowDrag}>
+      <div className="setup-container">
+        {/* Logo */}
+        <Logo className="setup-logo" />
 
-        <div className="setup-copy">
-          <h1>
-            Welcome to <strong>Copi</strong>
-          </h1>
-          <p>Your new clipboard copilot.</p>
-        </div>
+        {/* Status card */}
+        <div className="setup-card">
+          {/* Icon */}
+          <div className="setup-status-icon">
+            {state === "ready" ? (
+              <CheckIcon className="setup-icon setup-icon-success" />
+            ) : state === "error" ? (
+              <WarningIcon className="setup-icon setup-icon-error" />
+            ) : (
+              <DownloadIcon
+                className="setup-icon"
+                animated={state === "downloading" || state === "installing"}
+              />
+            )}
+          </div>
 
-        {status.ready ? (
-          <div className="setup-content">
-            <div className="setup-message">
-              <h2>You&apos;re all set.</h2>
-              <p>Hit {formatShortcut(hotkey)} to try it out.</p>
+          {/* Status text */}
+          <div className="setup-status-text">{statusText}</div>
+
+          {/* Explanation / progress */}
+          <div className="setup-explanation">{explanation}</div>
+
+          {/* Progress bar (only during download) */}
+          {(state === "downloading" || state === "installing") && (
+            <div className="setup-progress">
+              <div
+                className={`setup-progress-fill ${state === "installing" ? "setup-progress-indeterminate" : ""}`}
+                style={state === "downloading" ? { width: `${progress * 100}%` } : undefined}
+              />
             </div>
+          )}
 
+          {/* Action button */}
+          {canDownload && (
             <button
               type="button"
               className="setup-button"
               data-no-drag
-              onMouseDown={(event) => event.stopPropagation()}
+              onMouseDown={(e) => e.stopPropagation()}
+              onClick={handleDownload}
+            >
+              {state === "error" ? "Retry" : "Download"}
+            </button>
+          )}
+
+          {state === "ready" && (
+            <button
+              type="button"
+              className="setup-button setup-button-primary"
+              data-no-drag
+              onMouseDown={(e) => e.stopPropagation()}
               onClick={handleClose}
             >
-              Close
+              Get Started
             </button>
-          </div>
-        ) : (
-          <div className="setup-content">
-            <div className="setup-message">
-              <h2>Copi needs an embeddings model to run semantic search locally.</h2>
-              <p>Download our tested multilingual model once and keep it on this device.</p>
-            </div>
-
-            <div className="setup-download-block">
-              <div className="setup-file-summary">
-                <span>Download intfloat/multilingual-e5-small (~300MB)</span>
-                {fileLabel ? (
-                  <span>
-                    {fileLabel}
-                    {status.totalBytes > 0
-                      ? ` • ${formatBytes(status.downloadedBytes)} of ${formatBytes(status.totalBytes)}`
-                      : ""}
-                  </span>
-                ) : (
-                  <span>{status.completedFiles} of {status.totalFiles} files ready</span>
-                )}
-              </div>
-
-              <button
-                type="button"
-                className="setup-button"
-                data-no-drag
-                disabled={!canDownload}
-                onMouseDown={(event) => event.stopPropagation()}
-                onClick={handleDownload}
-              >
-                {status.phase === "installing"
-                  ? "Installing"
-                  : status.phase === "downloading"
-                    ? "Downloading"
-                    : "Download"}
-              </button>
-
-              <div className="setup-progress" aria-hidden="true">
-                <div className="setup-progress-fill" style={{ width: `${progress * 100}%` }} />
-              </div>
-
-              <div className="setup-meta">
-                <span>Stored in app local data</span>
-                {status.installPath ? <span>{status.installPath}</span> : null}
-              </div>
-
-              {status.error ? <div className="setup-error">{status.error}</div> : null}
-            </div>
-          </div>
-        )}
+          )}
+        </div>
       </div>
     </div>
   );

@@ -24,7 +24,13 @@ pub fn init_ocr_engine() -> Result<Box<dyn OcrEngine>, String> {
         Ok(Box::new(AppleVisionOcr { passes }))
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        eprintln!("[OCR] Initializing Windows Media OCR engine");
+        WindowsMediaOcr::new().map(|engine| Box::new(engine) as Box<dyn OcrEngine>)
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
         Err("OCR not available on this platform".to_string())
     }
@@ -376,4 +382,213 @@ fn extract_result(request: &vn::RecognizeTextRequest) -> Result<OcrPassResult, S
         char_count,
         meaningful_char_count,
     })
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Windows Media OCR Implementation
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(target_os = "windows")]
+use windows::{
+    core::HSTRING,
+    Foundation::IAsyncOperation,
+    Globalization::Language,
+    Graphics::Imaging::{BitmapAlphaMode, BitmapPixelFormat, SoftwareBitmap},
+    Media::Ocr::{OcrEngine as WinOcrEngine, OcrResult},
+    Storage::Streams::{Buffer, DataWriter, IBuffer, InMemoryRandomAccessStream},
+};
+
+#[cfg(target_os = "windows")]
+struct WindowsMediaOcr {
+    engine: WinOcrEngine,
+    language_tag: String,
+}
+
+// SAFETY: WinOcrEngine is thread-safe per Windows documentation
+#[cfg(target_os = "windows")]
+unsafe impl Send for WindowsMediaOcr {}
+#[cfg(target_os = "windows")]
+unsafe impl Sync for WindowsMediaOcr {}
+
+#[cfg(target_os = "windows")]
+impl WindowsMediaOcr {
+    fn new() -> Result<Self, String> {
+        // Try to create OCR engine from user's preferred languages
+        if let Ok(engine) = WinOcrEngine::TryCreateFromUserProfileLanguages() {
+            if let Some(engine) = engine {
+                let lang_tag = engine
+                    .RecognizerLanguage()
+                    .ok()
+                    .and_then(|lang| lang.LanguageTag().ok())
+                    .map(|tag| tag.to_string_lossy())
+                    .unwrap_or_else(|| "unknown".to_string());
+                eprintln!(
+                    "[OCR] Windows engine initialized with language: {}",
+                    lang_tag
+                );
+                return Ok(Self {
+                    engine,
+                    language_tag: lang_tag,
+                });
+            }
+        }
+
+        // Fall back to specific languages in order of preference
+        let fallback_languages = ["en-US", "en-GB", "ja-JP", "zh-Hans-CN", "de-DE", "fr-FR"];
+        for lang_tag in fallback_languages {
+            if let Ok(lang) = Language::CreateLanguage(&HSTRING::from(lang_tag)) {
+                if WinOcrEngine::IsLanguageSupported(&lang).unwrap_or(false) {
+                    if let Ok(Some(engine)) = WinOcrEngine::TryCreateFromLanguage(&lang) {
+                        eprintln!(
+                            "[OCR] Windows engine initialized with fallback: {}",
+                            lang_tag
+                        );
+                        return Ok(Self {
+                            engine,
+                            language_tag: lang_tag.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Last resort: try any available language
+        if let Ok(langs) = WinOcrEngine::AvailableRecognizerLanguages() {
+            for i in 0..langs.Size().unwrap_or(0) {
+                if let Ok(lang) = langs.GetAt(i) {
+                    if let Ok(Some(engine)) = WinOcrEngine::TryCreateFromLanguage(&lang) {
+                        let tag = lang
+                            .LanguageTag()
+                            .ok()
+                            .map(|t| t.to_string_lossy())
+                            .unwrap_or_else(|| "unknown".to_string());
+                        eprintln!(
+                            "[OCR] Windows engine initialized with available language: {}",
+                            tag
+                        );
+                        return Ok(Self {
+                            engine,
+                            language_tag: tag,
+                        });
+                    }
+                }
+            }
+        }
+
+        Err("No OCR languages available on this Windows installation".to_string())
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl OcrEngine for WindowsMediaOcr {
+    fn recognize_text(&self, image_data: &[u8], width: u32, height: u32) -> Result<String, String> {
+        // Validate input
+        let expected_len = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or("OCR image dimensions overflow")?;
+
+        if image_data.len() < expected_len {
+            return Err(format!(
+                "OCR image buffer too small: expected at least {} bytes, got {}",
+                expected_len,
+                image_data.len()
+            ));
+        }
+
+        // Convert RGBA to BGRA (Windows expects BGRA)
+        let bgra_data: Vec<u8> = image_data[..expected_len]
+            .chunks_exact(4)
+            .flat_map(|pixel| [pixel[2], pixel[1], pixel[0], pixel[3]])
+            .collect();
+
+        // Create SoftwareBitmap
+        let bitmap = SoftwareBitmap::Create(
+            BitmapPixelFormat::Bgra8,
+            width as i32,
+            height as i32,
+            BitmapAlphaMode::Premultiplied,
+        )
+        .map_err(|e| format!("Failed to create SoftwareBitmap: {}", e))?;
+
+        // Copy pixel data into bitmap
+        {
+            let buffer = bitmap
+                .LockBuffer(windows::Graphics::Imaging::BitmapBufferAccessMode::Write)
+                .map_err(|e| format!("Failed to lock bitmap buffer: {}", e))?;
+
+            let reference = buffer
+                .CreateReference()
+                .map_err(|e| format!("Failed to create buffer reference: {}", e))?;
+
+            // Get raw pointer to bitmap memory
+            let mem_buffer: windows::Storage::Streams::IMemoryBufferByteAccess =
+                reference
+                    .cast()
+                    .map_err(|e| format!("Failed to cast buffer: {}", e))?;
+
+            unsafe {
+                let mut data_ptr: *mut u8 = std::ptr::null_mut();
+                let mut capacity: u32 = 0;
+                mem_buffer
+                    .GetBuffer(&mut data_ptr, &mut capacity)
+                    .map_err(|e| format!("Failed to get buffer pointer: {}", e))?;
+
+                if capacity as usize >= bgra_data.len() {
+                    std::ptr::copy_nonoverlapping(bgra_data.as_ptr(), data_ptr, bgra_data.len());
+                } else {
+                    return Err(format!(
+                        "Bitmap buffer too small: {} < {}",
+                        capacity,
+                        bgra_data.len()
+                    ));
+                }
+            }
+        }
+
+        // Perform OCR
+        let result: OcrResult = self
+            .engine
+            .RecognizeAsync(&bitmap)
+            .map_err(|e| format!("OCR RecognizeAsync failed: {}", e))?
+            .get()
+            .map_err(|e| format!("OCR recognition failed: {}", e))?;
+
+        // Extract text from lines
+        let lines = result
+            .Lines()
+            .map_err(|e| format!("Failed to get OCR lines: {}", e))?;
+
+        let mut text = String::new();
+        for i in 0..lines.Size().unwrap_or(0) {
+            if let Ok(line) = lines.GetAt(i) {
+                if let Ok(line_text) = line.Text() {
+                    let line_str = line_text.to_string_lossy();
+                    if !line_str.trim().is_empty() {
+                        if !text.is_empty() {
+                            text.push('\n');
+                        }
+                        text.push_str(line_str.trim());
+                    }
+                }
+            }
+        }
+
+        if !text.is_empty() {
+            eprintln!(
+                "[OCR] Windows recognized {} chars using {}",
+                text.chars().count(),
+                self.language_tag
+            );
+        }
+
+        Ok(text)
+    }
+}
+
+// IMemoryBufferByteAccess interface for direct memory access
+#[cfg(target_os = "windows")]
+#[windows::core::interface("5b0d3235-4dba-4d44-865e-8f1d0e4fd04d")]
+unsafe trait IMemoryBufferByteAccess: windows::core::IUnknown {
+    unsafe fn GetBuffer(&self, value: *mut *mut u8, capacity: *mut u32) -> windows::core::HRESULT;
 }
