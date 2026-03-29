@@ -391,11 +391,11 @@ fn extract_result(request: &vn::RecognizeTextRequest) -> Result<OcrPassResult, S
 #[cfg(target_os = "windows")]
 use windows::{
     core::HSTRING,
-    Foundation::IAsyncOperation,
     Globalization::Language,
-    Graphics::Imaging::{BitmapAlphaMode, BitmapPixelFormat, SoftwareBitmap},
+    Graphics::Imaging::{
+        BitmapAlphaMode, BitmapBufferAccessMode, BitmapPixelFormat, SoftwareBitmap,
+    },
     Media::Ocr::{OcrEngine as WinOcrEngine, OcrResult},
-    Storage::Streams::{Buffer, DataWriter, IBuffer, InMemoryRandomAccessStream},
 };
 
 #[cfg(target_os = "windows")]
@@ -514,7 +514,7 @@ impl OcrEngine for WindowsMediaOcr {
         // Copy pixel data into bitmap
         {
             let buffer = bitmap
-                .LockBuffer(windows::Graphics::Imaging::BitmapBufferAccessMode::Write)
+                .LockBuffer(BitmapBufferAccessMode::Write)
                 .map_err(|e| format!("Failed to lock bitmap buffer: {}", e))?;
 
             let reference = buffer
@@ -522,10 +522,9 @@ impl OcrEngine for WindowsMediaOcr {
                 .map_err(|e| format!("Failed to create buffer reference: {}", e))?;
 
             // Get raw pointer to bitmap memory
-            let mem_buffer: windows::Storage::Streams::IMemoryBufferByteAccess =
-                reference
-                    .cast()
-                    .map_err(|e| format!("Failed to cast buffer: {}", e))?;
+            let mem_buffer: IMemoryBufferByteAccess = reference
+                .cast()
+                .map_err(|e| format!("Failed to cast buffer: {}", e))?;
 
             unsafe {
                 let mut data_ptr: *mut u8 = std::ptr::null_mut();
@@ -588,7 +587,11 @@ impl OcrEngine for WindowsMediaOcr {
 
 // IMemoryBufferByteAccess interface for direct memory access
 #[cfg(target_os = "windows")]
-#[windows::core::interface("5b0d3235-4dba-4d44-865e-8f1d0e4fd04d")]
-unsafe trait IMemoryBufferByteAccess: windows::core::IUnknown {
-    unsafe fn GetBuffer(&self, value: *mut *mut u8, capacity: *mut u32) -> windows::core::HRESULT;
+#[windows_core::interface("5b0d3235-4dba-4d44-865e-8f1d0e4fd04d")]
+unsafe trait IMemoryBufferByteAccess: windows_core::IUnknown {
+    unsafe fn GetBuffer(
+        &self,
+        value: *mut *mut u8,
+        capacity: *mut u32,
+    ) -> windows_core::HRESULT;
 }
