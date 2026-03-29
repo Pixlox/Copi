@@ -253,6 +253,36 @@ fn main() {
                 let _ = overlay.center();
             }
 
+            // Apply vibrancy to setup window
+            if let Some(setup) = handle.get_webview_window("setup") {
+                #[cfg(target_os = "macos")]
+                {
+                    use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial};
+                    let _ = apply_vibrancy(
+                        &setup,
+                        NSVisualEffectMaterial::HudWindow,
+                        None,
+                        Some(16.0),
+                    );
+                    eprintln!("[Copi] Setup vibrancy applied");
+                }
+            }
+
+            // Apply vibrancy to settings window
+            if let Some(settings) = handle.get_webview_window("settings") {
+                #[cfg(target_os = "macos")]
+                {
+                    use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial};
+                    let _ = apply_vibrancy(
+                        &settings,
+                        NSVisualEffectMaterial::Sidebar,
+                        None,
+                        Some(12.0),
+                    );
+                    eprintln!("[Copi] Settings vibrancy applied");
+                }
+            }
+
             // Tray icon
             let settings_item =
                 MenuItem::with_id(&handle, "settings", "Settings\u{2026}", true, None::<&str>)?;

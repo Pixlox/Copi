@@ -16,10 +16,13 @@ import {
   FolderOpen,
 } from "lucide-react";
 import { useThemeContext } from "../contexts/ThemeContext";
-import type { ThemePreference } from "../hooks/useTheme";
 import Picker from "../components/Picker";
 import { checkForUpdates } from "../utils/updater";
 import { formatShortcut, isMacPlatform, platformName } from "../utils/platform";
+
+// ════════════════════════════════════════════════════════════════════════════
+// Types
+// ════════════════════════════════════════════════════════════════════════════
 
 interface CopiConfig {
   general: {
@@ -39,104 +42,23 @@ interface CopiConfig {
   };
 }
 
-function Toggle({
-  checked,
-  onChange,
-}: {
-  checked: boolean;
-  onChange: (v: boolean) => void;
-}) {
-  return (
-    <button
-      type="button"
-      className={`toggle-track ${checked ? "on" : "off"}`}
-      onClick={() => onChange(!checked)}
-      aria-checked={checked}
-      role="switch"
-    >
-      <div className="toggle-knob" />
-    </button>
-  );
+interface CollectionInfo {
+  id: number;
+  name: string;
+  color: string;
+  clip_count: number;
+  created_at: number;
 }
 
-function SectionHeader({ icon, title }: { icon: React.ReactNode; title: string }) {
-  return (
-    <div className="flex items-center gap-2 px-4 pt-6 pb-1.5 first:pt-2">
-      <span style={{ color: "var(--text-secondary)" }}>{icon}</span>
-      <h2
-        className="text-[11px] font-semibold uppercase"
-        style={{ color: "var(--settings-section-title)", letterSpacing: "0.06em" }}
-      >
-        {title}
-      </h2>
-    </div>
-  );
-}
+type Section = "general" | "appearance" | "privacy" | "data" | "collections";
 
-function Card({ children }: { children: React.ReactNode }) {
-  return (
-    <div
-      className="rounded-[10px] settings-card-shadow"
-      style={{ background: "var(--settings-card-bg)" }}
-    >
-      {children}
-    </div>
-  );
-}
-
-function Row({
-  label,
-  description,
-  children,
-}: {
-  label: string;
-  description?: string;
-  children?: React.ReactNode;
-}) {
-  return (
-    <div className="flex items-center gap-4 px-4 py-[11px]">
-      <div className="min-w-0 flex-1">
-        <div className="text-[13px]" style={{ color: "var(--text-primary)" }}>
-          {label}
-        </div>
-        {description && (
-          <div className="mt-0.5 text-[11px]" style={{ color: "var(--text-tertiary)" }}>
-            {description}
-          </div>
-        )}
-      </div>
-      {children && <div className="shrink-0">{children}</div>}
-    </div>
-  );
-}
-
-function Divider() {
-  return (
-    <div className="mx-4" style={{ borderTop: "0.5px solid var(--border-subtle)" }} />
-  );
-}
-
-function SaveNotice({ show }: { show: boolean }) {
-  return (
-    <span
-      className="inline-flex items-center gap-1 px-4 pb-1 text-[11px] transition-opacity duration-200"
-      style={{
-        color: "var(--success-text)",
-        opacity: show ? 1 : 0,
-      }}
-    >
-      Saved
-    </span>
-  );
-}
-
-function formatBytes(bytes: number): string {
-  if (bytes === 0) return "0 B";
-  const k = 1024;
-  const sizes = ["B", "KB", "MB", "GB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return `${parseFloat((bytes / Math.pow(k, i)).toFixed(1))} ${sizes[i]}`;
-}
+const SECTIONS: { id: Section; label: string; icon: typeof Keyboard }[] = [
+  { id: "general", label: "General", icon: Keyboard },
+  { id: "appearance", label: "Appearance", icon: Palette },
+  { id: "privacy", label: "Privacy", icon: Shield },
+  { id: "data", label: "Data", icon: HardDrive },
+  { id: "collections", label: "Collections", icon: FolderOpen },
+];
 
 const RETENTION_OPTIONS = [
   { label: "7 days", value: "7" },
@@ -162,488 +84,524 @@ function getHotkeyPresets() {
       ];
 }
 
-export default function Settings() {
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return "0 B";
+  const k = 1024;
+  const sizes = ["B", "KB", "MB", "GB"];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return `${parseFloat((bytes / Math.pow(k, i)).toFixed(1))} ${sizes[i]}`;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// UI Components
+// ════════════════════════════════════════════════════════════════════════════
+
+function Logo({ size = 28 }: { size?: number }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 512 512"
+      xmlns="http://www.w3.org/2000/svg"
+    >
+      <defs>
+        <linearGradient id="settings-bg" x1="0%" y1="0%" x2="100%" y2="100%">
+          <stop offset="0%" stopColor="#1a1a1f" />
+          <stop offset="100%" stopColor="#111114" />
+        </linearGradient>
+        <linearGradient id="settings-front" x1="0%" y1="0%" x2="100%" y2="100%">
+          <stop offset="0%" stopColor="#ffffff" />
+          <stop offset="100%" stopColor="#c8c8d0" />
+        </linearGradient>
+        <linearGradient id="settings-back" x1="0%" y1="0%" x2="100%" y2="100%">
+          <stop offset="0%" stopColor="#ffffff" stopOpacity="0.22" />
+          <stop offset="100%" stopColor="#ffffff" stopOpacity="0.10" />
+        </linearGradient>
+      </defs>
+      <g transform="translate(56, 56) scale(0.781)">
+        <rect width="512" height="512" rx="112" fill="url(#settings-bg)" />
+        <rect x="190" y="170" width="196" height="236" rx="28" fill="url(#settings-back)" stroke="rgba(255,255,255,0.12)" strokeWidth="1.5" />
+        <rect x="158" y="138" width="196" height="236" rx="28" fill="url(#settings-front)" />
+        <rect x="188" y="186" width="80" height="8" rx="4" fill="#1a1a1f" opacity="0.18" />
+        <rect x="188" y="206" width="136" height="8" rx="4" fill="#1a1a1f" opacity="0.12" />
+        <rect x="188" y="226" width="112" height="8" rx="4" fill="#1a1a1f" opacity="0.12" />
+      </g>
+    </svg>
+  );
+}
+
+function Toggle({ checked, onChange }: { checked: boolean; onChange: (v: boolean) => void }) {
+  return (
+    <button
+      type="button"
+      className={`settings-toggle ${checked ? "on" : ""}`}
+      onClick={() => onChange(!checked)}
+      role="switch"
+      aria-checked={checked}
+    >
+      <div className="settings-toggle-knob" />
+    </button>
+  );
+}
+
+function SettingRow({
+  label,
+  description,
+  children,
+}: {
+  label: string;
+  description?: string;
+  children?: React.ReactNode;
+}) {
+  return (
+    <div className="settings-row">
+      <div className="settings-row-info">
+        <span className="settings-row-label">{label}</span>
+        {description && <span className="settings-row-desc">{description}</span>}
+      </div>
+      {children && <div className="settings-row-control">{children}</div>}
+    </div>
+  );
+}
+
+function SettingCard({ children }: { children: React.ReactNode }) {
+  return <div className="settings-card">{children}</div>;
+}
+
+function SettingDivider() {
+  return <div className="settings-divider" />;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Section Content Components
+// ════════════════════════════════════════════════════════════════════════════
+
+function GeneralSection({
+  config,
+  saveConfig,
+}: {
+  config: CopiConfig;
+  saveConfig: (c: CopiConfig) => void;
+}) {
+  return (
+    <>
+      <SettingCard>
+        <SettingRow label="Global Hotkey" description="The shortcut that opens Copi">
+          <Picker
+            value={config.general.hotkey}
+            options={getHotkeyPresets()}
+            onChange={(val) => saveConfig({ ...config, general: { ...config.general, hotkey: val } })}
+          />
+        </SettingRow>
+      </SettingCard>
+
+      <SettingCard>
+        <SettingRow label="Launch at Login" description={`Start Copi when your ${platformName} starts`}>
+          <Toggle
+            checked={config.general.launch_at_login}
+            onChange={(v) => saveConfig({ ...config, general: { ...config.general, launch_at_login: v } })}
+          />
+        </SettingRow>
+      </SettingCard>
+
+      <SettingCard>
+        <SettingRow label="Default Action" description="What Enter does in the overlay">
+          <div className="settings-segment">
+            <button
+              className={config.general.default_paste_behaviour === "copy" ? "active" : ""}
+              onClick={() => saveConfig({ ...config, general: { ...config.general, default_paste_behaviour: "copy" } })}
+            >
+              Copy
+            </button>
+            <button
+              className={config.general.default_paste_behaviour === "paste" ? "active" : ""}
+              onClick={() => saveConfig({ ...config, general: { ...config.general, default_paste_behaviour: "paste" } })}
+            >
+              Paste
+            </button>
+          </div>
+        </SettingRow>
+      </SettingCard>
+
+      <SettingCard>
+        <SettingRow label="History Retention" description="Auto-delete clips older than this">
+          <Picker
+            value={String(config.general.history_retention_days)}
+            options={RETENTION_OPTIONS}
+            onChange={(val) => saveConfig({ ...config, general: { ...config.general, history_retention_days: parseInt(val) } })}
+          />
+        </SettingRow>
+      </SettingCard>
+
+      <SettingCard>
+        <SettingRow label="Auto-check for Updates" description="Check for updates on startup">
+          <Toggle
+            checked={config.general.auto_check_updates}
+            onChange={(v) => saveConfig({ ...config, general: { ...config.general, auto_check_updates: v } })}
+          />
+        </SettingRow>
+      </SettingCard>
+    </>
+  );
+}
+
+function AppearanceSection({
+  config,
+  saveConfig,
+}: {
+  config: CopiConfig;
+  saveConfig: (c: CopiConfig) => void;
+}) {
   const { theme, setTheme } = useThemeContext();
+
+  return (
+    <>
+      <SettingCard>
+        <SettingRow label="Theme" description="Choose your color scheme">
+          <div className="settings-segment">
+            <button className={theme === "dark" ? "active" : ""} onClick={() => setTheme("dark")}>
+              <Moon size={12} /> Dark
+            </button>
+            <button className={theme === "light" ? "active" : ""} onClick={() => setTheme("light")}>
+              <Sun size={12} /> Light
+            </button>
+            <button className={theme === "system" ? "active" : ""} onClick={() => setTheme("system")}>
+              <Monitor size={12} /> Auto
+            </button>
+          </div>
+        </SettingRow>
+      </SettingCard>
+
+      <SettingCard>
+        <SettingRow label="Compact Mode" description="Smaller rows in the overlay">
+          <Toggle
+            checked={config.appearance.compact_mode}
+            onChange={(v) => saveConfig({ ...config, appearance: { ...config.appearance, compact_mode: v } })}
+          />
+        </SettingRow>
+      </SettingCard>
+
+      <SettingCard>
+        <SettingRow label="Show App Icons" description="Source app icons next to clips">
+          <Toggle
+            checked={config.appearance.show_app_icons}
+            onChange={(v) => saveConfig({ ...config, appearance: { ...config.appearance, show_app_icons: v } })}
+          />
+        </SettingRow>
+      </SettingCard>
+    </>
+  );
+}
+
+function PrivacySection({
+  config,
+  saveConfig,
+}: {
+  config: CopiConfig;
+  saveConfig: (c: CopiConfig) => void;
+}) {
+  const [newApp, setNewApp] = useState("");
+
+  const addApp = () => {
+    if (!newApp.trim()) return;
+    saveConfig({
+      ...config,
+      privacy: { ...config.privacy, excluded_apps: [...config.privacy.excluded_apps, newApp.trim()] },
+    });
+    setNewApp("");
+  };
+
+  const removeApp = (index: number) => {
+    const apps = [...config.privacy.excluded_apps];
+    apps.splice(index, 1);
+    saveConfig({ ...config, privacy: { ...config.privacy, excluded_apps: apps } });
+  };
+
+  return (
+    <SettingCard>
+      <SettingRow label="Excluded Apps" description="Content from these apps won't be captured" />
+      <SettingDivider />
+      
+      <div className="settings-chips">
+        {config.privacy.excluded_apps.length === 0 && (
+          <span className="settings-chips-empty">No excluded apps</span>
+        )}
+        {config.privacy.excluded_apps.map((app, i) => (
+          <span key={`${app}-${i}`} className="settings-chip">
+            {app}
+            <button onClick={() => removeApp(i)}>
+              <X size={10} />
+            </button>
+          </span>
+        ))}
+      </div>
+
+      <div className="settings-add-row">
+        <input
+          type="text"
+          value={newApp}
+          onChange={(e) => setNewApp(e.target.value)}
+          placeholder="App name or bundle ID…"
+          onKeyDown={(e) => e.key === "Enter" && addApp()}
+        />
+        <button onClick={addApp} disabled={!newApp.trim()}>
+          <Plus size={14} />
+        </button>
+      </div>
+    </SettingCard>
+  );
+}
+
+function DataSection({
+  dbSize,
+  clipCount,
+  appVersion,
+  onClearHistory,
+}: {
+  dbSize: number;
+  clipCount: number;
+  appVersion: string | null;
+  onClearHistory: () => void;
+}) {
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+
+  return (
+    <>
+      <SettingCard>
+        <SettingRow label="Database Size">
+          <span className="settings-value">{formatBytes(dbSize)}</span>
+        </SettingRow>
+        <SettingRow label="Total Clips">
+          <span className="settings-value">{clipCount.toLocaleString()}</span>
+        </SettingRow>
+        <SettingRow label="Version">
+          <span className="settings-value">{appVersion ? `v${appVersion}` : "—"}</span>
+        </SettingRow>
+      </SettingCard>
+
+      <SettingCard>
+        <SettingRow label="Check for Updates">
+          <button
+            className="settings-btn"
+            disabled={checkingUpdate}
+            onClick={async () => {
+              setCheckingUpdate(true);
+              try {
+                await checkForUpdates("interactive");
+              } finally {
+                setCheckingUpdate(false);
+              }
+            }}
+          >
+            <RefreshCw size={12} className={checkingUpdate ? "animate-spin" : ""} />
+            {checkingUpdate ? "Checking…" : "Check Now"}
+          </button>
+        </SettingRow>
+      </SettingCard>
+
+      <SettingCard>
+        <SettingRow label="Clear All History" description="Permanently delete all clipboard data">
+          <button className="settings-btn danger" onClick={onClearHistory}>
+            <Trash2 size={12} />
+            Clear
+          </button>
+        </SettingRow>
+      </SettingCard>
+    </>
+  );
+}
+
+function CollectionsSection({
+  collections,
+  onDelete,
+}: {
+  collections: CollectionInfo[];
+  onDelete: (id: number) => void;
+}) {
+  if (collections.length === 0) {
+    return (
+      <SettingCard>
+        <SettingRow label="No collections yet" description="Create collections from the overlay sidebar" />
+      </SettingCard>
+    );
+  }
+
+  return (
+    <SettingCard>
+      {collections.map((col, i) => (
+        <div key={col.id}>
+          {i > 0 && <SettingDivider />}
+          <SettingRow label={col.name} description={`${col.clip_count} clip${col.clip_count !== 1 ? "s" : ""}`}>
+            <div className="settings-collection-actions">
+              <div className="settings-collection-color" style={{ background: col.color }} />
+              <button onClick={() => onDelete(col.id)} className="settings-collection-delete">
+                <Trash2 size={12} />
+              </button>
+            </div>
+          </SettingRow>
+        </div>
+      ))}
+    </SettingCard>
+  );
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Main Component
+// ════════════════════════════════════════════════════════════════════════════
+
+export default function Settings() {
   const [config, setConfig] = useState<CopiConfig | null>(null);
+  const [activeSection, setActiveSection] = useState<Section>("general");
   const [dbSize, setDbSize] = useState(0);
   const [clipCount, setClipCount] = useState(0);
   const [appVersion, setAppVersion] = useState<string | null>(null);
+  const [collections, setCollections] = useState<CollectionInfo[]>([]);
+  const [confirmClear, setConfirmClear] = useState(false);
+  const [clearError, setClearError] = useState<string | null>(null);
+  const [clearing, setClearing] = useState(false);
 
-  const [savedField, setSavedField] = useState<string | null>(null);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const [newApp, setNewApp] = useState("");
-  const [confirmClear, setConfirmClear] = useState(false);
-  const [checkingUpdate, setCheckingUpdate] = useState(false);
-
-  // Collections
-  interface CollectionInfo {
-    id: number;
-    name: string;
-    color: string;
-    clip_count: number;
-    created_at: number;
-  }
-  const [collections, setCollections] = useState<CollectionInfo[]>([]);
-
   const fetchCollections = useCallback(() => {
-    invoke<CollectionInfo[]>("list_collections")
-      .then(setCollections)
-      .catch(() => {});
+    invoke<CollectionInfo[]>("list_collections").then(setCollections).catch(() => {});
   }, []);
 
   useEffect(() => {
-    invoke<CopiConfig>("get_config")
-      .then(setConfig)
-      .catch((e) => console.error("Config load failed:", e));
+    invoke<CopiConfig>("get_config").then(setConfig).catch(console.error);
     invoke<number>("get_db_size").then(setDbSize).catch(() => {});
     invoke<number>("get_total_clip_count").then(setClipCount).catch(() => {});
     getVersion().then(setAppVersion).catch(() => {});
     fetchCollections();
   }, [fetchCollections]);
 
-  const showSaved = useCallback((field: string) => {
-    if (saveTimer.current) clearTimeout(saveTimer.current);
-    setSavedField(field);
-    saveTimer.current = setTimeout(() => setSavedField(null), 1500);
-  }, []);
-
   const saveConfig = useCallback(
-    async (updated: CopiConfig, field: string) => {
+    async (updated: CopiConfig) => {
       const previous = config;
       setConfig(updated);
-      try {
-        await invoke("set_config", { config: updated });
-        showSaved(field);
-      } catch (e) {
-        console.error("Save failed:", e);
-        if (previous) {
-          setConfig(previous);
+      if (saveTimer.current) clearTimeout(saveTimer.current);
+      saveTimer.current = setTimeout(async () => {
+        try {
+          await invoke("set_config", { config: updated });
+        } catch (e) {
+          console.error("Save failed:", e);
+          if (previous) setConfig(previous);
         }
-      }
+      }, 150);
     },
-    [config, showSaved]
+    [config]
   );
+
+  const handleDeleteCollection = async (id: number) => {
+    try {
+      await invoke("delete_collection", { id });
+      fetchCollections();
+    } catch (e) {
+      console.error("Delete collection failed:", e);
+    }
+  };
+
+  const handleClearHistory = async () => {
+    setClearing(true);
+    setClearError(null);
+    try {
+      await invoke("clear_all_history");
+      setClipCount(0);
+      setDbSize(0);
+      setConfirmClear(false);
+    } catch (e) {
+      const msg = typeof e === "string" ? e : (e instanceof Error ? e.message : "Unknown error");
+      setClearError(msg);
+      console.error("Clear failed:", e);
+    } finally {
+      setClearing(false);
+    }
+  };
 
   if (!config) {
     return (
-      <div
-        className="flex h-screen items-center justify-center"
-        style={{ background: "var(--settings-bg)", color: "var(--text-tertiary)" }}
-      >
-        Loading…
+      <div className="settings-root settings-loading">
+        <span>Loading…</span>
       </div>
     );
   }
 
+  const activeSectionData = SECTIONS.find((s) => s.id === activeSection)!;
+
   return (
-    <div style={{ background: "var(--settings-bg)", color: "var(--text-primary)" }}>
-      <div className="mx-auto max-w-[540px] px-4 py-4 pb-10">
-        {/* ── Header (draggable) ─────────────────────────────────── */}
-        <div
-          className="mb-3 rounded-[10px] px-4 py-3 settings-card-shadow"
-          style={{
-            background: "var(--settings-card-bg)",
-            WebkitAppRegion: "drag",
-          } as React.CSSProperties}
-        >
-          <div className="flex items-center justify-between">
-            <div>
-              <h1 className="text-[15px] font-semibold" style={{ color: "var(--text-primary)" }}>
-                Copi
-              </h1>
-              <p className="text-[11px]" style={{ color: "var(--text-tertiary)" }}>
-                Your copying copilot
-              </p>
-            </div>
-            <div className="text-right text-[11px]" style={{ color: "var(--text-tertiary)" }}>
-              <div>{formatBytes(dbSize)} stored</div>
-              <div>{clipCount.toLocaleString()} clips</div>
-            </div>
-          </div>
+    <div className="settings-root">
+      {/* ── Sidebar ─────────────────────────────────────────────────── */}
+      <aside className="settings-sidebar" data-tauri-drag-region>
+        <div className="settings-sidebar-brand" data-tauri-drag-region>
+          <Logo size={28} />
+          <span>Copi</span>
         </div>
 
-        {/* ── General ─────────────────────────────────────────────── */}
-        <SectionHeader icon={<Keyboard size={14} />} title="General" />
-        <Card>
-          <Row label="Global Hotkey" description="Choose the shortcut that opens Copi">
-            <Picker
-              value={config.general.hotkey}
-              options={getHotkeyPresets()}
-              onChange={(val) => {
-                const updated: CopiConfig = {
-                  ...config,
-                  general: { ...config.general, hotkey: val },
-                };
-                saveConfig(updated, "hotkey");
-              }}
-            />
-          </Row>
-
-          <Row label="Launch at Login" description={`Start Copi when your ${platformName} starts`}>
-            <Toggle
-              checked={config.general.launch_at_login}
-              onChange={(v) => {
-                const updated: CopiConfig = {
-                  ...config,
-                  general: { ...config.general, launch_at_login: v },
-                };
-                saveConfig(updated, "launch");
-              }}
-            />
-          </Row>
-
-          <Divider />
-
-          <Row label="Default Action" description="Choose what Enter does in the overlay">
-            <div className="segmented-control">
-              <button
-                className={`segmented-option ${config.general.default_paste_behaviour === "copy" ? "active" : ""}`}
-                onClick={() => {
-                  const updated: CopiConfig = {
-                    ...config,
-                    general: { ...config.general, default_paste_behaviour: "copy" },
-                  };
-                  saveConfig(updated, "paste");
-                }}
-              >
-                Copy
-              </button>
-              <button
-                className={`segmented-option ${config.general.default_paste_behaviour === "paste" ? "active" : ""}`}
-                onClick={() => {
-                  const updated: CopiConfig = {
-                    ...config,
-                    general: { ...config.general, default_paste_behaviour: "paste" },
-                  };
-                  saveConfig(updated, "paste");
-                }}
-              >
-                Paste
-              </button>
-            </div>
-          </Row>
-
-          <Divider />
-
-          <Row label="History Retention" description="Auto-delete clips older than this">
-            <Picker
-              value={String(config.general.history_retention_days)}
-              options={RETENTION_OPTIONS}
-              onChange={(val) => {
-                const updated: CopiConfig = {
-                  ...config,
-                  general: { ...config.general, history_retention_days: parseInt(val) },
-                };
-                saveConfig(updated, "retention");
-              }}
-            />
-          </Row>
-
-          <Divider />
-
-          <Row label="Auto-check for Updates" description="Check for updates on startup">
-            <Toggle
-              checked={config.general.auto_check_updates}
-              onChange={(v) => {
-                const updated: CopiConfig = {
-                  ...config,
-                  general: { ...config.general, auto_check_updates: v },
-                };
-                saveConfig(updated, "updates");
-              }}
-            />
-          </Row>
-
-          <SaveNotice show={savedField === "hotkey" || savedField === "launch" || savedField === "paste" || savedField === "retention" || savedField === "updates"} />
-        </Card>
-
-        {/* ── Appearance ──────────────────────────────────────────── */}
-        <SectionHeader icon={<Palette size={14} />} title="Appearance" />
-        <Card>
-          <Row label="Theme" description="Choose your color scheme">
-            <div className="segmented-control">
-              <button
-                className={`segmented-option flex items-center gap-1.5 ${theme === "dark" ? "active" : ""}`}
-                onClick={() => setTheme("dark")}
-              >
-                <Moon size={12} />
-                Dark
-              </button>
-              <button
-                className={`segmented-option flex items-center gap-1.5 ${theme === "light" ? "active" : ""}`}
-                onClick={() => setTheme("light")}
-              >
-                <Sun size={12} />
-                Light
-              </button>
-              <button
-                className={`segmented-option flex items-center gap-1.5 ${theme === "system" ? "active" : ""}`}
-                onClick={() => setTheme("system")}
-              >
-                <Monitor size={12} />
-                Auto
-              </button>
-            </div>
-          </Row>
-
-          <Divider />
-
-          <Row label="Compact Mode" description="Smaller rows in the overlay">
-            <Toggle
-              checked={config.appearance.compact_mode}
-              onChange={(v) => {
-                const updated: CopiConfig = {
-                  ...config,
-                  appearance: { ...config.appearance, compact_mode: v },
-                };
-                saveConfig(updated, "compact");
-              }}
-            />
-          </Row>
-
-          <Divider />
-
-          <Row label="Show App Icons" description="Source app icons next to clips">
-            <Toggle
-              checked={config.appearance.show_app_icons}
-              onChange={(v) => {
-                const updated: CopiConfig = {
-                  ...config,
-                  appearance: { ...config.appearance, show_app_icons: v },
-                };
-                saveConfig(updated, "icons");
-              }}
-            />
-          </Row>
-
-          <SaveNotice show={savedField === "compact" || savedField === "icons"} />
-        </Card>
-
-        {/* ── Privacy ─────────────────────────────────────────────── */}
-        <SectionHeader icon={<Shield size={14} />} title="Privacy" />
-        <Card>
-          <Row label="Excluded Apps" description="Content from these apps won't be captured" />
-
-          <div className="px-4 pb-2 flex flex-wrap gap-1.5">
-            {config.privacy.excluded_apps.length === 0 && (
-              <span className="text-[11px]" style={{ color: "var(--text-tertiary)" }}>
-                No excluded apps
-              </span>
-            )}
-            {config.privacy.excluded_apps.map((app, i) => (
-              <span
-                key={`${app}-${i}`}
-                className="inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px]"
-                style={{
-                  background: "var(--surface-primary)",
-                  color: "var(--text-secondary)",
-                }}
-              >
-                {app}
-                <button
-                  type="button"
-                  onClick={() => {
-                    const apps = [...config.privacy.excluded_apps];
-                    apps.splice(i, 1);
-                    const updated: CopiConfig = {
-                      ...config,
-                      privacy: { ...config.privacy, excluded_apps: apps },
-                    };
-                    saveConfig(updated, "excluded");
-                  }}
-                  style={{ color: "var(--text-tertiary)" }}
-                >
-                  <X size={10} />
-                </button>
-              </span>
-            ))}
-          </div>
-
-          <div className="px-4 pb-3 flex items-center gap-2">
-            <input
-              type="text"
-              value={newApp}
-              onChange={(e) => setNewApp(e.target.value)}
-              placeholder="App name or bundle ID…"
-              className="settings-input flex-1"
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && newApp.trim()) {
-                  const updated: CopiConfig = {
-                    ...config,
-                    privacy: {
-                      ...config.privacy,
-                      excluded_apps: [...config.privacy.excluded_apps, newApp.trim()],
-                    },
-                  };
-                  saveConfig(updated, "excluded");
-                  setNewApp("");
-                }
-              }}
-            />
+        <nav className="settings-sidebar-nav">
+          {SECTIONS.map((section) => (
             <button
-              type="button"
-              disabled={!newApp.trim()}
-              onClick={() => {
-                if (!newApp.trim()) return;
-                const updated: CopiConfig = {
-                  ...config,
-                  privacy: {
-                    ...config.privacy,
-                    excluded_apps: [...config.privacy.excluded_apps, newApp.trim()],
-                  },
-                };
-                saveConfig(updated, "excluded");
-                setNewApp("");
-              }}
-              className="settings-button"
+              key={section.id}
+              className={`settings-nav-item ${activeSection === section.id ? "active" : ""}`}
+              onClick={() => setActiveSection(section.id)}
             >
-              <Plus size={12} />
+              <section.icon size={15} />
+              <span>{section.label}</span>
             </button>
-          </div>
+          ))}
+        </nav>
 
-          <Divider />
+        <div className="settings-sidebar-footer">
+          <span>{appVersion ? `v${appVersion}` : ""}</span>
+        </div>
+      </aside>
 
-          <SaveNotice show={savedField === "excluded"} />
-        </Card>
+      {/* ── Content ─────────────────────────────────────────────────── */}
+      <main className="settings-content">
+        <header className="settings-content-header" data-tauri-drag-region>
+          <h1>{activeSectionData.label}</h1>
+        </header>
 
-        {/* ── Storage & Data ──────────────────────────────────────── */}
-        <SectionHeader icon={<HardDrive size={14} />} title="Storage & Data" />
-        <Card>
-          <Row label="Database Size" description="Current storage used">
-            <span className="text-[12px]" style={{ color: "var(--text-secondary)" }}>
-              {formatBytes(dbSize)}
-            </span>
-          </Row>
-
-          <Divider />
-
-          <Row label="Total Clips">
-            <span className="text-[12px]" style={{ color: "var(--text-secondary)" }}>
-              {clipCount.toLocaleString()}
-            </span>
-          </Row>
-
-          <Divider />
-
-          <Row label="Current Version">
-            <span className="text-[12px]" style={{ color: "var(--text-secondary)" }}>
-              {appVersion ? `v${appVersion}` : "Unknown"}
-            </span>
-          </Row>
-
-          <Divider />
-
-          <Row label="Check for Updates">
-            <button
-              type="button"
-              disabled={checkingUpdate}
-              onClick={async () => {
-                setCheckingUpdate(true);
-                try {
-                  await checkForUpdates("interactive");
-                } finally {
-                  setCheckingUpdate(false);
-                }
-              }}
-              className="settings-button"
-            >
-              <RefreshCw size={12} className={checkingUpdate ? "animate-spin" : ""} />
-              {checkingUpdate ? "Checking…" : "Check Now"}
-            </button>
-          </Row>
-
-          <Row label="Clear All History" description="Permanently delete all clipboard data">
-            <button
-              type="button"
-              onClick={() => setConfirmClear(true)}
-              className="settings-button destructive"
-            >
-              <Trash2 size={12} />
-              Clear
-            </button>
-          </Row>
-        </Card>
-
-        {/* ── Collections ───────────────────────────────────────────── */}
-        <SectionHeader icon={<FolderOpen size={14} />} title="Collections" />
-        <Card>
-          {collections.length === 0 ? (
-            <Row label="No collections yet" description="Create collections from the overlay sidebar">
-              <span />
-            </Row>
-          ) : (
-            collections.map((col, i) => (
-              <div key={col.id}>
-                {i > 0 && <Divider />}
-                <Row label={col.name} description={`${col.clip_count} clip${col.clip_count !== 1 ? "s" : ""}`}>
-                  <div className="flex items-center gap-1">
-                    <div
-                      className="w-3 h-3 rounded-full"
-                      style={{ background: col.color }}
-                    />
-                    <button
-                      type="button"
-                      onClick={async () => {
-                        try {
-                          await invoke("delete_collection", { id: col.id });
-                          fetchCollections();
-                        } catch (e) {
-                          console.error("Delete collection failed:", e);
-                        }
-                      }}
-                      className="rounded p-1 transition-colors"
-                      style={{ color: "var(--text-tertiary)" }}
-                    >
-                      <Trash2 size={11} />
-                    </button>
-                  </div>
-                </Row>
-              </div>
-            ))
+        <div className="settings-content-body">
+          {activeSection === "general" && <GeneralSection config={config} saveConfig={saveConfig} />}
+          {activeSection === "appearance" && <AppearanceSection config={config} saveConfig={saveConfig} />}
+          {activeSection === "privacy" && <PrivacySection config={config} saveConfig={saveConfig} />}
+          {activeSection === "data" && (
+            <DataSection
+              dbSize={dbSize}
+              clipCount={clipCount}
+              appVersion={appVersion}
+              onClearHistory={() => setConfirmClear(true)}
+            />
           )}
-        </Card>
-
-        {/* Footer */}
-        <div className="mt-6 mb-4 text-center text-[11px]" style={{ color: "var(--text-muted)" }}>
-          Press {formatShortcut(config.general.hotkey, " + ")} to open Copi
+          {activeSection === "collections" && (
+            <CollectionsSection collections={collections} onDelete={handleDeleteCollection} />
+          )}
         </div>
-      </div>
 
-      {/* ── Clear History Confirmation ──────────────────────────── */}
+        <footer className="settings-content-footer">
+          Press {formatShortcut(config.general.hotkey, " + ")} to open
+        </footer>
+      </main>
+
+      {/* ── Clear Confirmation Dialog ───────────────────────────────── */}
       {confirmClear && (
-        <div className="confirm-overlay">
-          <div className="confirm-dialog">
-            <h3 className="mb-1 text-[13px] font-semibold" style={{ color: "var(--text-primary)" }}>
-              Clear all history?
-            </h3>
-            <p className="mb-4 text-[11px] leading-relaxed" style={{ color: "var(--text-secondary)" }}>
-              This will permanently delete all {clipCount.toLocaleString()} clips, including pinned items. This cannot be undone.
+        <div className="settings-dialog-overlay" onClick={(e) => { if (e.target === e.currentTarget) { setConfirmClear(false); setClearError(null); } }}>
+          <div className="settings-dialog">
+            <h3>Clear all history?</h3>
+            <p>
+              This will permanently delete all {clipCount.toLocaleString()} clips, including pinned items.
+              This cannot be undone.
             </p>
-            <div className="flex items-center justify-end gap-2">
+            {clearError && (
+              <p className="settings-dialog-error">Error: {clearError}</p>
+            )}
+            <div className="settings-dialog-actions">
+              <button onClick={() => { setConfirmClear(false); setClearError(null); }}>Cancel</button>
               <button
-                type="button"
-                onClick={() => setConfirmClear(false)}
-                className="settings-button"
+                className="danger"
+                onClick={handleClearHistory}
+                disabled={clearing}
               >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={async () => {
-                  try {
-                    await invoke("clear_all_history");
-                    setClipCount(0);
-                    setDbSize(0);
-                    setConfirmClear(false);
-                    showSaved("clear");
-                  } catch (e) {
-                    console.error("Clear failed:", e);
-                  }
-                }}
-                className="settings-button destructive"
-              >
-                Delete All
+                {clearing ? "Clearing…" : "Delete All"}
               </button>
             </div>
           </div>

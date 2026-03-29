@@ -241,6 +241,12 @@ export default function Setup() {
         {/* Logo */}
         <Logo className="setup-logo" />
 
+        {/* Branding */}
+        <div className="setup-branding">
+          <h1 className="setup-title">Welcome to Copi</h1>
+          <p className="setup-tagline">Your local clipboard copilot</p>
+        </div>
+
         {/* Status card */}
         <div className="setup-card">
           {/* Icon */}

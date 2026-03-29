@@ -51,6 +51,19 @@ export default function Picker({ value, options, onChange, disabled }: PickerPro
     items[focusIndex]?.scrollIntoView({ block: "nearest" });
   }, [open, focusIndex]);
 
+  useEffect(() => {
+    const card = containerRef.current?.closest(".settings-card");
+    if (!card) return;
+    if (open) {
+      card.classList.add("settings-card--picker-open");
+    } else {
+      card.classList.remove("settings-card--picker-open");
+    }
+    return () => {
+      card.classList.remove("settings-card--picker-open");
+    };
+  }, [open]);
+
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
       if (!open) {
@@ -90,6 +103,7 @@ export default function Picker({ value, options, onChange, disabled }: PickerPro
     <div
       ref={containerRef}
       className="relative inline-block"
+      style={{ zIndex: open ? 40 : 1 }}
       onKeyDown={handleKeyDown}
       onBlur={(e) => {
         if (!containerRef.current?.contains(e.relatedTarget as Node)) {
