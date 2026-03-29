@@ -389,13 +389,12 @@ fn extract_result(request: &vn::RecognizeTextRequest) -> Result<OcrPassResult, S
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[cfg(target_os = "windows")]
-use windows_core::Interface;
-
-#[cfg(target_os = "windows")]
 use windows::{
     core::HSTRING,
     Globalization::Language,
-    Graphics::Imaging::{BitmapBufferAccessMode, BitmapPixelFormat, SoftwareBitmap},
+    Graphics::Imaging::{
+        BitmapAlphaMode, BitmapBufferAccessMode, BitmapPixelFormat, SoftwareBitmap,
+    },
     Media::Ocr::{OcrEngine as WinOcrEngine, OcrResult},
 };
 
@@ -419,7 +418,11 @@ impl WindowsMediaOcr {
             let lang_tag = engine
                 .RecognizerLanguage()
                 .ok()
-                .and_then(|lang| lang.LanguageTag().ok().map(|tag| tag.to_string_lossy()))
+                .and_then(|lang: Language| {
+                    lang.LanguageTag()
+                        .ok()
+                        .map(|tag: HSTRING| tag.to_string_lossy())
+                })
                 .unwrap_or_else(|| "unknown".to_string());
             eprintln!(
                 "[OCR] Windows engine initialized with language: {}",
@@ -501,10 +504,11 @@ impl OcrEngine for WindowsMediaOcr {
             .collect();
 
         // Create SoftwareBitmap
-        let bitmap = SoftwareBitmap::Create(
+        let bitmap = SoftwareBitmap::CreateWithAlpha(
             BitmapPixelFormat::Bgra8,
             width as i32,
             height as i32,
+            BitmapAlphaMode::Premultiplied,
         )
         .map_err(|e| format!("Failed to create SoftwareBitmap: {}", e))?;
 
@@ -519,8 +523,7 @@ impl OcrEngine for WindowsMediaOcr {
                 .map_err(|e| format!("Failed to create buffer reference: {}", e))?;
 
             // Get raw pointer to bitmap memory
-            let mem_buffer: IMemoryBufferByteAccess = reference
-                .cast()
+            let mem_buffer: IMemoryBufferByteAccess = windows_core::Interface::cast(&reference)
                 .map_err(|e| format!("Failed to cast buffer: {}", e))?;
 
             unsafe {
@@ -586,9 +589,5 @@ impl OcrEngine for WindowsMediaOcr {
 #[cfg(target_os = "windows")]
 #[windows_core::interface("5b0d3235-4dba-4d44-865e-8f1d0e4fd04d")]
 unsafe trait IMemoryBufferByteAccess: windows_core::IUnknown {
-    unsafe fn GetBuffer(
-        &self,
-        value: *mut *mut u8,
-        capacity: *mut u32,
-    ) -> windows_core::HRESULT;
+    unsafe fn GetBuffer(&self, value: *mut *mut u8, capacity: *mut u32) -> windows_core::HRESULT;
 }
