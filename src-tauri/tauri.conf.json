@@ -36,7 +36,21 @@
         "minHeight": 400,
         "resizable": true,
         "visible": false,
-        "center": true
+        "center": true,
+        "skipTaskbar": false
+      },
+      {
+        "label": "setup",
+        "title": "Welcome to Copi",
+        "width": 860,
+        "height": 620,
+        "decorations": false,
+        "transparent": true,
+        "resizable": false,
+        "visible": false,
+        "center": true,
+        "acceptFirstMouse": true,
+        "skipTaskbar": false
       }
     ],
     "security": {
@@ -53,9 +67,6 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ],
-    "resources": [
-      "resources/models/*"
     ]
   },
   "plugins": {

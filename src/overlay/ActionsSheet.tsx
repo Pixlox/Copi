@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { Copy, Pin, PinOff, Trash2, X, Shuffle, FolderOpen, ExternalLink } from "lucide-react";
 import { ClipResult, CollectionInfo } from "../hooks/useSearch";
 import { transforms } from "../utils/transforms";
+import { formatShortcut, isMacPlatform } from "../utils/platform";
 import { getImagePreviewData, setImagePreviewData } from "./clipMediaCache";
 
 export interface SheetAction {
@@ -37,6 +38,10 @@ function wrapIndex(current: number, delta: number, total: number): number {
 function previewText(clip: ClipResult): string {
   const source = clip.content_type === "image" ? clip.ocr_text || "Image clip" : clip.content;
   return source.replace(/[\r\n]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function actionShortcut(shortcut: string): string {
+  return formatShortcut(shortcut);
 }
 
 function ActionButton({
@@ -185,7 +190,7 @@ function ActionsSheet({
         id: "open-url",
         icon: <ExternalLink size={16} />,
         label: "Open in Browser",
-        shortcut: "⌘O",
+        shortcut: actionShortcut(isMacPlatform ? "cmd+o" : "ctrl+o"),
       });
     }
 
@@ -572,7 +577,7 @@ function ActionsSheet({
           </div>
           <div className="text-[11px]" style={{ color: "var(--text-tertiary)" }}>
             Use <span style={{ color: "var(--text-secondary)" }}>↑↓</span> to move,{" "}
-            <span style={{ color: "var(--text-secondary)" }}>Enter</span> to confirm
+            <span style={{ color: "var(--text-secondary)" }}>{formatShortcut("enter")}</span> to confirm
           </div>
         </div>
 
@@ -603,19 +608,19 @@ export function buildSheetActions(clip: ClipResult): SheetAction[] {
       id: "pin",
       icon: clip.pinned ? <PinOff size={16} /> : <Pin size={16} />,
       label: clip.pinned ? "Unpin Clip" : "Pin Clip",
-      shortcut: "⌘P",
+      shortcut: actionShortcut(isMacPlatform ? "cmd+p" : "ctrl+p"),
     },
     {
       id: "copy",
       icon: <Copy size={16} />,
       label: "Copy to Clipboard",
-      shortcut: "⇧↵",
+      shortcut: actionShortcut("shift+enter"),
     },
     {
       id: "delete",
       icon: <Trash2 size={16} />,
       label: "Delete Entry",
-      shortcut: "⌘D",
+      shortcut: actionShortcut(isMacPlatform ? "cmd+d" : "ctrl+d"),
       tone: "danger",
     },
   ];

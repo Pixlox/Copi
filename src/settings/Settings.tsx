@@ -12,7 +12,6 @@ import {
   Plus,
   X,
   Trash2,
-  Download,
   RefreshCw,
   FolderOpen,
 } from "lucide-react";
@@ -20,6 +19,7 @@ import { useThemeContext } from "../contexts/ThemeContext";
 import type { ThemePreference } from "../hooks/useTheme";
 import Picker from "../components/Picker";
 import { checkForUpdates } from "../utils/updater";
+import { formatShortcut, isMacPlatform, platformName } from "../utils/platform";
 
 interface CopiConfig {
   general: {
@@ -36,7 +36,6 @@ interface CopiConfig {
   };
   privacy: {
     excluded_apps: string[];
-    privacy_rules: string[];
   };
 }
 
@@ -139,15 +138,6 @@ function formatBytes(bytes: number): string {
   return `${parseFloat((bytes / Math.pow(k, i)).toFixed(1))} ${sizes[i]}`;
 }
 
-const HOTKEY_PRESETS = [
-  { label: "Alt + Space", value: "alt+space" },
-  { label: "Ctrl + Shift + Space", value: "ctrl+shift+space" },
-  { label: "Cmd + Shift + Space", value: "cmd+shift+space" },
-  { label: "Cmd + Shift + V", value: "cmd+shift+v" },
-  { label: "Ctrl + Shift + V", value: "ctrl+shift+v" },
-  { label: "Ctrl + Alt + V", value: "ctrl+alt+v" },
-];
-
 const RETENTION_OPTIONS = [
   { label: "7 days", value: "7" },
   { label: "30 days", value: "30" },
@@ -155,6 +145,22 @@ const RETENTION_OPTIONS = [
   { label: "1 year", value: "365" },
   { label: "Forever", value: "0" },
 ];
+
+function getHotkeyPresets() {
+  return isMacPlatform
+    ? [
+        { label: formatShortcut("alt+space", " + "), value: "alt+space" },
+        { label: formatShortcut("cmd+shift+space", " + "), value: "cmd+shift+space" },
+        { label: formatShortcut("cmd+shift+v", " + "), value: "cmd+shift+v" },
+        { label: formatShortcut("ctrl+shift+space", " + "), value: "ctrl+shift+space" },
+      ]
+    : [
+        { label: formatShortcut("alt+space"), value: "alt+space" },
+        { label: formatShortcut("ctrl+shift+space"), value: "ctrl+shift+space" },
+        { label: formatShortcut("ctrl+shift+v"), value: "ctrl+shift+v" },
+        { label: formatShortcut("ctrl+alt+v"), value: "ctrl+alt+v" },
+      ];
+}
 
 export default function Settings() {
   const { theme, setTheme } = useThemeContext();
@@ -166,9 +172,7 @@ export default function Settings() {
   const [savedField, setSavedField] = useState<string | null>(null);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const [recordingHotkey, setRecordingHotkey] = useState(false);
   const [newApp, setNewApp] = useState("");
-  const [newRule, setNewRule] = useState("");
   const [confirmClear, setConfirmClear] = useState(false);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
 
@@ -206,61 +210,20 @@ export default function Settings() {
 
   const saveConfig = useCallback(
     async (updated: CopiConfig, field: string) => {
+      const previous = config;
       setConfig(updated);
       try {
         await invoke("set_config", { config: updated });
         showSaved(field);
       } catch (e) {
         console.error("Save failed:", e);
+        if (previous) {
+          setConfig(previous);
+        }
       }
     },
-    [showSaved]
+    [config, showSaved]
   );
-
-  // Hotkey recording
-  useEffect(() => {
-    if (!recordingHotkey) return;
-
-    const handleKeyDown = (e: KeyboardEvent) => {
-      e.preventDefault();
-      e.stopPropagation();
-      if (e.key === "Escape") {
-        setRecordingHotkey(false);
-      }
-    };
-
-    const handleKeyUp = (e: KeyboardEvent) => {
-      e.preventDefault();
-      e.stopPropagation();
-
-      const mods: string[] = [];
-      if (e.metaKey) mods.push("cmd");
-      if (e.ctrlKey) mods.push("ctrl");
-      if (e.altKey) mods.push("alt");
-      if (e.shiftKey) mods.push("shift");
-
-      const key = e.key.toLowerCase();
-      if (["meta", "control", "alt", "shift"].includes(key)) return;
-
-      const combo = [...mods, key].join("+");
-      setRecordingHotkey(false);
-
-      if (config) {
-        const updated: CopiConfig = {
-          ...config,
-          general: { ...config.general, hotkey: combo },
-        };
-        saveConfig(updated, "hotkey");
-      }
-    };
-
-    window.addEventListener("keydown", handleKeyDown, true);
-    window.addEventListener("keyup", handleKeyUp, true);
-    return () => {
-      window.removeEventListener("keydown", handleKeyDown, true);
-      window.removeEventListener("keyup", handleKeyUp, true);
-    };
-  }, [recordingHotkey, config, saveConfig]);
 
   if (!config) {
     return (
@@ -303,39 +266,10 @@ export default function Settings() {
         {/* ── General ─────────────────────────────────────────────── */}
         <SectionHeader icon={<Keyboard size={14} />} title="General" />
         <Card>
-          <Row label="Global Hotkey" description="Press to open the clipboard overlay">
-            {recordingHotkey ? (
-              <span
-                className="inline-flex items-center rounded-full px-3 py-1 text-[12px]"
-                style={{
-                  background: "var(--accent-bg)",
-                  color: "var(--accent-text)",
-                }}
-              >
-                Recording…
-              </span>
-            ) : (
-              <div className="flex items-center gap-2">
-                <span className="text-[12px]" style={{ color: "var(--text-secondary)" }}>
-                  {config.general.hotkey}
-                </span>
-                <button
-                  type="button"
-                  onClick={() => setRecordingHotkey(true)}
-                  className="settings-button"
-                >
-                  Change
-                </button>
-              </div>
-            )}
-          </Row>
-
-          <Divider />
-
-          <Row label="Quick Presets">
+          <Row label="Global Hotkey" description="Choose the shortcut that opens Copi">
             <Picker
               value={config.general.hotkey}
-              options={HOTKEY_PRESETS}
+              options={getHotkeyPresets()}
               onChange={(val) => {
                 const updated: CopiConfig = {
                   ...config,
@@ -346,9 +280,7 @@ export default function Settings() {
             />
           </Row>
 
-          <Divider />
-
-          <Row label="Launch at Login" description="Start Copi when your Mac starts">
+          <Row label="Launch at Login" description={`Start Copi when your ${platformName} starts`}>
             <Toggle
               checked={config.general.launch_at_login}
               onChange={(v) => {
@@ -363,7 +295,7 @@ export default function Settings() {
 
           <Divider />
 
-          <Row label="Default Paste" description="Enter key behavior">
+          <Row label="Default Action" description="Choose what Enter does in the overlay">
             <div className="segmented-control">
               <button
                 className={`segmented-option ${config.general.default_paste_behaviour === "copy" ? "active" : ""}`}
@@ -572,87 +504,7 @@ export default function Settings() {
 
           <Divider />
 
-          <Row label="Privacy Rules" description="Regex patterns — matching content won't be captured" />
-
-          <div className="px-4 pb-2 space-y-1.5">
-            {config.privacy.privacy_rules.map((rule, i) => (
-              <div
-                key={`${rule}-${i}`}
-                className="flex items-center gap-2 rounded-lg px-3 py-2"
-                style={{ background: "var(--surface-primary)" }}
-              >
-                <code
-                  className="flex-1 text-[11px]"
-                  style={{
-                    color: "var(--accent-text)",
-                    fontFamily: "'SF Mono', monospace",
-                  }}
-                >
-                  {rule}
-                </code>
-                <button
-                  type="button"
-                  onClick={() => {
-                    const rules = [...config.privacy.privacy_rules];
-                    rules.splice(i, 1);
-                    const updated: CopiConfig = {
-                      ...config,
-                      privacy: { ...config.privacy, privacy_rules: rules },
-                    };
-                    saveConfig(updated, "rules");
-                  }}
-                  style={{ color: "var(--text-tertiary)" }}
-                >
-                  <Trash2 size={12} />
-                </button>
-              </div>
-            ))}
-          </div>
-
-          <div className="px-4 pb-3 flex items-center gap-2">
-            <input
-              type="text"
-              value={newRule}
-              onChange={(e) => setNewRule(e.target.value)}
-              placeholder="Regex pattern…"
-              className="settings-input flex-1"
-              style={{ fontFamily: "'SF Mono', monospace" }}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && newRule.trim()) {
-                  const updated: CopiConfig = {
-                    ...config,
-                    privacy: {
-                      ...config.privacy,
-                      privacy_rules: [...config.privacy.privacy_rules, newRule.trim()],
-                    },
-                  };
-                  saveConfig(updated, "rules");
-                  setNewRule("");
-                }
-              }}
-            />
-            <button
-              type="button"
-              disabled={!newRule.trim()}
-              onClick={() => {
-                if (!newRule.trim()) return;
-                const updated: CopiConfig = {
-                  ...config,
-                  privacy: {
-                    ...config.privacy,
-                    privacy_rules: [...config.privacy.privacy_rules, newRule.trim()],
-                  },
-                };
-                saveConfig(updated, "rules");
-                setNewRule("");
-              }}
-              className="settings-button"
-            >
-              <Plus size={12} />
-            </button>
-          </div>
-
-          <SaveNotice show={savedField === "excluded" || savedField === "rules"} />
+          <SaveNotice show={savedField === "excluded"} />
         </Card>
 
         {/* ── Storage & Data ──────────────────────────────────────── */}
@@ -700,34 +552,6 @@ export default function Settings() {
               {checkingUpdate ? "Checking…" : "Check Now"}
             </button>
           </Row>
-
-          <Divider />
-
-          <Row label="Export History" description="Download all clips as JSON">
-            <button
-              type="button"
-              onClick={async () => {
-                try {
-                  const json = await invoke<string>("export_history_json");
-                  const blob = new Blob([json], { type: "application/json" });
-                  const url = URL.createObjectURL(blob);
-                  const a = document.createElement("a");
-                  a.href = url;
-                  a.download = `copi-export-${new Date().toISOString().slice(0, 10)}.json`;
-                  a.click();
-                  URL.revokeObjectURL(url);
-                } catch (e) {
-                  console.error("Export failed:", e);
-                }
-              }}
-              className="settings-button"
-            >
-              <Download size={12} />
-              Export
-            </button>
-          </Row>
-
-          <Divider />
 
           <Row label="Clear All History" description="Permanently delete all clipboard data">
             <button
@@ -782,7 +606,7 @@ export default function Settings() {
 
         {/* Footer */}
         <div className="mt-6 mb-4 text-center text-[11px]" style={{ color: "var(--text-muted)" }}>
-          ⌘ + {config.general.hotkey} to open overlay
+          Press {formatShortcut(config.general.hotkey, " + ")} to open Copi
         </div>
       </div>
 

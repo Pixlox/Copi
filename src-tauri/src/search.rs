@@ -84,7 +84,13 @@ pub async fn search_clips(
         let query_clone = query.clone();
         let filter_clone = filter.clone();
         tokio::task::spawn_blocking(move || {
-            search_sync(&app_handle, &query_clone, &filter_clone, collection_id, SearchPhase::Fast)
+            search_sync(
+                &app_handle,
+                &query_clone,
+                &filter_clone,
+                collection_id,
+                SearchPhase::Fast,
+            )
         })
         .await
         .map_err(|e| e.to_string())??
@@ -171,20 +177,17 @@ pub async fn update_clip_content(
         "UPDATE clips
          SET content = ?1, content_hash = ?2, content_type = ?3, language = COALESCE(?5, language)
          WHERE id = ?4",
-        rusqlite::params![
-            new_content,
-            hash,
-            content_type,
-            clip_id,
-            detected_language
-        ],
+        rusqlite::params![new_content, hash, content_type, clip_id, detected_language],
     )
     .map_err(|e| e.to_string())?;
     drop(conn);
     let tx = state.clip_tx.clone();
     tauri::async_runtime::spawn(async move {
         if let Err(e) = tx.send(clip_id).await {
-            eprintln!("[EmbedQueue] Failed to enqueue edited clip {}: {}", clip_id, e);
+            eprintln!(
+                "[EmbedQueue] Failed to enqueue edited clip {}: {}",
+                clip_id, e
+            );
         }
     });
     let _ = app.emit("clips-changed", ());
@@ -212,8 +215,8 @@ pub async fn get_image_thumbnail(
         Some((thumb, _, _, _)) if !thumb.is_empty() => Ok(Some(b64(&thumb))),
         Some((_, raw, width, height)) if !raw.is_empty() => {
             drop(conn);
-            let (rgba, w, h) = decode_stored_image(&raw, width, height)
-                .ok_or("Failed to decode image")?;
+            let (rgba, w, h) =
+                decode_stored_image(&raw, width, height).ok_or("Failed to decode image")?;
             Ok(gen_thumb(&rgba, w, h, 64).map(|data| b64(&data)))
         }
         _ => Ok(None),
@@ -241,8 +244,8 @@ pub async fn get_image_preview(
     match result {
         Some((raw, width, height)) if !raw.is_empty() => {
             drop(conn);
-            let (rgba, w, h) = decode_stored_image(&raw, width, height)
-                .ok_or("Failed to decode image")?;
+            let (rgba, w, h) =
+                decode_stored_image(&raw, width, height).ok_or("Failed to decode image")?;
             Ok(gen_thumb(&rgba, w, h, max_size).map(|data| b64(&data)))
         }
         _ => Ok(None),
@@ -253,8 +256,10 @@ pub async fn get_image_preview(
 pub async fn get_clip_full_content(app: tauri::AppHandle, clip_id: i64) -> Result<String, String> {
     let state = app.state::<AppState>();
     let conn = state.db_read_pool.get().map_err(|e| e.to_string())?;
-    conn.query_row("SELECT content FROM clips WHERE id = ?", [clip_id], |row| row.get(0))
-        .map_err(|e| e.to_string())
+    conn.query_row("SELECT content FROM clips WHERE id = ?", [clip_id], |row| {
+        row.get(0)
+    })
+    .map_err(|e| e.to_string())
 }
 
 fn schedule_semantic_update(
@@ -264,9 +269,16 @@ fn schedule_semantic_update(
     filter: String,
     collection_id: Option<i64>,
 ) {
-    let Some(_) = app.state::<AppState>().model.as_ref() else {
+    let has_model = app
+        .state::<AppState>()
+        .model
+        .read()
+        .ok()
+        .and_then(|guard| guard.as_ref().cloned())
+        .is_some();
+    if !has_model {
         return;
-    };
+    }
     if query.trim().len() < 2 {
         return;
     }
@@ -278,7 +290,8 @@ fn schedule_semantic_update(
         return;
     }
     // Allow semantic search if we have meaningful text OR temporal/source/type filters
-    let has_filters = parsed.has_temporal || !parsed.source_apps.is_empty() || parsed.content_type.is_some();
+    let has_filters =
+        parsed.has_temporal || !parsed.source_apps.is_empty() || parsed.content_type.is_some();
     if parsed.semantic.trim().len() < 3 && !has_filters {
         return;
     }
@@ -298,7 +311,15 @@ fn schedule_semantic_update(
             let app_handle = app_handle.clone();
             let query = query.clone();
             let filter = filter.clone();
-            move || search_sync(&app_handle, &query, &filter, collection_id, SearchPhase::Semantic)
+            move || {
+                search_sync(
+                    &app_handle,
+                    &query,
+                    &filter,
+                    collection_id,
+                    SearchPhase::Semantic,
+                )
+            }
         })
         .await;
 
@@ -348,8 +369,14 @@ fn search_sync(
     let (semantic_results, semantic_results_relaxed) = match phase {
         SearchPhase::Fast => (None, None),
         SearchPhase::Semantic => {
-            if let Some(model) = state.model.as_ref() {
-                let strict = do_vector_candidates(&conn, model, &parsed, filter, collection_id, true);
+            let model = state
+                .model
+                .read()
+                .ok()
+                .and_then(|guard| guard.as_ref().cloned());
+            if let Some(model) = model.as_ref() {
+                let strict =
+                    do_vector_candidates(&conn, model, &parsed, filter, collection_id, true);
                 let relaxed = if parsed.has_temporal {
                     Some(do_vector_candidates(
                         &conn,
@@ -483,7 +510,11 @@ fn do_ordering(
         Ordering::Newest | Ordering::SecondNewest => "created_at DESC",
         Ordering::Oldest => "created_at ASC",
     };
-    let limit = if *ordering == Ordering::SecondNewest { 2 } else { 1 };
+    let limit = if *ordering == Ordering::SecondNewest {
+        2
+    } else {
+        1
+    };
     let mut conditions = vec!["1=1".to_string()];
     let mut params: Vec<Box<dyn ToSql>> = vec![];
 
@@ -520,13 +551,25 @@ fn do_ranked_search(
     semantic_candidates: Option<&[(i64, f64)]>,
     semantic_candidates_relaxed: Option<&[(i64, f64)]>,
 ) -> Result<Vec<ClipResult>, String> {
-    let (mut scores, mut temporal_relaxed) =
-        collect_ranked_scores(conn, parsed, filter, collection_id, semantic_candidates, true)?;
+    let (mut scores, mut temporal_relaxed) = collect_ranked_scores(
+        conn,
+        parsed,
+        filter,
+        collection_id,
+        semantic_candidates,
+        true,
+    )?;
 
     if scores.is_empty() && parsed.has_temporal {
         let fallback_semantic = semantic_candidates_relaxed.or(semantic_candidates);
-        let (fallback_scores, _) =
-            collect_ranked_scores(conn, parsed, filter, collection_id, fallback_semantic, false)?;
+        let (fallback_scores, _) = collect_ranked_scores(
+            conn,
+            parsed,
+            filter,
+            collection_id,
+            fallback_semantic,
+            false,
+        )?;
         scores = fallback_scores;
         temporal_relaxed = true;
     }
@@ -595,7 +638,10 @@ fn do_vector_candidates(
         return vec![];
     }
 
-    let bytes: Vec<u8> = embedding.iter().flat_map(|value| value.to_le_bytes()).collect();
+    let bytes: Vec<u8> = embedding
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
     let mut params: Vec<Box<dyn ToSql>> = vec![Box::new(bytes), Box::new(60_i64)];
     let mut conditions = vec!["e.embedding MATCH ?".to_string(), "e.k = ?".to_string()];
     apply_filters(
@@ -736,11 +782,7 @@ fn sort_scored_ids(scores: HashMap<i64, ScoreEntry>, limit: usize) -> Vec<i64> {
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| right.0.cmp(&left.0))
     });
-    ranked
-        .into_iter()
-        .take(limit)
-        .map(|(id, _)| id)
-        .collect()
+    ranked.into_iter().take(limit).map(|(id, _)| id).collect()
 }
 
 fn query_rows(
@@ -749,7 +791,9 @@ fn query_rows(
     params: &[&dyn ToSql],
 ) -> Result<Vec<ClipResult>, String> {
     let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
-    let rows = stmt.query_map(params, row_to_clip).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params, row_to_clip)
+        .map_err(|e| e.to_string())?;
     let mut results = Vec::new();
     for row in rows {
         results.push(row.map_err(|e| e.to_string())?);
@@ -764,7 +808,9 @@ fn query_id_scores(
 ) -> Result<Vec<(i64, f64)>, String> {
     let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map(params, |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?)))
+        .query_map(params, |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
+        })
         .map_err(|e| e.to_string())?;
     let mut results = Vec::new();
     for row in rows {
@@ -783,7 +829,8 @@ fn fetch_clips_by_ids(conn: &rusqlite::Connection, ids: &[i64]) -> Result<Vec<Cl
     let sql = format!("SELECT {SEL} FROM clips WHERE id IN ({placeholders})");
     let params: Vec<&dyn ToSql> = ids.iter().map(|id| id as &dyn ToSql).collect();
     let rows = query_rows(conn, &sql, &params)?;
-    let mut by_id: HashMap<i64, ClipResult> = rows.into_iter().map(|clip| (clip.id, clip)).collect();
+    let mut by_id: HashMap<i64, ClipResult> =
+        rows.into_iter().map(|clip| (clip.id, clip)).collect();
 
     let mut ordered = Vec::new();
     for id in ids {
@@ -908,7 +955,10 @@ fn apply_clip_boosts(
         }
 
         if parsed.content_type.as_deref() == Some("image")
-            && clip.ocr_text.as_deref().is_some_and(|text| !text.trim().is_empty())
+            && clip
+                .ocr_text
+                .as_deref()
+                .is_some_and(|text| !text.trim().is_empty())
         {
             entry.score += 0.5;
         }
@@ -1029,7 +1079,11 @@ fn gen_thumb(data: &[u8], width: u32, height: u32, max: u32) -> Option<Vec<u8>> 
         }
     }
 
-    if png.is_empty() { None } else { Some(png) }
+    if png.is_empty() {
+        None
+    } else {
+        Some(png)
+    }
 }
 
 #[cfg(test)]
@@ -1078,7 +1132,16 @@ mod tests {
         created_at: i64,
         ocr_text: Option<&str>,
     ) {
-        insert_clip_with_language(conn, id, content, content_type, source_app, created_at, ocr_text, None);
+        insert_clip_with_language(
+            conn,
+            id,
+            content,
+            content_type,
+            source_app,
+            created_at,
+            ocr_text,
+            None,
+        );
     }
 
     fn insert_clip_with_language(
@@ -1213,8 +1276,11 @@ mod tests {
             1_710_000_000,
             None,
         );
-        conn.execute("UPDATE clips SET pinned = 1, copy_count = 99 WHERE id = 1", [])
-            .unwrap();
+        conn.execute(
+            "UPDATE clips SET pinned = 1, copy_count = 99 WHERE id = 1",
+            [],
+        )
+        .unwrap();
         insert_clip(
             &conn,
             2,
@@ -1292,9 +1358,23 @@ mod tests {
         let now = 1_720_000_000_i64;
         for id in 1..=5000_i64 {
             let content = format!("noise clip {id} lorem ipsum dolor sit amet {id}");
-            let content_type = if id % 9 == 0 { "url" } else if id % 13 == 0 { "code" } else { "text" };
+            let content_type = if id % 9 == 0 {
+                "url"
+            } else if id % 13 == 0 {
+                "code"
+            } else {
+                "text"
+            };
             let source_app = if id % 7 == 0 { "Slack" } else { "Notes" };
-            insert_clip(&conn, id, &content, content_type, source_app, now - id, None);
+            insert_clip(
+                &conn,
+                id,
+                &content,
+                content_type,
+                source_app,
+                now - id,
+                None,
+            );
         }
         insert_clip(
             &conn,
@@ -1444,22 +1524,63 @@ mod tests {
     #[test]
     fn intent_query_finds_related_clips() {
         let conn = setup_test_db();
-        insert_clip(&conn, 1, "Your verification code is 123456", "text", "Messages", 1_710_000_000, None);
-        insert_clip(&conn, 2, "Hello world", "text", "Notes", 1_710_000_100, None);
+        insert_clip(
+            &conn,
+            1,
+            "Your verification code is 123456",
+            "text",
+            "Messages",
+            1_710_000_000,
+            None,
+        );
+        insert_clip(
+            &conn,
+            2,
+            "Hello world",
+            "text",
+            "Notes",
+            1_710_000_100,
+            None,
+        );
 
         let parsed = query_parser::parse_query("auth code");
         // Verify intent expansion produces correct keywords
-        assert!(parsed.keywords.contains(&"verification".to_string()), "should expand to 'verification'");
-        assert!(parsed.keywords.contains(&"token".to_string()), "should expand to 'token'");
+        assert!(
+            parsed.keywords.contains(&"verification".to_string()),
+            "should expand to 'verification'"
+        );
+        assert!(
+            parsed.keywords.contains(&"token".to_string()),
+            "should expand to 'token'"
+        );
         // Verify semantic is enriched for embedding
-        assert!(parsed.semantic.contains("verification"), "semantic should contain 'verification'");
+        assert!(
+            parsed.semantic.contains("verification"),
+            "semantic should contain 'verification'"
+        );
     }
 
     #[test]
     fn receipt_query_finds_invoice() {
         let conn = setup_test_db();
-        insert_clip(&conn, 1, "Invoice #1234 - Total: $50.00 - Thank you for your payment", "text", "Mail", 1_710_000_000, None);
-        insert_clip(&conn, 2, "Meeting at 3pm", "text", "Calendar", 1_710_000_100, None);
+        insert_clip(
+            &conn,
+            1,
+            "Invoice #1234 - Total: $50.00 - Thank you for your payment",
+            "text",
+            "Mail",
+            1_710_000_000,
+            None,
+        );
+        insert_clip(
+            &conn,
+            2,
+            "Meeting at 3pm",
+            "text",
+            "Calendar",
+            1_710_000_100,
+            None,
+        );
 
         let parsed = query_parser::parse_query("receipt");
         let results = do_ranked_search(&conn, &parsed, "all", None, None, None).unwrap();
@@ -1469,8 +1590,24 @@ mod tests {
     #[test]
     fn error_query_finds_stack_trace() {
         let conn = setup_test_db();
-        insert_clip(&conn, 1, "panic: index out of range\nat main.rs:42\nstack trace:\n  0: main", "code", "Terminal", 1_710_000_000, None);
-        insert_clip(&conn, 2, "Hello world", "text", "Notes", 1_710_000_100, None);
+        insert_clip(
+            &conn,
+            1,
+            "panic: index out of range\nat main.rs:42\nstack trace:\n  0: main",
+            "code",
+            "Terminal",
+            1_710_000_000,
+            None,
+        );
+        insert_clip(
+            &conn,
+            2,
+            "Hello world",
+            "text",
+            "Notes",
+            1_710_000_100,
+            None,
+        );
 
         let parsed = query_parser::parse_query("error");
         let results = do_ranked_search(&conn, &parsed, "all", None, None, None).unwrap();
@@ -1482,8 +1619,24 @@ mod tests {
         let conn = setup_test_db();
         let now = 1_720_000_000_i64;
         let yesterday = now - 86400;
-        insert_clip(&conn, 1, "Meeting notes from yesterday", "text", "Notes", yesterday, None);
-        insert_clip(&conn, 2, "Meeting notes from last month", "text", "Notes", now - 86400 * 30, None);
+        insert_clip(
+            &conn,
+            1,
+            "Meeting notes from yesterday",
+            "text",
+            "Notes",
+            yesterday,
+            None,
+        );
+        insert_clip(
+            &conn,
+            2,
+            "Meeting notes from last month",
+            "text",
+            "Notes",
+            now - 86400 * 30,
+            None,
+        );
 
         let parsed = query_parser::parse_query("from yesterday");
         // Should return clip 1 based on temporal filter alone
@@ -1494,8 +1647,24 @@ mod tests {
     #[test]
     fn source_filtered_url_query() {
         let conn = setup_test_db();
-        insert_clip(&conn, 1, "https://slack.com/archives/C123/p456", "url", "Slack", 1_710_000_000, None);
-        insert_clip(&conn, 2, "https://example.com/docs", "url", "Safari", 1_720_000_000, None);
+        insert_clip(
+            &conn,
+            1,
+            "https://slack.com/archives/C123/p456",
+            "url",
+            "Slack",
+            1_710_000_000,
+            None,
+        );
+        insert_clip(
+            &conn,
+            2,
+            "https://example.com/docs",
+            "url",
+            "Safari",
+            1_720_000_000,
+            None,
+        );
 
         let parsed = query_parser::parse_query("url from slack");
         let results = do_filter_search(&conn, &parsed, "all", None).unwrap();
@@ -1505,8 +1674,24 @@ mod tests {
     #[test]
     fn code_block_query_finds_code() {
         let conn = setup_test_db();
-        insert_clip(&conn, 1, "fn main() {\n    println!(\"hello\");\n}", "code", "Code", 1_710_000_000, None);
-        insert_clip(&conn, 2, "hello there", "text", "Messages", 1_710_000_050, None);
+        insert_clip(
+            &conn,
+            1,
+            "fn main() {\n    println!(\"hello\");\n}",
+            "code",
+            "Code",
+            1_710_000_000,
+            None,
+        );
+        insert_clip(
+            &conn,
+            2,
+            "hello there",
+            "text",
+            "Messages",
+            1_710_000_050,
+            None,
+        );
 
         let parsed = query_parser::parse_query("code block");
         let results = do_filter_search(&conn, &parsed, "all", None).unwrap();
@@ -1516,8 +1701,25 @@ mod tests {
     #[test]
     fn language_filtered_screenshot_query() {
         let conn = setup_test_db();
-        insert_clip_with_language(&conn, 1, "[Image]", "image", "Photos", 1_710_000_000, Some("搭乗券 ゲート B7"), Some("ja"));
-        insert_clip(&conn, 2, "[Image]", "image", "Photos", 1_710_000_100, Some("Boarding pass Gate A12"));
+        insert_clip_with_language(
+            &conn,
+            1,
+            "[Image]",
+            "image",
+            "Photos",
+            1_710_000_000,
+            Some("搭乗券 ゲート B7"),
+            Some("ja"),
+        );
+        insert_clip(
+            &conn,
+            2,
+            "[Image]",
+            "image",
+            "Photos",
+            1_710_000_100,
+            Some("Boarding pass Gate A12"),
+        );
 
         let parsed = query_parser::parse_query("japanese screenshot");
         let results = do_filter_search(&conn, &parsed, "all", None).unwrap();
@@ -1527,8 +1729,24 @@ mod tests {
     #[test]
     fn todo_list_query_finds_tasks() {
         let conn = setup_test_db();
-        insert_clip(&conn, 1, "Buy groceries, Call dentist, Send email - my todo list for today", "text", "Notes", 1_710_000_000, None);
-        insert_clip(&conn, 2, "Meeting notes for today", "text", "Notes", 1_710_000_100, None);
+        insert_clip(
+            &conn,
+            1,
+            "Buy groceries, Call dentist, Send email - my todo list for today",
+            "text",
+            "Notes",
+            1_710_000_000,
+            None,
+        );
+        insert_clip(
+            &conn,
+            2,
+            "Meeting notes for today",
+            "text",
+            "Notes",
+            1_710_000_100,
+            None,
+        );
 
         let parsed = query_parser::parse_query("todo list");
         let results = do_ranked_search(&conn, &parsed, "all", None, None, None).unwrap();
@@ -1538,8 +1756,24 @@ mod tests {
     #[test]
     fn zoom_link_query_finds_meeting_url() {
         let conn = setup_test_db();
-        insert_clip(&conn, 1, "https://zoom.us/j/123456789?pwd=abc123", "url", "Calendar", 1_710_000_000, None);
-        insert_clip(&conn, 2, "https://example.com/article", "url", "Safari", 1_710_000_100, None);
+        insert_clip(
+            &conn,
+            1,
+            "https://zoom.us/j/123456789?pwd=abc123",
+            "url",
+            "Calendar",
+            1_710_000_000,
+            None,
+        );
+        insert_clip(
+            &conn,
+            2,
+            "https://example.com/article",
+            "url",
+            "Safari",
+            1_710_000_100,
+            None,
+        );
 
         let parsed = query_parser::parse_query("zoom link");
         let results = do_ranked_search(&conn, &parsed, "all", None, None, None).unwrap();
@@ -1549,8 +1783,24 @@ mod tests {
     #[test]
     fn meeting_notes_query_finds_agenda() {
         let conn = setup_test_db();
-        insert_clip(&conn, 1, "Meeting agenda: Q3 review, action items, followup on deployment", "text", "Notion", 1_710_000_000, None);
-        insert_clip(&conn, 2, "Random text note", "text", "Notes", 1_710_000_100, None);
+        insert_clip(
+            &conn,
+            1,
+            "Meeting agenda: Q3 review, action items, followup on deployment",
+            "text",
+            "Notion",
+            1_710_000_000,
+            None,
+        );
+        insert_clip(
+            &conn,
+            2,
+            "Random text note",
+            "text",
+            "Notes",
+            1_710_000_100,
+            None,
+        );
 
         let parsed = query_parser::parse_query("meeting notes");
         let results = do_ranked_search(&conn, &parsed, "all", None, None, None).unwrap();
@@ -1560,8 +1810,24 @@ mod tests {
     #[test]
     fn tracking_number_query_finds_shipment() {
         let conn = setup_test_db();
-        insert_clip(&conn, 1, "Your order has been shipped! Tracking: 1Z999AA10123456784 - FedEx delivery", "text", "Mail", 1_710_000_000, None);
-        insert_clip(&conn, 2, "Meeting at 3pm", "text", "Calendar", 1_710_000_100, None);
+        insert_clip(
+            &conn,
+            1,
+            "Your order has been shipped! Tracking: 1Z999AA10123456784 - FedEx delivery",
+            "text",
+            "Mail",
+            1_710_000_000,
+            None,
+        );
+        insert_clip(
+            &conn,
+            2,
+            "Meeting at 3pm",
+            "text",
+            "Calendar",
+            1_710_000_100,
+            None,
+        );
 
         let parsed = query_parser::parse_query("tracking number");
         let results = do_ranked_search(&conn, &parsed, "all", None, None, None).unwrap();
@@ -1571,8 +1837,24 @@ mod tests {
     #[test]
     fn password_query_finds_credentials() {
         let conn = setup_test_db();
-        insert_clip(&conn, 1, "Username: admin@example.com\nPassword: secure123", "text", "Notes", 1_710_000_000, None);
-        insert_clip(&conn, 2, "Meeting notes", "text", "Notes", 1_710_000_100, None);
+        insert_clip(
+            &conn,
+            1,
+            "Username: admin@example.com\nPassword: secure123",
+            "text",
+            "Notes",
+            1_710_000_000,
+            None,
+        );
+        insert_clip(
+            &conn,
+            2,
+            "Meeting notes",
+            "text",
+            "Notes",
+            1_710_000_100,
+            None,
+        );
 
         let parsed = query_parser::parse_query("password");
         let results = do_ranked_search(&conn, &parsed, "all", None, None, None).unwrap();
@@ -1600,7 +1882,15 @@ mod tests {
             1_710_000_000,
             None,
         );
-        insert_clip(&conn, 2, "random shopping note", "text", "Notes", 1_710_000_100, None);
+        insert_clip(
+            &conn,
+            2,
+            "random shopping note",
+            "text",
+            "Notes",
+            1_710_000_100,
+            None,
+        );
 
         let parsed = query_parser::parse_query("that thing about the privacy policy");
         let results = do_ranked_search(&conn, &parsed, "all", None, None, None).unwrap();
@@ -1646,7 +1936,15 @@ mod tests {
             1_710_000_000,
             None,
         );
-        insert_clip(&conn, 2, "meeting agenda for friday", "text", "Notes", 1_710_000_100, None);
+        insert_clip(
+            &conn,
+            2,
+            "meeting agenda for friday",
+            "text",
+            "Notes",
+            1_710_000_100,
+            None,
+        );
 
         let parsed = query_parser::parse_query("that apology email I wrote");
         let results = do_ranked_search(&conn, &parsed, "all", None, None, None).unwrap();

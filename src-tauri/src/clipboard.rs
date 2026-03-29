@@ -168,10 +168,7 @@ pub async fn backfill_image_metadata(app: &tauri::AppHandle) {
                     break;
                 }
                 let delay = std::time::Duration::from_secs(2u64.pow(retry_count));
-                eprintln!(
-                    "[Backfill] Retry {} in {:?}",
-                    retry_count, delay
-                );
+                eprintln!("[Backfill] Retry {} in {:?}", retry_count, delay);
                 tokio::time::sleep(delay).await;
                 continue;
             }
@@ -184,8 +181,9 @@ pub async fn backfill_image_metadata(app: &tauri::AppHandle) {
         let mut updated_in_batch = false;
         for clip_id in repair_ids {
             let app_for_task = app.clone();
-            let updated = tokio::task::spawn_blocking(move || repair_image_clip(&app_for_task, clip_id))
-                .await;
+            let updated =
+                tokio::task::spawn_blocking(move || repair_image_clip(&app_for_task, clip_id))
+                    .await;
             if updated.unwrap_or(false) {
                 updated_in_batch = true;
             }
@@ -562,7 +560,12 @@ fn process_image_capture(
         bytes: Cow::Owned(payload.bytes),
     };
     let thumbnail = image_to_thumbnail(&image);
-    let ocr_text = run_ocr(app, image.bytes.as_ref(), image.width as u32, image.height as u32);
+    let ocr_text = run_ocr(
+        app,
+        image.bytes.as_ref(),
+        image.width as u32,
+        image.height as u32,
+    );
     let language = ocr_text
         .as_ref()
         .and_then(|text| crate::query_parser::detect_language(text));
@@ -631,12 +634,14 @@ fn repair_image_clip(app: &tauri::AppHandle, clip_id: i64) -> bool {
     } else {
         image_to_thumbnail(&image)
     };
-    let ocr_text =
-        if existing_ocr.as_deref().is_some_and(|text| !text.trim().is_empty()) {
-            existing_ocr.clone()
-        } else {
-            run_ocr(app, image.bytes.as_ref(), w as u32, h as u32)
-        };
+    let ocr_text = if existing_ocr
+        .as_deref()
+        .is_some_and(|text| !text.trim().is_empty())
+    {
+        existing_ocr.clone()
+    } else {
+        run_ocr(app, image.bytes.as_ref(), w as u32, h as u32)
+    };
     let language = ocr_text
         .as_ref()
         .and_then(|text| crate::query_parser::detect_language(text));
@@ -665,7 +670,14 @@ fn repair_image_clip(app: &tauri::AppHandle, clip_id: i64) -> bool {
                      ELSE image_height
                  END
              WHERE id = ?6",
-            rusqlite::params![ocr_for_db, language, thumb_bytes, w as i64, h as i64, clip_id],
+            rusqlite::params![
+                ocr_for_db,
+                language,
+                thumb_bytes,
+                w as i64,
+                h as i64,
+                clip_id
+            ],
         )
         .ok()
         .unwrap_or(0)
@@ -724,9 +736,7 @@ fn detect_content_type(content: &str, _source_app: Option<&str>) -> String {
         if lt.contains("def ") && lt.contains('(') {
             code_score += 2;
         }
-        if lt.contains("class ")
-            && (lt.contains('{') || lt.contains(':'))
-        {
+        if lt.contains("class ") && (lt.contains('{') || lt.contains(':')) {
             code_score += 2;
         }
         if lt.contains("async fn ") {
@@ -1005,8 +1015,7 @@ fn image_to_thumbnail(image_data: &ImageData) -> Option<Vec<u8>> {
                     let src_idx = ((src_y * width + src_x) as usize) * 4;
                     let dst_idx = ((y * new_width + x) as usize) * 4;
                     if src_idx + 3 < bytes.len() && dst_idx + 3 < resized.len() {
-                        resized[dst_idx..dst_idx + 4]
-                            .copy_from_slice(&bytes[src_idx..src_idx + 4]);
+                        resized[dst_idx..dst_idx + 4].copy_from_slice(&bytes[src_idx..src_idx + 4]);
                     }
                 }
             }

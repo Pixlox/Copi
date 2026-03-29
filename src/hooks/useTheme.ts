@@ -20,7 +20,6 @@ interface FullConfig {
   };
   privacy: {
     excluded_apps: string[];
-    privacy_rules: string[];
   };
 }
 

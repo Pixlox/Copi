@@ -1,9 +1,11 @@
 import type { SearchStatus } from "../hooks/useSearch";
+import { formatShortcut, isMacPlatform } from "../utils/platform";
 
 interface StatusBarProps {
   totalCount: number;
   query: string;
   searchStatus: SearchStatus;
+  defaultEnterAction: "copy" | "paste";
   actionsOpen: boolean;
   canOpenActions: boolean;
   onToggleActions: () => void;
@@ -60,9 +62,22 @@ function formatSearchStatus(status: SearchStatus): string | null {
   return null;
 }
 
-function StatusBar({ totalCount, query, searchStatus, actionsOpen, canOpenActions, onToggleActions }: StatusBarProps) {
+function StatusBar({
+  totalCount,
+  query,
+  searchStatus,
+  defaultEnterAction,
+  actionsOpen,
+  canOpenActions,
+  onToggleActions,
+}: StatusBarProps) {
   const filters = detectFilters(query);
   const statusLabel = formatSearchStatus(searchStatus);
+  const primaryLabel = defaultEnterAction === "copy" ? "copy" : "paste";
+  const secondaryLabel = defaultEnterAction === "copy" ? "paste" : "copy";
+  const actionsShortcut = formatShortcut(isMacPlatform ? "cmd+k" : "ctrl+k");
+  const primaryShortcut = formatShortcut("enter");
+  const secondaryShortcut = formatShortcut("shift+enter");
 
   return (
     <div
@@ -79,8 +94,8 @@ function StatusBar({ totalCount, query, searchStatus, actionsOpen, canOpenAction
         ))}
       </div>
       <div className="flex items-center gap-3" style={{ color: "var(--text-tertiary)" }}>
-        <span>↵ paste</span>
-        <span>⇧↵ copy</span>
+        <span key={`primary-${defaultEnterAction}`}>{primaryShortcut} {primaryLabel}</span>
+        <span key={`secondary-${defaultEnterAction}`}>{secondaryShortcut} {secondaryLabel}</span>
         <button
           type="button"
           data-no-drag
@@ -95,7 +110,7 @@ function StatusBar({ totalCount, query, searchStatus, actionsOpen, canOpenAction
               : { borderColor: "var(--border-subtle)", background: "var(--surface-secondary)", color: "var(--text-muted)" }
           }
         >
-          Actions ⌘K
+          Actions {actionsShortcut}
         </button>
       </div>
     </div>

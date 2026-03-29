@@ -155,7 +155,8 @@ fn load_supported_languages() -> Option<HashSet<String>> {
 
 #[cfg(target_os = "macos")]
 fn build_ocr_passes(supported_languages: Option<&HashSet<String>>) -> Vec<OcrPass> {
-    let multilingual_languages = collect_supported_languages(supported_languages, PRIMARY_LANGUAGE_GROUPS);
+    let multilingual_languages =
+        collect_supported_languages(supported_languages, PRIMARY_LANGUAGE_GROUPS);
     let latin_languages = collect_supported_languages(supported_languages, LATIN_CORRECTION_GROUPS);
     let mut passes = Vec::new();
     if !multilingual_languages.is_empty() {
@@ -274,10 +275,9 @@ fn run_vision_ocr(
                         best_result = Some(result);
                     }
 
-                    if best_result
-                        .as_ref()
-                        .is_some_and(|best| best.avg_confidence >= 0.86 && best.meaningful_char_count >= 24)
-                    {
+                    if best_result.as_ref().is_some_and(|best| {
+                        best.avg_confidence >= 0.86 && best.meaningful_char_count >= 24
+                    }) {
                         break;
                     }
                 }

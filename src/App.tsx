@@ -5,20 +5,25 @@ import { ThemeProvider } from "./contexts/ThemeContext";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import Overlay from "./overlay/Overlay";
 import Settings from "./settings/Settings";
+import Setup from "./setup/Setup";
 import { checkForUpdates } from "./utils/updater";
 
 function App() {
-  const isSettings = getCurrentWindow().label === "settings";
+  const windowLabel = getCurrentWindow().label;
+  const isSettings = windowLabel === "settings";
+  const isSetup = windowLabel === "setup";
 
   useEffect(() => {
     if (isSettings) {
       document.documentElement.classList.add("settings-window");
+    } else {
+      document.documentElement.classList.remove("settings-window");
     }
   }, [isSettings]);
 
   // Auto-update check on startup (only in overlay/main window)
   useEffect(() => {
-    if (isSettings) return;
+    if (isSettings || isSetup) return;
 
     const timer = setTimeout(async () => {
       try {
@@ -34,13 +39,23 @@ function App() {
     }, 3000);
 
     return () => clearTimeout(timer);
-  }, [isSettings]);
+  }, [isSettings, isSetup]);
 
   if (isSettings) {
     return (
       <ThemeProvider>
         <div className="settings-root w-full min-h-screen">
           <Settings />
+        </div>
+      </ThemeProvider>
+    );
+  }
+
+  if (isSetup) {
+    return (
+      <ThemeProvider>
+        <div className="w-full h-screen">
+          <Setup />
         </div>
       </ThemeProvider>
     );

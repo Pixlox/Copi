@@ -31,7 +31,6 @@ pub struct AppearanceConfig {
 #[serde(default)]
 pub struct PrivacyConfig {
     pub excluded_apps: Vec<String>,
-    pub privacy_rules: Vec<String>,
 }
 
 impl Default for CopiConfig {
@@ -40,7 +39,7 @@ impl Default for CopiConfig {
             general: GeneralConfig {
                 hotkey: "alt+space".to_string(),
                 launch_at_login: false,
-                default_paste_behaviour: "copy".to_string(),
+                default_paste_behaviour: "paste".to_string(),
                 history_retention_days: 90,
                 auto_check_updates: true,
             },
@@ -56,7 +55,6 @@ impl Default for CopiConfig {
                     "Keychain Access".to_string(),
                     "com.apple.keychainaccess".to_string(),
                 ],
-                privacy_rules: vec![r"^sk-[a-zA-Z0-9]{48}$".to_string(), r"^\d{16}$".to_string()],
             },
         }
     }
@@ -95,13 +93,24 @@ pub async fn get_config(app: tauri::AppHandle) -> Result<CopiConfig, String> {
 // Sync version for use from non-async contexts (cleanup task, setup)
 pub fn get_config_sync(app: tauri::AppHandle) -> Result<CopiConfig, String> {
     let path = config_path(&app);
-    if !path.exists() {
+    let mut config = if !path.exists() {
         let config = CopiConfig::default();
         save_config(&app, &config)?;
-        return Ok(config);
+        config
+    } else {
+        let content = std::fs::read_to_string(&path).map_err(|e: std::io::Error| e.to_string())?;
+        toml::from_str(&content).map_err(|e| e.to_string())?
+    };
+
+    #[cfg(desktop)]
+    {
+        use tauri_plugin_autostart::ManagerExt;
+        if let Ok(enabled) = app.autolaunch().is_enabled() {
+            config.general.launch_at_login = enabled;
+        }
     }
-    let content = std::fs::read_to_string(&path).map_err(|e: std::io::Error| e.to_string())?;
-    toml::from_str(&content).map_err(|e| e.to_string())
+
+    Ok(config)
 }
 
 #[tauri::command]
@@ -128,14 +137,30 @@ pub async fn set_config(app: tauri::AppHandle, config: CopiConfig) -> Result<(),
             use tauri_plugin_autostart::ManagerExt;
             let autolaunch = app.autolaunch();
             if config.general.launch_at_login {
-                let _ = autolaunch.enable();
+                autolaunch.enable().map_err(|e| e.to_string())?;
             } else {
-                let _ = autolaunch.disable();
+                autolaunch.disable().map_err(|e| e.to_string())?;
             }
         }
     }
 
-    save_config(&app, &config)
+    save_config(&app, &config)?;
+
+    if existing
+        .as_ref()
+        .map(|current| {
+            current.general.history_retention_days != config.general.history_retention_days
+        })
+        .unwrap_or(true)
+    {
+        let app_handle = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let _ =
+                tokio::task::spawn_blocking(move || crate::cleanup_old_clips(&app_handle)).await;
+        });
+    }
+
+    Ok(())
 }
 
 fn save_config(app: &tauri::AppHandle, config: &CopiConfig) -> Result<(), String> {
@@ -161,38 +186,22 @@ pub async fn get_db_size(app: tauri::AppHandle) -> Result<u64, String> {
 #[tauri::command]
 pub async fn clear_all_history(app: tauri::AppHandle) -> Result<(), String> {
     let state = app.state::<crate::AppState>();
-    let conn = state.db_write.lock().map_err(|e| e.to_string())?;
-    conn.execute("DELETE FROM clip_embeddings", [])
+    let mut conn = state.db_write.lock().map_err(|e| e.to_string())?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    tx.execute("DELETE FROM clips", [])
         .map_err(|e| e.to_string())?;
-    conn.execute_batch("INSERT INTO clips_fts(clips_fts) VALUES('delete-all');")
+    tx.execute("DROP TABLE IF EXISTS clip_embeddings", [])
         .map_err(|e| e.to_string())?;
-    conn.execute("DELETE FROM clips", [])
+    tx.execute(
+        "CREATE VIRTUAL TABLE clip_embeddings USING vec0(embedding float[384])",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute_batch("INSERT INTO clips_fts(clips_fts) VALUES('rebuild');")
         .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
     drop(conn);
     let _ = app.emit("clips-changed", ());
+    let _ = app.emit("collections-changed", ());
     Ok(())
-}
-
-#[tauri::command]
-pub async fn export_history_json(app: tauri::AppHandle) -> Result<String, String> {
-    let state = app.state::<crate::AppState>();
-    let conn = state.db_read_pool.get().map_err(|e| e.to_string())?;
-    let mut stmt = conn
-        .prepare("SELECT id, content, content_type, source_app, created_at, pinned FROM clips ORDER BY created_at DESC")
-        .map_err(|e| e.to_string())?;
-    let clips: Vec<serde_json::Value> = stmt
-        .query_map([], |row| {
-            Ok(serde_json::json!({
-                "id": row.get::<_, i64>(0)?,
-                "content": row.get::<_, String>(1)?,
-                "content_type": row.get::<_, String>(2)?,
-                "source_app": row.get::<_, String>(3)?,
-                "created_at": row.get::<_, i64>(4)?,
-                "pinned": row.get::<_, i64>(5)? != 0,
-            }))
-        })
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
-    serde_json::to_string_pretty(&clips).map_err(|e| e.to_string())
 }

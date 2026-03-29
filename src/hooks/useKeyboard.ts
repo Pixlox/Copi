@@ -126,7 +126,11 @@ export function useKeyboard({
       if (e.key === "Enter" && e.shiftKey) {
         e.preventDefault();
         if (selectedIndex >= 0 && selectedIndex < resultCount) {
-          onCopy(selectedIndex);
+          if (defaultEnterAction === "copy") {
+            onPaste(selectedIndex);
+          } else {
+            onCopy(selectedIndex);
+          }
         }
         return;
       }

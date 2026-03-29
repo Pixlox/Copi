@@ -128,10 +128,14 @@ function Overlay() {
         setShowAppIcons(payload.appearance.show_app_icons);
       }
     });
+    const unlistenShown = listen("overlay:shown", () => {
+      void loadConfig();
+    });
 
     return () => {
       mounted = false;
       unlisten.then((fn) => fn());
+      unlistenShown.then((fn) => fn());
     };
   }, []);
 
@@ -408,10 +412,11 @@ function Overlay() {
         totalCount={totalCount}
         query={query}
         searchStatus={searchStatus}
+        defaultEnterAction={defaultPasteBehaviour}
         actionsOpen={actionsOpen}
         canOpenActions={!!selectedResult}
         onToggleActions={toggleActions}
-        />
+      />
 
       {actionsOpen && selectedResult && (
         <ActionsSheet

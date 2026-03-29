@@ -2,6 +2,7 @@ use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::value::Tensor;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager};
 use tokenizers::Tokenizer;
@@ -19,48 +20,19 @@ pub struct EmbeddingModel {
 }
 
 pub fn init_model(app: &tauri::AppHandle) -> Result<Arc<EmbeddingModel>, String> {
-    let mut search_dirs: Vec<std::path::PathBuf> = Vec::new();
+    let install_dir = crate::model_setup::model_install_dir(app)?;
+    if !crate::model_setup::validate_model_install_dir(&install_dir) {
+        return Err(format!(
+            "Model files are missing or incomplete in {}",
+            install_dir.to_string_lossy()
+        ));
+    }
+    load_model_from_dir(&install_dir)
+}
 
-    if let Ok(resource_dir) = app.path().resource_dir() {
-        search_dirs.push(resource_dir.join("resources/models"));
-    }
-    if let Ok(exe_dir) = std::env::current_exe() {
-        if let Some(parent) = exe_dir.parent() {
-            search_dirs.push(parent.join("resources/models"));
-        }
-    }
-    if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
-        search_dirs.push(std::path::PathBuf::from(manifest_dir).join("resources/models"));
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        search_dirs.push(cwd.join("src-tauri/resources/models"));
-    }
-
-    let mut model_path: Option<std::path::PathBuf> = None;
-    let mut tokenizer_path: Option<std::path::PathBuf> = None;
-
-    for dir in &search_dirs {
-        let mp = if dir.join("model_O4.onnx").exists() {
-            dir.join("model_O4.onnx")
-        } else {
-            dir.join("model.onnx")
-        };
-        let tp = dir.join("tokenizer.json");
-        if mp.exists() && tp.exists() {
-            model_path = Some(mp);
-            tokenizer_path = Some(tp);
-            eprintln!("[Embed] Found model in: {:?}", dir);
-            break;
-        }
-    }
-
-    let model_path = model_path.ok_or_else(|| {
-        format!(
-            "Model not found. Searched: {:?}\nPlace model_O4.onnx (or model.onnx) and tokenizer.json in resources/models/",
-            search_dirs
-        )
-    })?;
-    let tokenizer_path = tokenizer_path.unwrap();
+pub fn load_model_from_dir(dir: &Path) -> Result<Arc<EmbeddingModel>, String> {
+    let model_path = dir.join("model_O4.onnx");
+    let tokenizer_path = dir.join("tokenizer.json");
 
     ort::init().commit();
 
@@ -120,10 +92,8 @@ pub fn embed_text(model: &EmbeddingModel, text: &str) -> Result<Vec<f32>, String
         .map_err(|e| format!("Tensor failed: {}", e))?;
     let attention_mask_tensor = Tensor::from_array((vec![1i64, seq_len], attention_mask.to_vec()))
         .map_err(|e| format!("Tensor failed: {}", e))?;
-    let token_type_ids_tensor =
-        Tensor::from_array((vec![1i64, seq_len], token_type_ids)).map_err(|e| {
-            format!("Tensor failed: {}", e)
-        })?;
+    let token_type_ids_tensor = Tensor::from_array((vec![1i64, seq_len], token_type_ids))
+        .map_err(|e| format!("Tensor failed: {}", e))?;
 
     let mut session = model.session.lock().map_err(|e| e.to_string())?;
     let outputs = session
@@ -235,9 +205,10 @@ pub async fn backfill_embeddings(
     clip_tx: &tokio::sync::mpsc::Sender<i64>,
 ) -> usize {
     let app_handle = app.clone();
-    let unembedded = tokio::task::spawn_blocking(move || collect_missing_embedding_ids(&app_handle))
-        .await
-        .unwrap_or_default();
+    let unembedded =
+        tokio::task::spawn_blocking(move || collect_missing_embedding_ids(&app_handle))
+            .await
+            .unwrap_or_default();
 
     let total = unembedded.len();
     if total > 0 {
@@ -246,7 +217,10 @@ pub async fn backfill_embeddings(
         let mut enqueued = 0usize;
         for id in unembedded {
             if clip_tx.send(id).await.is_err() {
-                eprintln!("[Embed] Queue closed while backfilling at item {}", enqueued + 1);
+                eprintln!(
+                    "[Embed] Queue closed while backfilling at item {}",
+                    enqueued + 1
+                );
                 break;
             }
             enqueued += 1;
@@ -288,24 +262,33 @@ pub async fn embedding_worker(
         let app = app.clone();
 
         tokio::task::spawn_blocking(move || {
-            let success = embed_single_clip(&model, &app, clip_id);
+            let success = !matches!(
+                embed_single_clip(&model, &app, clip_id),
+                EmbedOutcome::Failed
+            );
             update_search_progress(&app, success);
             drop(permit);
         });
     }
 }
 
-fn embed_single_clip(model: &EmbeddingModel, app: &tauri::AppHandle, clip_id: i64) -> bool {
+enum EmbedOutcome {
+    Stored,
+    Skipped,
+    Failed,
+}
+
+fn embed_single_clip(model: &EmbeddingModel, app: &tauri::AppHandle, clip_id: i64) -> EmbedOutcome {
     let (content, source_app, content_type): (Option<String>, String, String) = {
         let state = app.state::<crate::AppState>();
         let conn = match state.db_read_pool.get() {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("[Embed] Pool error for clip {}: {}", clip_id, e);
-                return false;
+                return EmbedOutcome::Failed;
             }
         };
-        conn.query_row(
+        match conn.query_row(
             "SELECT content, ocr_text, source_app, content_type FROM clips WHERE id = ?",
             [clip_id],
             |row| {
@@ -319,13 +302,28 @@ fn embed_single_clip(model: &EmbeddingModel, app: &tauri::AppHandle, clip_id: i6
                     Ok((Some(content), source_app, content_type))
                 }
             },
-        )
-        .unwrap_or((None, String::new(), String::new()))
+        ) {
+            Ok(data) => data,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                eprintln!("[Embed] Skipping clip {}: clip no longer exists", clip_id);
+                return EmbedOutcome::Skipped;
+            }
+            Err(error) => {
+                eprintln!("[Embed] Read failed for clip {}: {}", clip_id, error);
+                return EmbedOutcome::Failed;
+            }
+        }
     };
 
     let content = match content {
         Some(c) if !c.is_empty() => c,
-        _ => return false,
+        _ => {
+            eprintln!(
+                "[Embed] Skipping clip {}: no embeddable text for content type '{}'",
+                clip_id, content_type
+            );
+            return EmbedOutcome::Skipped;
+        }
     };
 
     let enriched = if !source_app.is_empty() {
@@ -348,11 +346,11 @@ fn embed_single_clip(model: &EmbeddingModel, app: &tauri::AppHandle, clip_id: i6
                 e.len(),
                 EMBED_DIMS
             );
-            return false;
+            return EmbedOutcome::Failed;
         }
         Err(e) => {
             eprintln!("[Embed] Failed clip {}: {}", clip_id, e);
-            return false;
+            return EmbedOutcome::Failed;
         }
     };
 
@@ -363,7 +361,7 @@ fn embed_single_clip(model: &EmbeddingModel, app: &tauri::AppHandle, clip_id: i6
         Ok(c) => c,
         Err(_) => {
             eprintln!("[Embed] Write lock failed clip {}", clip_id);
-            return false;
+            return EmbedOutcome::Failed;
         }
     };
     let _ = conn.execute("DELETE FROM clip_embeddings WHERE rowid = ?", [clip_id]);
@@ -371,10 +369,10 @@ fn embed_single_clip(model: &EmbeddingModel, app: &tauri::AppHandle, clip_id: i6
         "INSERT INTO clip_embeddings(rowid, embedding) VALUES (?1, ?2)",
         rusqlite::params![clip_id, vec_bytes],
     ) {
-        Ok(_) => true,
+        Ok(_) => EmbedOutcome::Stored,
         Err(e) => {
             eprintln!("[Embed] Store failed clip {}: {}", clip_id, e);
-            false
+            EmbedOutcome::Failed
         }
     }
 }
@@ -389,8 +387,7 @@ fn update_search_progress(app: &tauri::AppHandle, success: bool) {
             if status.phase == "idle" {
                 eprintln!(
                     "[Embed] Indexing complete: {} success, {} failed",
-                    status.completed_items,
-                    status.failed_items
+                    status.completed_items, status.failed_items
                 );
             }
             let _ = app.emit("search-status-updated", status.clone());

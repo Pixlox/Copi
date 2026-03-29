@@ -1,5 +1,5 @@
-use std::sync::atomic::AtomicU64;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, RwLock};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::{Emitter, Manager};
@@ -11,6 +11,7 @@ mod db;
 mod embed;
 mod hotkey;
 mod macos;
+mod model_setup;
 mod ocr;
 mod privacy;
 mod query_parser;
@@ -20,13 +21,16 @@ mod settings;
 pub struct AppState {
     pub db_read_pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
     pub db_write: Mutex<rusqlite::Connection>,
-    pub model: Option<std::sync::Arc<embed::EmbeddingModel>>,
+    pub model: RwLock<Option<std::sync::Arc<embed::EmbeddingModel>>>,
     pub ocr_engine: Option<Box<dyn ocr::OcrEngine>>,
     pub clip_tx: tokio::sync::mpsc::Sender<i64>,
+    pub clip_rx: Mutex<Option<tokio::sync::mpsc::Receiver<i64>>>,
     pub clipboard_watcher_running: Mutex<bool>,
     pub previous_frontmost_app: Mutex<Option<String>>,
     pub search_generation: AtomicU64,
+    pub runtime_started: AtomicBool,
     pub search_status: Mutex<search::SearchStatusPayload>,
+    pub model_setup_status: Mutex<model_setup::ModelSetupStatus>,
 }
 
 pub struct MenuBarState {
@@ -68,6 +72,13 @@ fn main() {
                 .build(),
         )
         .on_window_event(|_window, event| match event {
+            tauri::WindowEvent::CloseRequested { api, .. } => {
+                if matches!(_window.label(), "settings" | "setup") {
+                    api.prevent_close();
+                    let _ = _window.hide();
+                    sync_app_shell_visibility(_window.app_handle());
+                }
+            }
             tauri::WindowEvent::Focused(focused) => {
                 #[cfg(not(target_os = "macos"))]
                 if _window.label() == "overlay" && !*focused {
@@ -84,7 +95,7 @@ fn main() {
                 let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             }
 
-            let handle = app.handle();
+            let handle = app.handle().clone();
             eprintln!("[Copi] Starting up...");
 
             // Register NSPanel plugin INSIDE setup (not in builder chain)
@@ -101,20 +112,34 @@ fn main() {
                 handle.plugin(tauri_plugin_updater::Builder::new().build())?;
                 handle.plugin(tauri_plugin_dialog::init())?;
                 handle.plugin(tauri_plugin_process::init())?;
-                handle.plugin(tauri_plugin_autostart::Builder::new().build())?;
+                let autostart_builder = tauri_plugin_autostart::Builder::new().app_name("Copi");
+                #[cfg(target_os = "macos")]
+                let autostart_builder = autostart_builder
+                    .macos_launcher(tauri_plugin_autostart::MacosLauncher::LaunchAgent);
+                handle.plugin(autostart_builder.build())?;
             }
 
             // Initialize database (dual connections for read/write separation)
-            let db_conns = db::init_db(handle).expect("Failed to initialize database");
-
-            // Initialize ONNX model
-            let model = embed::init_model(handle);
-            match &model {
-                Ok(m) => eprintln!("[Copi] Model loaded ({}d)", m.dimensions),
-                Err(e) => eprintln!("[Copi] Model: {}", e),
-            }
-
+            let db_conns = db::init_db(&handle).expect("Failed to initialize database");
             let (clip_tx, clip_rx) = tokio::sync::mpsc::channel::<i64>(512);
+            if let Err(error) = model_setup::migrate_legacy_model_dir(&handle) {
+                eprintln!("[Copi] Model migration: {}", error);
+            }
+            let install_path = model_setup::model_install_path_string(&handle);
+            let model = if model_setup::has_valid_model_install(&handle) {
+                embed::init_model(&handle)
+            } else {
+                Err(format!("Model files missing from {}", install_path))
+            };
+            match &model {
+                Ok(model) => eprintln!("[Copi] Model loaded ({}d)", model.dimensions),
+                Err(error) => eprintln!("[Copi] Model unavailable: {}", error),
+            }
+            let model_load_error = if model_setup::has_valid_model_install(&handle) {
+                model.as_ref().err().cloned()
+            } else {
+                None
+            };
             let model_arc = model.ok();
 
             // Initialize OCR
@@ -132,67 +157,56 @@ fn main() {
             app.manage(AppState {
                 db_read_pool: db_conns.read_pool,
                 db_write: Mutex::new(db_conns.write),
-                model: model_arc.clone(),
+                model: RwLock::new(model_arc.clone()),
                 ocr_engine,
                 clip_tx: clip_tx.clone(),
+                clip_rx: Mutex::new(Some(clip_rx)),
                 clipboard_watcher_running: Mutex::new(true),
                 previous_frontmost_app: Mutex::new(None),
                 search_generation: AtomicU64::new(0),
+                runtime_started: AtomicBool::new(false),
                 search_status: Mutex::new(search::SearchStatusPayload {
-                    phase: if model_arc.is_some() { "starting".into() } else { "unavailable".into() },
+                    phase: if model_arc.is_some() {
+                        "starting".into()
+                    } else {
+                        "unavailable".into()
+                    },
                     queued_items: 0,
                     completed_items: 0,
                     failed_items: 0,
                     total_items: 0,
                     semantic_ready: false,
                 }),
+                model_setup_status: Mutex::new(if model_arc.is_some() {
+                    model_setup::ModelSetupStatus {
+                        phase: "ready".to_string(),
+                        current_file: None,
+                        downloaded_bytes: 0,
+                        total_bytes: 0,
+                        completed_files: 5,
+                        total_files: 5,
+                        install_path: install_path.clone(),
+                        error: None,
+                        ready: true,
+                        setup_required: false,
+                    }
+                } else {
+                    model_setup::ModelSetupStatus {
+                        phase: "missing".to_string(),
+                        current_file: None,
+                        downloaded_bytes: 0,
+                        total_bytes: 0,
+                        completed_files: 0,
+                        total_files: 5,
+                        install_path: install_path.clone(),
+                        error: model_load_error,
+                        ready: false,
+                        setup_required: true,
+                    }
+                }),
             });
             app.manage(MenuBarState {
                 tray_icon: Mutex::new(None),
-            });
-
-            // Delay heavy historical repair slightly so launch and first search stay responsive.
-            let delayed_handle = handle.clone();
-            let delayed_clip_tx = clip_tx.clone();
-            let delayed_has_model = model_arc.is_some();
-            tauri::async_runtime::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                if delayed_has_model {
-                    let _ = embed::backfill_embeddings(&delayed_handle, &delayed_clip_tx).await;
-                }
-            });
-
-            let delayed_handle = handle.clone();
-            tauri::async_runtime::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(8)).await;
-                clipboard::backfill_language_tags(&delayed_handle).await;
-            });
-
-            let delayed_handle = handle.clone();
-            tauri::async_runtime::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(18)).await;
-                clipboard::backfill_image_metadata(&delayed_handle).await;
-            });
-
-            // Spawn workers
-            let ah = handle.clone();
-            tauri::async_runtime::spawn(async move {
-                embed::embedding_worker(model_arc, clip_rx, ah).await;
-            });
-            let ah = handle.clone();
-            tauri::async_runtime::spawn(async move {
-                clipboard::watch_clipboard(&ah).await;
-            });
-            let ah = handle.clone();
-            tauri::async_runtime::spawn(async move {
-                let ah2 = ah.clone();
-                let _ = tokio::task::spawn_blocking(move || cleanup_old_clips(&ah2)).await;
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
-                loop {
-                    interval.tick().await;
-                    let ah2 = ah.clone();
-                    let _ = tokio::task::spawn_blocking(move || cleanup_old_clips(&ah2)).await;
-                }
             });
 
             // Convert overlay to NSPanel (inside setup — EcoPaste pattern)
@@ -241,17 +255,17 @@ fn main() {
 
             // Tray icon
             let settings_item =
-                MenuItem::with_id(handle, "settings", "Settings\u{2026}", true, None::<&str>)?;
+                MenuItem::with_id(&handle, "settings", "Settings\u{2026}", true, None::<&str>)?;
             let pause_item =
-                MenuItem::with_id(handle, "pause", "Pause Monitoring", true, None::<&str>)?;
-            let quit = MenuItem::with_id(handle, "quit", "Quit Copi", true, None::<&str>)?;
+                MenuItem::with_id(&handle, "pause", "Pause Monitoring", true, None::<&str>)?;
+            let quit = MenuItem::with_id(&handle, "quit", "Quit Copi", true, None::<&str>)?;
             let menu = Menu::with_items(
-                handle,
+                &handle,
                 &[
                     &settings_item,
-                    &PredefinedMenuItem::separator(handle)?,
+                    &PredefinedMenuItem::separator(&handle)?,
                     &pause_item,
-                    &PredefinedMenuItem::separator(handle)?,
+                    &PredefinedMenuItem::separator(&handle)?,
                     &quit,
                 ],
             )?;
@@ -262,11 +276,7 @@ fn main() {
                 .show_menu_on_left_click(true)
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "settings" => {
-                        if let Some(w) = app.get_webview_window("settings") {
-                            let _ = w.unminimize();
-                            let _ = w.show();
-                            let _ = w.set_focus();
-                        }
+                        show_settings_window_inner(app);
                     }
                     "pause" => {
                         let state = app.state::<AppState>();
@@ -302,6 +312,12 @@ fn main() {
 
             register_initial_hotkey(app)?;
 
+            if model_arc.is_some() {
+                start_runtime_services_once(&handle);
+            } else {
+                show_setup_window_inner(&handle);
+            }
+
             eprintln!("[Copi] Ready. Press hotkey to open overlay.");
             Ok(())
         })
@@ -317,13 +333,15 @@ fn main() {
             search::update_clip_content,
             clipboard::copy_to_clipboard,
             clipboard::get_clip_icons_batch,
+            model_setup::get_model_setup_status,
+            model_setup::download_required_models,
+            hide_setup_window,
             show_overlay,
             hide_overlay,
             settings::get_config,
             settings::set_config,
             settings::get_db_size,
             settings::clear_all_history,
-            settings::export_history_json,
             collections::create_collection,
             collections::delete_collection,
             collections::rename_collection,
@@ -335,9 +353,144 @@ fn main() {
         .expect("error while running tauri application");
 }
 
+fn is_setup_required(app: &tauri::AppHandle) -> bool {
+    app.state::<AppState>()
+        .model_setup_status
+        .lock()
+        .map(|status| status.setup_required)
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn set_app_shell_visible(app: &tauri::AppHandle, visible: bool) {
+    let policy = if visible {
+        tauri::ActivationPolicy::Regular
+    } else {
+        tauri::ActivationPolicy::Accessory
+    };
+    let _ = app.set_activation_policy(policy);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_app_shell_visible(_app: &tauri::AppHandle, _visible: bool) {}
+
+#[cfg(target_os = "macos")]
+fn sync_app_shell_visibility(app: &tauri::AppHandle) {
+    let show_in_dock = ["settings", "setup"].iter().any(|label| {
+        app.get_webview_window(label)
+            .and_then(|window| window.is_visible().ok())
+            .unwrap_or(false)
+    });
+    set_app_shell_visible(app, show_in_dock);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sync_app_shell_visibility(_app: &tauri::AppHandle) {}
+
+pub(crate) fn start_runtime_services_once(app: &tauri::AppHandle) {
+    let state = app.state::<AppState>();
+    if state
+        .runtime_started
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+
+    let model = match state
+        .model
+        .read()
+        .ok()
+        .and_then(|guard| guard.as_ref().cloned())
+    {
+        Some(model) => model,
+        None => {
+            state.runtime_started.store(false, Ordering::SeqCst);
+            return;
+        }
+    };
+    let clip_rx = match state.clip_rx.lock() {
+        Ok(mut guard) => match guard.take() {
+            Some(rx) => rx,
+            None => {
+                state.runtime_started.store(false, Ordering::SeqCst);
+                return;
+            }
+        },
+        Err(_) => {
+            state.runtime_started.store(false, Ordering::SeqCst);
+            return;
+        }
+    };
+    let clip_tx = state.clip_tx.clone();
+
+    let delayed_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let _ = embed::backfill_embeddings(&delayed_handle, &clip_tx).await;
+    });
+
+    let delayed_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+        clipboard::backfill_language_tags(&delayed_handle).await;
+    });
+
+    let delayed_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(18)).await;
+        clipboard::backfill_image_metadata(&delayed_handle).await;
+    });
+
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        embed::embedding_worker(Some(model), clip_rx, app_handle).await;
+    });
+
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        clipboard::watch_clipboard(&app_handle).await;
+    });
+
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let cleanup_handle = app_handle.clone();
+        let _ = tokio::task::spawn_blocking(move || cleanup_old_clips(&cleanup_handle)).await;
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+        loop {
+            interval.tick().await;
+            let cleanup_handle = app_handle.clone();
+            let _ = tokio::task::spawn_blocking(move || cleanup_old_clips(&cleanup_handle)).await;
+        }
+    });
+}
+
+fn show_setup_window_inner(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("overlay") {
+        let _ = window.hide();
+    }
+    set_app_shell_visible(app, true);
+    if let Some(window) = app.get_webview_window("setup") {
+        let _ = window.center();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+    sync_app_shell_visibility(app);
+}
+
+fn show_settings_window_inner(app: &tauri::AppHandle) {
+    set_app_shell_visible(app, true);
+    if let Some(window) = app.get_webview_window("settings") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+    sync_app_shell_visibility(app);
+}
+
 // ─── Cleanup ──────────────────────────────────────────────────────
 
-fn cleanup_old_clips(app: &tauri::AppHandle) {
+pub(crate) fn cleanup_old_clips(app: &tauri::AppHandle) {
     let retention_days = match settings::get_config_sync(app.clone()) {
         Ok(c) => c.general.history_retention_days,
         Err(_) => return,
@@ -370,6 +523,11 @@ fn cleanup_old_clips(app: &tauri::AppHandle) {
 // ─── Overlay Toggle (EcoPaste pattern: run_on_main_thread) ────────
 
 fn toggle_overlay(app: &tauri::AppHandle) {
+    if is_setup_required(app) {
+        show_setup_window_inner(app);
+        return;
+    }
+
     // Check current visibility via NSPanel
     #[cfg(target_os = "macos")]
     {
@@ -393,6 +551,16 @@ fn toggle_overlay(app: &tauri::AppHandle) {
 }
 
 fn show_overlay_inner(app: &tauri::AppHandle) {
+    if is_setup_required(app) {
+        show_setup_window_inner(app);
+        return;
+    }
+
+    if let Some(setup) = app.get_webview_window("setup") {
+        let _ = setup.hide();
+    }
+    sync_app_shell_visibility(app);
+
     // Save previous frontmost app for paste-on-select
     if let Ok(mut guard) = app.state::<AppState>().previous_frontmost_app.try_lock() {
         *guard = crate::macos::get_frontmost_app_bundle_id();
@@ -458,6 +626,13 @@ fn show_overlay(app: tauri::AppHandle) {
 #[tauri::command]
 fn hide_overlay(app: tauri::AppHandle, paste: bool) {
     hide_overlay_inner(&app, paste);
+}
+#[tauri::command]
+fn hide_setup_window(app: tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("setup") {
+        let _ = window.hide();
+    }
+    sync_app_shell_visibility(&app);
 }
 
 #[tauri::command]

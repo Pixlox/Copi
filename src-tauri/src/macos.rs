@@ -15,12 +15,6 @@ impl FrontmostApp {
     }
 }
 
-pub(crate) fn get_frontmost_app_name() -> String {
-    get_frontmost_app_info()
-        .map(|app| app.name)
-        .unwrap_or_default()
-}
-
 pub(crate) fn get_frontmost_app_bundle_id() -> Option<String> {
     get_frontmost_app_info()
         .map(|app| app.bundle_id)
@@ -66,9 +60,64 @@ pub(crate) fn get_frontmost_app_info() -> Option<FrontmostApp> {
     (!info.is_empty()).then_some(info)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 pub(crate) fn get_frontmost_app_info() -> Option<FrontmostApp> {
     None
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn get_frontmost_app_info() -> Option<FrontmostApp> {
+    use std::path::Path;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetWindowThreadProcessId,
+    };
+
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.is_null() {
+        return None;
+    }
+
+    let mut pid = 0u32;
+    unsafe {
+        GetWindowThreadProcessId(hwnd, &mut pid);
+    }
+    if pid == 0 {
+        return None;
+    }
+
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return None;
+    }
+
+    let mut buffer = vec![0u16; 1024];
+    let mut len = buffer.len() as u32;
+    let ok = unsafe { QueryFullProcessImageNameW(process, 0, buffer.as_mut_ptr(), &mut len) };
+    unsafe {
+        CloseHandle(process);
+    }
+    if ok == 0 || len == 0 {
+        return None;
+    }
+
+    let path = String::from_utf16_lossy(&buffer[..len as usize]);
+    let name = Path::new(&path)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+        .unwrap_or_default();
+
+    let info = FrontmostApp {
+        name: name.trim().to_string(),
+        bundle_id: String::new(),
+        path: path.trim().to_string(),
+    };
+
+    (!info.is_empty()).then_some(info)
 }
 
 #[cfg(target_os = "macos")]

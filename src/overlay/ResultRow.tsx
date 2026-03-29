@@ -134,7 +134,7 @@ function ResultRow({
           </div>
         ) : result.content_type === "code" && result.content_highlighted ? (
           <div
-            className="text-[12px] leading-snug line-clamp-2 overflow-hidden"
+            className="code-preview text-[12px] leading-snug line-clamp-2 overflow-hidden"
             style={{ color: "var(--text-secondary)" }}
             dangerouslySetInnerHTML={{ __html: query.trim() ? highlightMatches(preview, query) : result.content_highlighted }}
           />
