@@ -67,7 +67,7 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: "Copi ${{ github.ref_name }}"
           releaseBody: "Automated build for Copi. Install bundles are attached below."
-          releaseDraft: false
+          releaseDraft: true
           prerelease: false
           generateReleaseNotes: true
           uploadUpdaterJson: true
