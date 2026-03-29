@@ -1,5 +1,5 @@
 import type { SearchStatus } from "../hooks/useSearch";
-import { formatShortcut, isMacPlatform } from "../utils/platform";
+import { formatShortcut, formatSymbolShortcut, isMacPlatform } from "../utils/platform";
 
 interface StatusBarProps {
   totalCount: number;
@@ -76,8 +76,8 @@ function StatusBar({
   const primaryLabel = defaultEnterAction === "copy" ? "copy" : "paste";
   const secondaryLabel = defaultEnterAction === "copy" ? "paste" : "copy";
   const actionsShortcut = formatShortcut(isMacPlatform ? "cmd+k" : "ctrl+k");
-  const primaryShortcut = formatShortcut("enter");
-  const secondaryShortcut = formatShortcut("shift+enter");
+  const primaryShortcut = formatSymbolShortcut("enter");
+  const secondaryShortcut = formatSymbolShortcut("shift+enter");
 
   return (
     <div

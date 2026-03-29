@@ -7,6 +7,7 @@ import Overlay from "./overlay/Overlay";
 import Settings from "./settings/Settings";
 import Setup from "./setup/Setup";
 import { checkForUpdates } from "./utils/updater";
+import { isMacPlatform } from "./utils/platform";
 
 function App() {
   const windowLabel = getCurrentWindow().label;
@@ -20,6 +21,17 @@ function App() {
       document.documentElement.classList.remove("settings-window");
     }
   }, [isSettings]);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    if (isMacPlatform) {
+      root.classList.add("platform-macos");
+      root.classList.remove("platform-windows");
+    } else {
+      root.classList.add("platform-windows");
+      root.classList.remove("platform-macos");
+    }
+  }, []);
 
   // Auto-update check on startup (only in overlay/main window)
   useEffect(() => {

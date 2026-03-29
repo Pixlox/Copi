@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { Copy, Pin, PinOff, Trash2, X, Shuffle, FolderOpen, ExternalLink } from "lucide-react";
 import { ClipResult, CollectionInfo } from "../hooks/useSearch";
 import { transforms } from "../utils/transforms";
-import { formatShortcut, isMacPlatform } from "../utils/platform";
+import { formatShortcut, isMacPlatform, normalizeAppName } from "../utils/platform";
 import { getImagePreviewData, setImagePreviewData } from "./clipMediaCache";
 
 export interface SheetAction {
@@ -560,7 +560,7 @@ function ActionsSheet({
                 {previewText(clip) || "Untitled clip"}
               </div>
               <div className="mt-1.5 flex items-center gap-2 text-[11px]" style={{ color: "var(--text-tertiary)" }}>
-                <span>{clip.source_app || "Unknown app"}</span>
+                <span>{normalizeAppName(clip.source_app || "") || "Unknown app"}</span>
                 <span>·</span>
                 <span>{clip.content_type}</span>
               </div>

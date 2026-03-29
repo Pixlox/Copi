@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { X, Edit3, Save, ExternalLink, Copy } from "lucide-react";
 import type { ClipResult } from "../hooks/useSearch";
+import { normalizeAppName } from "../utils/platform";
 
 interface DetailPanelProps {
   clip: ClipResult;
@@ -83,6 +84,7 @@ export default function DetailPanel({ clip, onClose, onEdit, onCopy, onOpenUrl }
   const isCode = clip.content_type === "code";
   const isImage = clip.content_type === "image";
   const displayContent = isImage ? (clip.ocr_text || "[Image]") : clip.content;
+  const sourceAppLabel = normalizeAppName(clip.source_app || "");
 
   return (
     <div
@@ -97,7 +99,7 @@ export default function DetailPanel({ clip, onClose, onEdit, onCopy, onOpenUrl }
         <div className="flex items-center gap-2">
           <div className="w-4 h-4 rounded" style={{ background: "var(--surface-primary)" }} />
           <span className="text-[12px] font-medium" style={{ color: "var(--text-primary)" }}>
-            {clip.source_app || "Unknown"}
+            {sourceAppLabel || "Unknown"}
           </span>
         </div>
         <div className="flex items-center gap-1">

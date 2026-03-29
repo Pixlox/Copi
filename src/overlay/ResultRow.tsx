@@ -1,5 +1,6 @@
 import { Pin } from "lucide-react";
 import { ClipResult } from "../hooks/useSearch";
+import { normalizeAppName } from "../utils/platform";
 
 interface ResultRowProps {
   result: ClipResult;
@@ -101,6 +102,7 @@ function ResultRow({
   const rawPreview = cleanPreview(result.content);
   const preview = query.trim() ? extractSnippet(rawPreview, query) : rawPreview;
   const imageThumbnail = imageThumbnailData ?? null;
+  const sourceAppLabel = normalizeAppName(result.source_app || "");
 
   return (
     <div
@@ -169,8 +171,8 @@ function ResultRow({
 
       {/* Meta */}
       <div className="flex flex-col items-end shrink-0 gap-0.5">
-        {result.source_app && (
-          <span className="text-[11px] truncate max-w-[100px]" style={{ color: "var(--text-tertiary)" }}>{result.source_app}</span>
+        {sourceAppLabel && (
+          <span className="text-[11px] truncate max-w-[100px]" style={{ color: "var(--text-tertiary)" }}>{sourceAppLabel}</span>
         )}
         <span className="text-[11px]" style={{ color: "var(--text-muted)" }}>{timeAgo(result.created_at)}</span>
       </div>

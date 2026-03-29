@@ -2,6 +2,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { ask, message } from "@tauri-apps/plugin-dialog";
 import { relaunch } from "@tauri-apps/plugin-process";
+import { isWindowsPlatform } from "./platform";
 
 export type UpdateCheckMode = "background" | "interactive";
 
@@ -55,7 +56,10 @@ export async function checkForUpdates(mode: UpdateCheckMode = "interactive"): Pr
   } catch (error) {
     console.error("[Updater] Failed:", error);
     if (interactive) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
+      const errorMessageRaw = error instanceof Error ? error.message : String(error);
+      const errorMessage = isWindowsPlatform && errorMessageRaw.includes("windows-x86_64")
+        ? "No compatible Windows update package is available for this build channel yet."
+        : errorMessageRaw;
       await message(`Update check failed: ${errorMessage}`, {
         title: "Update Error",
         kind: "error",

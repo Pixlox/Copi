@@ -1,3 +1,5 @@
+#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
+
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
@@ -27,6 +29,7 @@ pub struct AppState {
     pub clip_rx: Mutex<Option<tokio::sync::mpsc::Receiver<i64>>>,
     pub clipboard_watcher_running: Mutex<bool>,
     pub previous_frontmost_app: Mutex<Option<String>>,
+    pub previous_foreground_window: Mutex<Option<isize>>,
     pub search_generation: AtomicU64,
     pub runtime_started: AtomicBool,
     pub search_status: Mutex<search::SearchStatusPayload>,
@@ -163,6 +166,7 @@ fn main() {
                 clip_rx: Mutex::new(Some(clip_rx)),
                 clipboard_watcher_running: Mutex::new(true),
                 previous_frontmost_app: Mutex::new(None),
+                previous_foreground_window: Mutex::new(None),
                 search_generation: AtomicU64::new(0),
                 runtime_started: AtomicBool::new(false),
                 search_status: Mutex::new(search::SearchStatusPayload {
@@ -591,9 +595,15 @@ fn show_overlay_inner(app: &tauri::AppHandle) {
     }
     sync_app_shell_visibility(app);
 
-    // Save previous frontmost app for paste-on-select
+    // Save previous frontmost target for paste-on-select
+    #[cfg(target_os = "macos")]
     if let Ok(mut guard) = app.state::<AppState>().previous_frontmost_app.try_lock() {
         *guard = crate::macos::get_frontmost_app_bundle_id();
+    }
+
+    #[cfg(target_os = "windows")]
+    if let Ok(mut guard) = app.state::<AppState>().previous_foreground_window.try_lock() {
+        *guard = crate::macos::get_foreground_window_handle();
     }
 
     #[cfg(target_os = "macos")]
@@ -645,6 +655,12 @@ fn hide_overlay_inner(app: &tauri::AppHandle, paste: bool) {
         {
             restore_previous_app(app);
             simulate_paste();
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            restore_previous_window(app);
+            simulate_paste_windows();
         }
     }
 }
@@ -875,5 +891,164 @@ fn simulate_paste() {
             CGEventPost(K_CG_HID_EVENT_TAP, key_up);
             CFRelease(key_up);
         }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn restore_previous_window(app: &tauri::AppHandle) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE};
+
+    let Some(hwnd_value) = app
+        .state::<AppState>()
+        .previous_foreground_window
+        .try_lock()
+        .ok()
+        .and_then(|guard| *guard)
+    else {
+        return;
+    };
+
+    let hwnd = hwnd_value as windows_sys::Win32::Foundation::HWND;
+    if hwnd.is_null() {
+        return;
+    }
+
+    unsafe {
+        if IsIconic(hwnd) != 0 {
+            ShowWindow(hwnd, SW_RESTORE);
+        }
+        let _ = SetForegroundWindow(hwnd);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn simulate_paste_windows() {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_CONTROL,
+    };
+
+    std::thread::sleep(std::time::Duration::from_millis(90));
+
+    let inputs = [
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VK_CONTROL,
+                    wScan: 0,
+                    dwFlags: 0,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        },
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: b'V' as u16,
+                    wScan: 0,
+                    dwFlags: 0,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        },
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: b'V' as u16,
+                    wScan: 0,
+                    dwFlags: KEYEVENTF_KEYUP,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        },
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VK_CONTROL,
+                    wScan: 0,
+                    dwFlags: KEYEVENTF_KEYUP,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        },
+    ];
+
+    unsafe {
+        let _ = SendInput(
+            inputs.len() as u32,
+            inputs.as_ptr(),
+            std::mem::size_of::<INPUT>() as i32,
+        );
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod windows_tests {
+    #[test]
+    fn windows_paste_sequence_uses_four_inputs() {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_CONTROL,
+        };
+
+        let inputs = [
+            INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VK_CONTROL,
+                        wScan: 0,
+                        dwFlags: 0,
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            },
+            INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: b'V' as u16,
+                        wScan: 0,
+                        dwFlags: 0,
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            },
+            INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: b'V' as u16,
+                        wScan: 0,
+                        dwFlags: KEYEVENTF_KEYUP,
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            },
+            INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VK_CONTROL,
+                        wScan: 0,
+                        dwFlags: KEYEVENTF_KEYUP,
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            },
+        ];
+
+        assert_eq!(inputs.len(), 4);
+        assert_eq!(inputs[0].r#type, INPUT_KEYBOARD);
     }
 }

@@ -49,14 +49,48 @@ impl Default for CopiConfig {
                 show_app_icons: true,
             },
             privacy: PrivacyConfig {
-                excluded_apps: vec![
-                    "1Password".to_string(),
-                    "com.agilebits.onepassword".to_string(),
-                    "Keychain Access".to_string(),
-                    "com.apple.keychainaccess".to_string(),
-                ],
+                excluded_apps: default_excluded_apps(),
             },
         }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn default_excluded_apps() -> Vec<String> {
+    vec![
+        "1Password".to_string(),
+        "Bitwarden".to_string(),
+        "KeePass".to_string(),
+        "LastPass".to_string(),
+        "Windows Security".to_string(),
+        "Credential Manager".to_string(),
+    ]
+}
+
+#[cfg(not(target_os = "windows"))]
+fn default_excluded_apps() -> Vec<String> {
+    vec![
+        "1Password".to_string(),
+        "com.agilebits.onepassword".to_string(),
+        "Keychain Access".to_string(),
+        "com.apple.keychainaccess".to_string(),
+    ]
+}
+
+#[cfg(target_os = "windows")]
+fn normalize_windows_excluded_apps(apps: &mut Vec<String>) {
+    let mac_only = [
+        "keychain access",
+        "com.apple.keychainaccess",
+        "com.agilebits.onepassword",
+    ];
+    apps.retain(|app| {
+        let token = app.trim().to_ascii_lowercase();
+        !token.is_empty() && !mac_only.contains(&token.as_str())
+    });
+
+    if apps.is_empty() {
+        *apps = default_excluded_apps();
     }
 }
 
@@ -109,6 +143,9 @@ pub fn get_config_sync(app: tauri::AppHandle) -> Result<CopiConfig, String> {
             config.general.launch_at_login = enabled;
         }
     }
+
+    #[cfg(target_os = "windows")]
+    normalize_windows_excluded_apps(&mut config.privacy.excluded_apps);
 
     Ok(config)
 }

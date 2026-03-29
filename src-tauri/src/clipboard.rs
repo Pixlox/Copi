@@ -30,7 +30,7 @@ pub async fn watch_clipboard(app: &tauri::AppHandle) {
     let mut last_text_hash = String::new();
     let mut last_image_hash = String::new();
     let mut last_non_copi_app: Option<FrontmostApp> = None;
-    let mut last_change_count: i64 = -1;
+    let mut last_change_count: Option<i64> = None;
 
     loop {
         // Check if paused
@@ -46,11 +46,13 @@ pub async fn watch_clipboard(app: &tauri::AppHandle) {
 
         // PERF 6: Only read clipboard when changeCount changes (zero CPU when idle)
         let current_change_count = crate::macos::get_pasteboard_change_count();
-        if current_change_count == last_change_count {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            continue;
+        if current_change_count >= 0 {
+            if Some(current_change_count) == last_change_count {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                continue;
+            }
+            last_change_count = Some(current_change_count);
         }
-        last_change_count = current_change_count;
 
         let current_frontmost = get_frontmost_app_info();
         if let Some(frontmost) = current_frontmost.clone() {
