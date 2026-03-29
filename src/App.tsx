@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ThemeProvider } from "./contexts/ThemeContext";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import Overlay from "./overlay/Overlay";
 import Settings from "./settings/Settings";
 import { checkForUpdates } from "./utils/updater";
@@ -48,7 +49,9 @@ function App() {
   return (
     <ThemeProvider>
       <div className="w-full h-screen">
-        <Overlay />
+        <ErrorBoundary>
+          <Overlay />
+        </ErrorBoundary>
       </div>
     </ThemeProvider>
   );

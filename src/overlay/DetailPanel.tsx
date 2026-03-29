@@ -8,6 +8,7 @@ interface DetailPanelProps {
   onClose: () => void;
   onEdit: (clipId: number, newContent: string) => void;
   onCopy: (clipId: number) => void;
+  onOpenUrl: (url: string) => void;
 }
 
 function formatTimestamp(ts: number): string {
@@ -62,7 +63,7 @@ function ImageDetail({ clipId }: { clipId: number }) {
   );
 }
 
-export default function DetailPanel({ clip, onClose, onEdit, onCopy }: DetailPanelProps) {
+export default function DetailPanel({ clip, onClose, onEdit, onCopy, onOpenUrl }: DetailPanelProps) {
   const [editing, setEditing] = useState(false);
   const [editContent, setEditContent] = useState(clip.content);
 
@@ -94,13 +95,7 @@ export default function DetailPanel({ clip, onClose, onEdit, onCopy }: DetailPan
         style={{ borderBottom: "0.5px solid var(--border-subtle)" }}
       >
         <div className="flex items-center gap-2">
-          {clip.source_app_icon && (
-            <img
-              src={`data:image/png;base64,${clip.source_app_icon}`}
-              alt=""
-              className="w-4 h-4 rounded-sm"
-            />
-          )}
+          <div className="w-4 h-4 rounded" style={{ background: "var(--surface-primary)" }} />
           <span className="text-[12px] font-medium" style={{ color: "var(--text-primary)" }}>
             {clip.source_app || "Unknown"}
           </span>
@@ -218,7 +213,7 @@ export default function DetailPanel({ clip, onClose, onEdit, onCopy }: DetailPan
           <button
             type="button"
             data-no-drag
-            onClick={() => window.open(clip.content, "_blank")}
+            onClick={() => onOpenUrl(clip.content)}
             className="inline-flex items-center gap-1 rounded-md px-2.5 py-1 text-[11px]"
             style={{ background: "var(--surface-primary)", color: "var(--text-secondary)" }}
           >

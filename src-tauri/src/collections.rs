@@ -70,7 +70,7 @@ pub fn rename_collection(app: tauri::AppHandle, id: i64, name: String) -> Result
 #[tauri::command]
 pub fn list_collections(app: tauri::AppHandle) -> Result<Vec<CollectionInfo>, String> {
     let state = app.state::<AppState>();
-    let conn = state.db_read.lock().map_err(|e| e.to_string())?;
+    let conn = state.db_read_pool.get().map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
             "SELECT c.id, c.name, COALESCE(c.color, '#0A84FF'), c.created_at,
@@ -113,5 +113,6 @@ pub fn move_clip_to_collection(
     .map_err(|e| e.to_string())?;
     drop(conn);
     let _ = app.emit("clips-changed", ());
+    let _ = app.emit("collections-changed", ());
     Ok(())
 }

@@ -1,6 +1,7 @@
 use arboard::{Clipboard, ImageData};
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager};
 
@@ -15,6 +16,8 @@ struct ClipboardImagePayload {
     bytes: Vec<u8>,
 }
 
+// ─── Watch Clipboard ──────────────────────────────────────────────
+
 pub async fn watch_clipboard(app: &tauri::AppHandle) {
     let mut clipboard = match Clipboard::new() {
         Ok(c) => c,
@@ -27,6 +30,7 @@ pub async fn watch_clipboard(app: &tauri::AppHandle) {
     let mut last_text_hash = String::new();
     let mut last_image_hash = String::new();
     let mut last_non_copi_app: Option<FrontmostApp> = None;
+    let mut last_change_count: i64 = -1;
 
     loop {
         // Check if paused
@@ -39,6 +43,14 @@ pub async fn watch_clipboard(app: &tauri::AppHandle) {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             continue;
         }
+
+        // PERF 6: Only read clipboard when changeCount changes (zero CPU when idle)
+        let current_change_count = crate::macos::get_pasteboard_change_count();
+        if current_change_count == last_change_count {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            continue;
+        }
+        last_change_count = current_change_count;
 
         let current_frontmost = get_frontmost_app_info();
         if let Some(frontmost) = current_frontmost.clone() {
@@ -56,9 +68,9 @@ pub async fn watch_clipboard(app: &tauri::AppHandle) {
             let hash = compute_hash(&text);
             if hash != last_text_hash && !text.trim().is_empty() {
                 last_text_hash = hash.clone();
-                last_image_hash.clear();
 
                 if !crate::privacy::should_capture(&text, app) {
+                    tokio::time::sleep(std::time::Duration::from_millis(140)).await;
                     continue;
                 }
 
@@ -106,19 +118,26 @@ pub async fn watch_clipboard(app: &tauri::AppHandle) {
     }
 }
 
+// ─── Backfill Image Metadata ──────────────────────────────────────
+
 pub async fn backfill_image_metadata(app: &tauri::AppHandle) {
+    let mut retry_count = 0u32;
+    const MAX_RETRIES: u32 = 5;
+    let mut no_progress_rounds = 0u32;
+    let mut any_updated = false;
     loop {
         let app_handle = app.clone();
         let repair_ids = tokio::task::spawn_blocking(move || {
             let state = app_handle.state::<AppState>();
-            let conn = match state.db_read.try_lock() {
+            let conn = match state.db_read_pool.get() {
                 Ok(conn) => conn,
-                Err(_) => return vec![],
+                Err(e) => return Err(format!("{}", e)),
             };
             conn.prepare(
                 "SELECT id
                  FROM clips
                  WHERE content_type = 'image'
+                   AND length(COALESCE(image_data, X'')) > 0
                    AND (
                      ocr_text IS NULL OR TRIM(ocr_text) = ''
                      OR image_thumbnail IS NULL OR length(image_thumbnail) = 0
@@ -132,32 +151,78 @@ pub async fn backfill_image_metadata(app: &tauri::AppHandle) {
                     .map(|rows| rows.filter_map(|row| row.ok()).collect::<Vec<i64>>())
                     .unwrap_or_default()
             })
-            .unwrap_or_default()
+            .ok_or("query_failed".to_string())
         })
         .await
-        .unwrap_or_default();
+        .unwrap_or(Err("spawn_failed".to_string()));
+
+        let repair_ids = match repair_ids {
+            Ok(ids) => {
+                retry_count = 0;
+                ids
+            }
+            Err(_) => {
+                retry_count += 1;
+                if retry_count > MAX_RETRIES {
+                    eprintln!("[Backfill] Giving up after {} retries", MAX_RETRIES);
+                    break;
+                }
+                let delay = std::time::Duration::from_secs(2u64.pow(retry_count));
+                eprintln!(
+                    "[Backfill] Retry {} in {:?}",
+                    retry_count, delay
+                );
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+        };
 
         if repair_ids.is_empty() {
             break;
         }
 
+        let mut updated_in_batch = false;
         for clip_id in repair_ids {
             let app_for_task = app.clone();
-            let _ = tokio::task::spawn_blocking(move || repair_image_clip(&app_for_task, clip_id)).await;
+            let updated = tokio::task::spawn_blocking(move || repair_image_clip(&app_for_task, clip_id))
+                .await;
+            if updated.unwrap_or(false) {
+                updated_in_batch = true;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(80)).await;
         }
-        let _ = app.emit("clips-changed", ());
+
+        if updated_in_batch {
+            any_updated = true;
+            no_progress_rounds = 0;
+        } else {
+            no_progress_rounds += 1;
+            if no_progress_rounds >= 2 {
+                eprintln!(
+                    "[Backfill] Stopping image metadata backfill after repeated no-progress rounds"
+                );
+                break;
+            }
+        }
+
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    }
+
+    if any_updated {
+        let _ = app.emit("clips-changed", ());
     }
 }
 
+// ─── Backfill Language Tags ───────────────────────────────────────
+
 pub async fn backfill_language_tags(app: &tauri::AppHandle) {
+    let mut any_updated = false;
     loop {
         let app_handle = app.clone();
         let updated = tokio::task::spawn_blocking(move || {
             let state = app_handle.state::<AppState>();
             let rows: Vec<(i64, String)> = {
-                let conn = match state.db_read.lock() {
+                let conn = match state.db_read_pool.get() {
                     Ok(conn) => conn,
                     Err(_) => return 0_usize,
                 };
@@ -219,69 +284,140 @@ pub async fn backfill_language_tags(app: &tauri::AppHandle) {
             break;
         }
 
-        let _ = app.emit("clips-changed", ());
+        any_updated = true;
         tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+    }
+
+    if any_updated {
+        let _ = app.emit("clips-changed", ());
     }
 }
 
+// ─── Copy to Clipboard ────────────────────────────────────────────
+// PERF 5: Split read/write — read from pool, set clipboard, async copy_count
+
 #[tauri::command]
 pub async fn copy_to_clipboard(app: tauri::AppHandle, clip_id: i64) -> Result<(), String> {
-    let state = app.state::<AppState>();
-    let conn = state.db_write.lock().map_err(|e| e.to_string())?;
-
-    let content_type: String = conn
-        .query_row(
-            "SELECT content_type FROM clips WHERE id = ?",
+    // Phase 1: read data from pool (no write lock held)
+    let (content_type, content, image_bytes, width, height) = {
+        let conn = app
+            .state::<AppState>()
+            .db_read_pool
+            .get()
+            .map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT content_type, COALESCE(content, ''), COALESCE(image_data, X''), COALESCE(image_width, 0), COALESCE(image_height, 0) FROM clips WHERE id = ?",
             [clip_id],
-            |row| row.get(0),
+            |row| Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            )),
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?
+    };
+    // Connection returned to pool
 
-    // Increment copy count
-    let _ = conn.execute(
-        "UPDATE clips SET copy_count = COALESCE(copy_count, 0) + 1 WHERE id = ?",
-        [clip_id],
-    );
-
+    // Phase 2: set clipboard (no DB lock held)
     let mut clipboard = Clipboard::new().map_err(|e| e.to_string())?;
 
     if content_type == "image" {
-        let (raw_bytes, width, height): (Vec<u8>, i64, i64) = conn
-            .query_row(
-                "SELECT image_data, image_width, image_height FROM clips WHERE id = ?",
-                [clip_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .map_err(|e| format!("Image data not found: {}", e))?;
-
-        drop(conn);
-
-        if raw_bytes.is_empty() {
+        // PERF 1: Decode PNG back to RGBA
+        if let Some((raw_bytes, w, h)) = png_to_rgba(&image_bytes) {
+            let image = ImageData {
+                width: w,
+                height: h,
+                bytes: Cow::Owned(raw_bytes),
+            };
+            clipboard
+                .set_image(image)
+                .map_err(|e| format!("Failed to set image: {}", e))?;
+        } else if !image_bytes.is_empty() && width > 0 && height > 0 {
+            // Fallback: might be legacy raw RGBA
+            let image = ImageData {
+                width: width as usize,
+                height: height as usize,
+                bytes: Cow::Owned(image_bytes),
+            };
+            clipboard
+                .set_image(image)
+                .map_err(|e| format!("Failed to set image: {}", e))?;
+        } else {
             return Err("Image data is empty".to_string());
         }
-
-        let image = ImageData {
-            width: width as usize,
-            height: height as usize,
-            bytes: Cow::Owned(raw_bytes),
-        };
-        clipboard
-            .set_image(image)
-            .map_err(|e| format!("Failed to set image: {}", e))?;
     } else {
-        let content: String = conn
-            .query_row("SELECT content FROM clips WHERE id = ?", [clip_id], |row| {
-                row.get(0)
-            })
-            .map_err(|e| e.to_string())?;
-
-        drop(conn);
-
         clipboard.set_text(&content).map_err(|e| e.to_string())?;
     }
 
-    let _ = app.emit("clips-changed", ());
+    // Phase 3: increment copy_count and emit event — emit AFTER write completes
+    let app_clone = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Ok(conn) = app_clone.state::<AppState>().db_write.lock() {
+                let _ = conn.execute(
+                    "UPDATE clips SET copy_count = COALESCE(copy_count, 0) + 1 WHERE id = ?",
+                    [clip_id],
+                );
+            }
+            let _ = app_clone.emit("clips-changed", ());
+        })
+        .await;
+    });
+
     Ok(())
+}
+
+// ─── Batch Icon Retrieval (PERF 3) ────────────────────────────────
+
+#[derive(Clone, serde::Serialize)]
+pub struct ClipIconData {
+    pub thumbnail: Option<String>,
+    pub app_icon: Option<String>,
+}
+
+#[tauri::command]
+pub async fn get_clip_icons_batch(
+    app: tauri::AppHandle,
+    clip_ids: Vec<i64>,
+) -> Result<HashMap<i64, ClipIconData>, String> {
+    if clip_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let conn = app
+        .state::<AppState>()
+        .db_read_pool
+        .get()
+        .map_err(|e| e.to_string())?;
+
+    let placeholders = clip_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let query = format!(
+        "SELECT id, image_thumbnail, source_app_icon FROM clips WHERE id IN ({})",
+        placeholders
+    );
+
+    let mut result = HashMap::new();
+    let mut stmt = conn.prepare(&query).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(clip_ids.iter()), |row| {
+            let id: i64 = row.get(0)?;
+            let thumb: Option<Vec<u8>> = row.get(1).unwrap_or(None);
+            let icon: Option<Vec<u8>> = row.get(2).unwrap_or(None);
+            Ok((
+                id,
+                ClipIconData {
+                    thumbnail: thumb.filter(|b| !b.is_empty()).map(|b| b64(&b)),
+                    app_icon: icon.filter(|b| !b.is_empty()).map(|b| b64(&b)),
+                },
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+
+    for row in rows.filter_map(|r| r.ok()) {
+        result.insert(row.0, row.1);
+    }
+    Ok(result)
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────
@@ -298,14 +434,88 @@ fn compute_hash_bytes(data: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn queue_text_capture(app: &tauri::AppHandle, text: String, hash: String, source_app: FrontmostApp) {
+fn b64(data: &[u8]) -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let a = chunk[0] as u32;
+        let b = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let c = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (a << 16) | (b << 8) | c;
+        encoded.push(CHARS[((triple >> 18) & 0x3F) as usize] as char);
+        encoded.push(CHARS[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            encoded.push(CHARS[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+        if chunk.len() > 2 {
+            encoded.push(CHARS[(triple & 0x3F) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+    }
+    encoded
+}
+
+// PERF 1: PNG encoding/decoding
+fn rgba_to_png(bytes: &[u8], width: usize, height: usize) -> Option<Vec<u8>> {
+    let mut png_bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut png_bytes, width as u32, height as u32);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        if let Ok(mut writer) = encoder.write_header() {
+            if writer.write_image_data(bytes).is_err() {
+                return None;
+            }
+        } else {
+            return None;
+        }
+    }
+    if png_bytes.is_empty() {
+        None
+    } else {
+        Some(png_bytes)
+    }
+}
+
+fn png_to_rgba(png_bytes: &[u8]) -> Option<(Vec<u8>, usize, usize)> {
+    if png_bytes.is_empty() {
+        return None;
+    }
+    let decoder = png::Decoder::new(std::io::Cursor::new(png_bytes));
+    let mut reader = decoder.read_info().ok()?;
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).ok()?;
+    let w = info.width as usize;
+    let h = info.height as usize;
+    Some((buf[..info.buffer_size()].to_vec(), w, h))
+}
+
+// ─── Queue / Process ──────────────────────────────────────────────
+
+fn queue_text_capture(
+    app: &tauri::AppHandle,
+    text: String,
+    hash: String,
+    source_app: FrontmostApp,
+) {
     let app_handle = app.clone();
     tauri::async_runtime::spawn(async move {
-        let _ = tokio::task::spawn_blocking(move || process_text_capture(&app_handle, text, hash, source_app)).await;
+        let _ = tokio::task::spawn_blocking(move || {
+            process_text_capture(&app_handle, text, hash, source_app)
+        })
+        .await;
     });
 }
 
-fn process_text_capture(app: &tauri::AppHandle, text: String, hash: String, source_app: FrontmostApp) {
+fn process_text_capture(
+    app: &tauri::AppHandle,
+    text: String,
+    hash: String,
+    source_app: FrontmostApp,
+) {
     let content_type = detect_content_type(&text, None);
     let highlighted = if content_type == "code" {
         Some(highlight_code(&text))
@@ -333,7 +543,10 @@ fn queue_image_capture(
 ) {
     let app_handle = app.clone();
     tauri::async_runtime::spawn(async move {
-        let _ = tokio::task::spawn_blocking(move || process_image_capture(&app_handle, payload, hash, source_app)).await;
+        let _ = tokio::task::spawn_blocking(move || {
+            process_image_capture(&app_handle, payload, hash, source_app)
+        })
+        .await;
     });
 }
 
@@ -354,9 +567,13 @@ fn process_image_capture(
         .as_ref()
         .and_then(|text| crate::query_parser::detect_language(text));
 
+    // PERF 1: Encode to PNG before storing (10-20x smaller than raw RGBA)
+    let png_data = rgba_to_png(image.bytes.as_ref(), image.width, image.height);
+
     insert_image_clip(
         app,
         &image,
+        png_data.as_deref(),
         thumbnail.as_deref(),
         &hash,
         &source_app,
@@ -365,12 +582,18 @@ fn process_image_capture(
     );
 }
 
-fn repair_image_clip(app: &tauri::AppHandle, clip_id: i64) {
+fn repair_image_clip(app: &tauri::AppHandle, clip_id: i64) -> bool {
     let state = app.state::<AppState>();
-    let (bytes, width, height, existing_ocr, has_thumbnail): (Vec<u8>, i64, i64, Option<String>, bool) = {
-        let conn = match state.db_read.lock() {
+    let (stored_bytes, width, height, existing_ocr, has_thumbnail): (
+        Vec<u8>,
+        i64,
+        i64,
+        Option<String>,
+        bool,
+    ) = {
+        let conn = match state.db_read_pool.get() {
             Ok(conn) => conn,
-            Err(_) => return,
+            Err(_) => return false,
         };
         match conn.query_row(
             "SELECT image_data, image_width, image_height, ocr_text, length(COALESCE(image_thumbnail, X'')) > 0
@@ -380,38 +603,51 @@ fn repair_image_clip(app: &tauri::AppHandle, clip_id: i64) {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         ) {
             Ok(data) => data,
-            Err(_) => return,
+            Err(_) => return false,
         }
     };
 
-    if bytes.is_empty() || width <= 0 || height <= 0 {
-        return;
+    if stored_bytes.is_empty() {
+        return false;
     }
 
+    // Data may be PNG (new) or raw RGBA (legacy). Decode PNG if needed for OCR/thumbnail.
+    let (raw_rgba, w, h) = if let Some((decoded, dw, dh)) = png_to_rgba(&stored_bytes) {
+        (decoded, dw, dh)
+    } else if width > 0 && height > 0 {
+        // Legacy raw RGBA
+        (stored_bytes, width as usize, height as usize)
+    } else {
+        return false;
+    };
+
     let image = ImageData {
-        width: width as usize,
-        height: height as usize,
-        bytes: Cow::Owned(bytes),
+        width: w,
+        height: h,
+        bytes: Cow::Owned(raw_rgba),
     };
     let thumbnail = if has_thumbnail {
         None
     } else {
         image_to_thumbnail(&image)
     };
-    let ocr_text = if existing_ocr.as_deref().is_some_and(|text| !text.trim().is_empty()) {
-        existing_ocr.clone()
-    } else {
-        run_ocr(app, image.bytes.as_ref(), width as u32, height as u32)
-    };
-    let language = ocr_text.as_ref().and_then(|text| crate::query_parser::detect_language(text));
+    let ocr_text =
+        if existing_ocr.as_deref().is_some_and(|text| !text.trim().is_empty()) {
+            existing_ocr.clone()
+        } else {
+            run_ocr(app, image.bytes.as_ref(), w as u32, h as u32)
+        };
+    let language = ocr_text
+        .as_ref()
+        .and_then(|text| crate::query_parser::detect_language(text));
 
     let conn = match state.db_write.lock() {
         Ok(conn) => conn,
-        Err(_) => return,
+        Err(_) => return false,
     };
     let ocr_for_db = ocr_text.as_deref().filter(|text| !text.trim().is_empty());
     let thumb_bytes = thumbnail.as_deref().unwrap_or(&[]);
-    if conn
+    let updated = conn
         .execute(
             "UPDATE clips
              SET ocr_text = COALESCE(?1, ocr_text),
@@ -419,17 +655,27 @@ fn repair_image_clip(app: &tauri::AppHandle, clip_id: i64) {
                  image_thumbnail = CASE
                      WHEN length(COALESCE(image_thumbnail, X'')) = 0 AND length(?3) > 0 THEN ?3
                      ELSE image_thumbnail
+                 END,
+                 image_width = CASE
+                     WHEN COALESCE(image_width, 0) <= 0 AND ?4 > 0 THEN ?4
+                     ELSE image_width
+                 END,
+                 image_height = CASE
+                     WHEN COALESCE(image_height, 0) <= 0 AND ?5 > 0 THEN ?5
+                     ELSE image_height
                  END
-             WHERE id = ?4",
-            rusqlite::params![ocr_for_db, language, thumb_bytes, clip_id],
+             WHERE id = ?6",
+            rusqlite::params![ocr_for_db, language, thumb_bytes, w as i64, h as i64, clip_id],
         )
-        .is_ok()
-    {
-        drop(conn);
-        if ocr_for_db.is_some() {
-            let _ = state.clip_tx.try_send(clip_id);
-        }
+        .ok()
+        .unwrap_or(0)
+        > 0;
+
+    drop(conn);
+    if updated && ocr_for_db.is_some() {
+        enqueue_embedding(&state, clip_id, "repair_image_clip");
     }
+    updated
 }
 
 fn run_ocr(app: &tauri::AppHandle, bytes: &[u8], width: u32, height: u32) -> Option<String> {
@@ -445,22 +691,107 @@ fn run_ocr(app: &tauri::AppHandle, bytes: &[u8], width: u32, height: u32) -> Opt
     }
 }
 
+// ─── Content Type Detection (CLASSIFY 1) ──────────────────────────
+
 fn detect_content_type(content: &str, _source_app: Option<&str>) -> String {
     let trimmed = content.trim();
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+
+    // URL: starts with http(s):// and no newlines
+    if !content.contains('\n')
+        && (trimmed.starts_with("http://") || trimmed.starts_with("https://"))
+    {
         return "url".to_string();
     }
-    let has_newlines = content.contains('\n');
-    let code_indicators = [
-        "{", "}", "=>", "function", "def ", "import ", "class ", "//", "/*", "#!", "fn ", "pub ",
-        "impl ", "struct ", "enum ", "const ", "let ", "mut ",
-    ];
-    let has_code = code_indicators.iter().any(|&i| content.contains(i));
-    if has_newlines && has_code {
+
+    // Single line is never code
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.len() < 2 {
+        return "text".to_string();
+    }
+
+    let mut code_score: u32 = 0;
+
+    for line in &lines {
+        let lt = line.trim();
+
+        // Strong indicators (+2)
+        if lt.contains("fn ") && lt.contains('(') {
+            code_score += 2;
+        }
+        if lt.contains("function ") && lt.contains('(') {
+            code_score += 2;
+        }
+        if lt.contains("def ") && lt.contains('(') {
+            code_score += 2;
+        }
+        if lt.contains("class ")
+            && (lt.contains('{') || lt.contains(':'))
+        {
+            code_score += 2;
+        }
+        if lt.contains("async fn ") {
+            code_score += 2;
+        }
+        if lt.starts_with("import {") || (lt.starts_with("from ") && lt.contains(" import ")) {
+            code_score += 2;
+        }
+        if lt.starts_with("#include") {
+            code_score += 2;
+        }
+        if lt.starts_with("```") {
+            code_score += 2;
+        }
+
+        // Medium indicators (+1)
+        if lt.starts_with("pub ")
+            && (lt.contains("fn ")
+                || lt.contains("struct ")
+                || lt.contains("enum ")
+                || lt.contains("impl ")
+                || lt.contains("trait "))
+        {
+            code_score += 1;
+        }
+        if lt.ends_with('{')
+            && (lt.contains("if ")
+                || lt.contains("for ")
+                || lt.contains("while ")
+                || lt.contains("match ")
+                || lt.contains("switch "))
+        {
+            code_score += 1;
+        }
+        if lt.ends_with(';') && lt.len() > 3 {
+            code_score += 1;
+        }
+        if lt.contains("=>") && (lt.contains('(') || lt.contains("const ")) {
+            code_score += 1;
+        }
+        if lt.contains(": ")
+            && (lt.contains("String")
+                || lt.contains("Vec<")
+                || lt.contains("Option<")
+                || lt.contains("i32")
+                || lt.contains("i64")
+                || lt.contains("f64")
+                || lt.contains("bool"))
+        {
+            code_score += 1;
+        }
+        if lt == "}" || lt == "};" {
+            code_score += 1;
+        }
+    }
+
+    // Require at least 3 points for code classification
+    if code_score >= 3 {
         return "code".to_string();
     }
+
     "text".to_string()
 }
+
+// ─── Code Highlighting ────────────────────────────────────────────
 
 fn highlight_code(code: &str) -> String {
     use syntect::easy::HighlightLines;
@@ -490,15 +821,27 @@ fn highlight_code(code: &str) -> String {
     html
 }
 
-/// Fetch the app icon via AppKit and the on-disk cache.
 fn fetch_app_icon(state: &tauri::State<'_, AppState>, source_app: &FrontmostApp) -> Vec<u8> {
     if source_app.name.is_empty() || source_app.is_copi() {
         return Vec::new();
     }
-
     let _ = state;
     get_app_icon_png(source_app).unwrap_or_default()
 }
+
+fn enqueue_embedding(state: &tauri::State<'_, AppState>, clip_id: i64, reason: &'static str) {
+    let tx = state.clip_tx.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = tx.send(clip_id).await {
+            eprintln!(
+                "[EmbedQueue] Failed to enqueue clip {} ({}): {}",
+                clip_id, reason, e
+            );
+        }
+    });
+}
+
+// ─── Insert Clips ─────────────────────────────────────────────────
 
 fn insert_clip(
     app: &tauri::AppHandle,
@@ -526,7 +869,6 @@ fn insert_clip(
     };
 
     let icon = fetch_app_icon(&state, source_app);
-    let _hold = std::time::Instant::now();
     let conn = state.db_write.lock().unwrap();
 
     let result = conn.execute(
@@ -556,7 +898,7 @@ fn insert_clip(
             .ok();
         drop(conn);
         if let Some(clip_id) = clip_id {
-            let _ = state.clip_tx.try_send(clip_id);
+            enqueue_embedding(&state, clip_id, "insert_clip");
         }
         let _ = app.emit("new-clip", ());
     }
@@ -565,6 +907,7 @@ fn insert_clip(
 fn insert_image_clip(
     app: &tauri::AppHandle,
     image_data: &ImageData,
+    png_data: Option<&[u8]>,
     thumbnail: Option<&[u8]>,
     hash: &str,
     source_app: &FrontmostApp,
@@ -577,14 +920,14 @@ fn insert_image_clip(
         .unwrap()
         .as_secs() as i64;
 
-    let raw_bytes = image_data.bytes.as_ref();
+    // PERF 1: Store PNG instead of raw RGBA
+    let store_bytes = png_data.unwrap_or(image_data.bytes.as_ref());
     let width = image_data.width as i64;
     let height = image_data.height as i64;
     let thumb = thumbnail.unwrap_or(&[]);
 
     let icon = fetch_app_icon(&state, source_app);
 
-    let _hold = std::time::Instant::now();
     let conn = state.db_write.lock().unwrap();
     let result = conn.execute(
         "INSERT INTO clips (content, content_hash, content_type, source_app, source_app_icon, ocr_text, language, image_data, image_thumbnail, image_width, image_height, created_at)
@@ -614,7 +957,7 @@ fn insert_image_clip(
                 ELSE clips.image_height
             END,
             created_at = excluded.created_at",
-        rusqlite::params![hash, source_app.name, icon, ocr_text, language, raw_bytes, thumb, width, height, now],
+        rusqlite::params![hash, source_app.name, icon, ocr_text, language, store_bytes, thumb, width, height, now],
     );
 
     if result.is_ok() {
@@ -627,7 +970,7 @@ fn insert_image_clip(
             .ok();
         drop(conn);
         if let (Some(clip_id), true) = (clip_id, ocr_text.is_some()) {
-            let _ = state.clip_tx.try_send(clip_id);
+            enqueue_embedding(&state, clip_id, "insert_image_clip");
         }
         let _ = app.emit("new-clip", ());
     }
@@ -662,7 +1005,8 @@ fn image_to_thumbnail(image_data: &ImageData) -> Option<Vec<u8>> {
                     let src_idx = ((src_y * width + src_x) as usize) * 4;
                     let dst_idx = ((y * new_width + x) as usize) * 4;
                     if src_idx + 3 < bytes.len() && dst_idx + 3 < resized.len() {
-                        resized[dst_idx..dst_idx + 4].copy_from_slice(&bytes[src_idx..src_idx + 4]);
+                        resized[dst_idx..dst_idx + 4]
+                            .copy_from_slice(&bytes[src_idx..src_idx + 4]);
                     }
                 }
             }

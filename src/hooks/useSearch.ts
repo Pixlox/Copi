@@ -9,10 +9,8 @@ export interface ClipResult {
   source_app: string;
   created_at: number;
   pinned: boolean;
-  source_app_icon: string | null;
   content_highlighted: string | null;
   ocr_text: string | null;
-  image_thumbnail: string | null;
   copy_count: number;
 }
 
@@ -28,8 +26,20 @@ export interface SearchStatus {
   phase: string;
   queuedItems: number;
   completedItems: number;
+  failedItems: number;
   totalItems: number;
   semanticReady: boolean;
+}
+
+function searchStatusEqual(a: SearchStatus, b: SearchStatus): boolean {
+  return (
+    a.phase === b.phase &&
+    a.queuedItems === b.queuedItems &&
+    a.completedItems === b.completedItems &&
+    a.failedItems === b.failedItems &&
+    a.totalItems === b.totalItems &&
+    a.semanticReady === b.semanticReady
+  );
 }
 
 interface SearchUpdatedEvent {
@@ -53,6 +63,7 @@ export function useSearch() {
     phase: "idle",
     queuedItems: 0,
     completedItems: 0,
+    failedItems: 0,
     totalItems: 0,
     semanticReady: false,
   });
@@ -61,12 +72,39 @@ export function useSearch() {
   const totalCountRef = useRef(0);
   const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  const applySearchStatus = useCallback((nextStatus: SearchStatus) => {
+    setSearchStatus((prev) => (searchStatusEqual(prev, nextStatus) ? prev : nextStatus));
+  }, []);
+
   const applyResults = useCallback((nextResults: ClipResult[]) => {
+    const prev = resultsRef.current;
+    if (
+      prev.length === nextResults.length &&
+      prev.every((clip, index) => {
+        const next = nextResults[index];
+        return (
+          clip.id === next?.id &&
+          clip.pinned === next?.pinned &&
+          clip.copy_count === next?.copy_count &&
+          clip.content === next?.content &&
+          clip.content_highlighted === next?.content_highlighted &&
+          clip.ocr_text === next?.ocr_text &&
+          clip.content_type === next?.content_type &&
+          clip.source_app === next?.source_app &&
+          clip.created_at === next?.created_at
+        );
+      })
+    ) {
+      return;
+    }
     resultsRef.current = nextResults;
     setResults(nextResults);
   }, []);
 
   const applyTotalCount = useCallback((nextTotalCount: number) => {
+    if (totalCountRef.current === nextTotalCount) {
+      return;
+    }
     totalCountRef.current = nextTotalCount;
     setTotalCount(nextTotalCount);
   }, []);
@@ -108,11 +146,11 @@ export function useSearch() {
   const fetchSearchStatus = useCallback(async () => {
     try {
       const status = await invoke<SearchStatus>("get_search_status");
-      setSearchStatus(status);
+      applySearchStatus(status);
     } catch (error) {
       console.error("Failed to get search status:", error);
     }
-  }, []);
+  }, [applySearchStatus]);
 
   // Store latest values in refs for the event listener
   const queryRef = useRef(query);
@@ -122,12 +160,14 @@ export function useSearch() {
   filterRef.current = activeFilter;
   collectionIdRef.current = collectionId;
 
-  const scheduleRefresh = useCallback((includeCollections: boolean) => {
+  const scheduleRefresh = useCallback((includeCollections: boolean, refreshResults: boolean) => {
     if (refreshTimerRef.current) {
       clearTimeout(refreshTimerRef.current);
     }
     refreshTimerRef.current = setTimeout(() => {
-      fetchResults(queryRef.current, filterRef.current, collectionIdRef.current);
+      if (refreshResults) {
+        fetchResults(queryRef.current, filterRef.current, collectionIdRef.current);
+      }
       fetchCount();
       fetchSearchStatus();
       if (includeCollections) {
@@ -140,15 +180,20 @@ export function useSearch() {
   useEffect(() => {
     const timer = setTimeout(() => {
       fetchResults(deferredQuery, activeFilter, collectionId);
-    }, 140);
+    }, 80);
 
     return () => clearTimeout(timer);
   }, [deferredQuery, activeFilter, collectionId, fetchResults]);
 
   useEffect(() => {
-    const unlistenNew = listen("new-clip", () => scheduleRefresh(false));
-    const unlistenChanged = listen("clips-changed", () => scheduleRefresh(false));
-    const unlistenCollections = listen("collections-changed", () => scheduleRefresh(true));
+    const refreshFromMutation = (includeCollections: boolean) => {
+      const shouldRefreshResults = queryRef.current.trim().length === 0;
+      scheduleRefresh(includeCollections, shouldRefreshResults);
+    };
+
+    const unlistenNew = listen("new-clip", () => refreshFromMutation(false));
+    const unlistenChanged = listen("clips-changed", () => refreshFromMutation(false));
+    const unlistenCollections = listen("collections-changed", () => refreshFromMutation(true));
 
     return () => {
       if (refreshTimerRef.current) {
@@ -181,12 +226,12 @@ export function useSearch() {
 
   useEffect(() => {
     const unlisten = listen<SearchStatus>("search-status-updated", (event) => {
-      setSearchStatus(event.payload);
+      applySearchStatus(event.payload);
     });
     return () => {
       unlisten.then((fn) => fn());
     };
-  }, []);
+  }, [applySearchStatus]);
 
   useEffect(() => {
     fetchCount();

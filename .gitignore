@@ -16,6 +16,8 @@ Thumbs.db
 
 .tauri/
 release-helper.sh
+.ocx/
+.opencode/
 *.key
 *.pem
 *.p12
@@ -23,8 +25,12 @@ release-helper.sh
 
 src-tauri/gen/
 
+models/
+
 src-tauri/resources/models/*.onnx
 src-tauri/resources/models/*.json
+src-tauri/resources/models/*.model
+src-tauri/resources/models-old-gte/
 
 gte-multilingual-base-onnx/
 

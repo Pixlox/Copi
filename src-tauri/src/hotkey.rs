@@ -1,8 +1,8 @@
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
 
 pub fn register_hotkey(app: &tauri::AppHandle, hotkey_str: &str) -> Result<String, String> {
-    let _ = app.global_shortcut().unregister_all();
     let shortcut = parse_hotkey(hotkey_str)?;
+    let _ = app.global_shortcut().unregister_all();
     app.global_shortcut()
         .register(shortcut)
         .map_err(|e| e.to_string())?;
@@ -19,7 +19,8 @@ pub fn parse_hotkey(s: &str) -> Result<Shortcut, String> {
     for part in &parts {
         let lower = part.to_lowercase();
         match lower.as_str() {
-            "ctrl" | "control" | "cmd" | "command" | "super" => modifiers |= Modifiers::CONTROL,
+            "ctrl" | "control" => modifiers |= Modifiers::CONTROL,
+            "cmd" | "command" | "super" => modifiers |= Modifiers::SUPER,
             "alt" | "option" => modifiers |= Modifiers::ALT,
             "shift" => modifiers |= Modifiers::SHIFT,
             other => code_part = other.to_string(),

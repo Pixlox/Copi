@@ -553,3 +553,25 @@ input::placeholder {
   box-shadow: 0 0 0 0.5px rgba(0, 0, 0, 0.04),
               0 1px 3px rgba(0, 0, 0, 0.04);
 }
+
+/* Search match highlighting */
+.search-highlight {
+  background: rgba(255, 213, 0, 0.30);
+  color: inherit;
+  border-radius: 2px;
+  padding: 0 1px;
+}
+
+.light .search-highlight {
+  background: rgba(255, 180, 0, 0.25);
+}
+
+/* Smooth result transitions */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(-2px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.results-animate {
+  animation: fadeIn 0.12s ease-out;
+}

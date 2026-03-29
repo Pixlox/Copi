@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -147,7 +147,9 @@ fn save_config(app: &tauri::AppHandle, config: &CopiConfig) -> Result<(), String
         &path,
         toml::to_string_pretty(config).map_err(|e| e.to_string())?,
     )
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    let _ = app.emit("config-changed", config.clone());
+    Ok(())
 }
 
 #[tauri::command]
@@ -160,14 +162,21 @@ pub async fn get_db_size(app: tauri::AppHandle) -> Result<u64, String> {
 pub async fn clear_all_history(app: tauri::AppHandle) -> Result<(), String> {
     let state = app.state::<crate::AppState>();
     let conn = state.db_write.lock().map_err(|e| e.to_string())?;
-    conn.execute_batch("DELETE FROM clip_embeddings; DELETE FROM clips_fts; DELETE FROM clips;")
-        .map_err(|e| e.to_string())
+    conn.execute("DELETE FROM clip_embeddings", [])
+        .map_err(|e| e.to_string())?;
+    conn.execute_batch("INSERT INTO clips_fts(clips_fts) VALUES('delete-all');")
+        .map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM clips", [])
+        .map_err(|e| e.to_string())?;
+    drop(conn);
+    let _ = app.emit("clips-changed", ());
+    Ok(())
 }
 
 #[tauri::command]
 pub async fn export_history_json(app: tauri::AppHandle) -> Result<String, String> {
     let state = app.state::<crate::AppState>();
-    let conn = state.db_read.lock().map_err(|e| e.to_string())?;
+    let conn = state.db_read_pool.get().map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare("SELECT id, content, content_type, source_app, created_at, pinned FROM clips ORDER BY created_at DESC")
         .map_err(|e| e.to_string())?;

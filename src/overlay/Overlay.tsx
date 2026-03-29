@@ -1,6 +1,7 @@
 import { useState, useCallback, useMemo, useRef, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { listen } from "@tauri-apps/api/event";
 import { useSearch, FilterType } from "../hooks/useSearch";
 import { useKeyboard } from "../hooks/useKeyboard";
 import ActionsSheet, { buildSheetActions } from "./ActionsSheet";
@@ -9,6 +10,7 @@ import ResultsList from "./ResultsList";
 import StatusBar from "./StatusBar";
 import CollectionSidebar from "./CollectionSidebar";
 import DetailPanel from "./DetailPanel";
+import { getClipIconData } from "./clipMediaCache";
 
 const FILTERS: FilterType[] = ["all", "text", "url", "code", "image", "pinned"];
 
@@ -34,6 +36,10 @@ function Overlay() {
   const [selectedActionIndex, setSelectedActionIndex] = useState(0);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [detailOpen, setDetailOpen] = useState(false);
+  const [defaultPasteBehaviour, setDefaultPasteBehaviour] = useState<"copy" | "paste">("paste");
+  const [compactMode, setCompactMode] = useState(false);
+  const [showAppIcons, setShowAppIcons] = useState(true);
+  const [selectedClipFullContent, setSelectedClipFullContent] = useState<string | null>(null);
 
   // Drag tracking state
   const dragStart = useRef<{ x: number; y: number } | null>(null);
@@ -81,6 +87,53 @@ function Overlay() {
     setSelectedIndex(0);
     setActionsOpen(false);
   }, [activeFilter, setActiveFilter]);
+
+  useEffect(() => {
+    let mounted = true;
+
+    const loadConfig = async () => {
+      try {
+        const config = await invoke<{
+          general: { default_paste_behaviour: string };
+          appearance: { compact_mode: boolean; show_app_icons: boolean };
+        }>("get_config");
+        if (!mounted) {
+          return;
+        }
+        setDefaultPasteBehaviour(
+          config.general.default_paste_behaviour === "copy" ? "copy" : "paste"
+        );
+        setCompactMode(Boolean(config.appearance.compact_mode));
+        setShowAppIcons(Boolean(config.appearance.show_app_icons));
+      } catch (error) {
+        console.error("Failed to load overlay config:", error);
+      }
+    };
+
+    void loadConfig();
+
+    const unlisten = listen<{
+      general?: { default_paste_behaviour?: string };
+      appearance?: { compact_mode?: boolean; show_app_icons?: boolean };
+    }>("config-changed", (event) => {
+      const payload = event.payload;
+      const behaviour = payload.general?.default_paste_behaviour;
+      if (behaviour) {
+        setDefaultPasteBehaviour(behaviour === "copy" ? "copy" : "paste");
+      }
+      if (typeof payload.appearance?.compact_mode === "boolean") {
+        setCompactMode(payload.appearance.compact_mode);
+      }
+      if (typeof payload.appearance?.show_app_icons === "boolean") {
+        setShowAppIcons(payload.appearance.show_app_icons);
+      }
+    });
+
+    return () => {
+      mounted = false;
+      unlisten.then((fn) => fn());
+    };
+  }, []);
 
   const handleDelete = useCallback(
     async (index: number) => {
@@ -177,17 +230,14 @@ function Overlay() {
 
   const selectedResult =
     selectedIndex >= 0 && selectedIndex < results.length ? results[selectedIndex] : null;
+  const selectedClipContent = selectedClipFullContent ?? selectedResult?.content ?? "";
+  const selectedMedia = selectedResult ? getClipIconData(selectedResult.id) : undefined;
   const actions = useMemo(
     () => (selectedResult ? buildSheetActions(selectedResult) : []),
     [selectedResult?.id, selectedResult?.pinned]
   );
 
-  // Show detail panel when a clip is selected
-  useEffect(() => {
-    if (selectedResult) {
-      setDetailOpen(true);
-    }
-  }, [selectedResult?.id]);
+  // Detail panel opens only via Cmd+I or explicit toggle — not on selection change
 
   const triggerAction = useCallback(
     (actionIndex: number) => {
@@ -224,11 +274,13 @@ function Overlay() {
     onCopy: handleCopy,
     onPaste: handlePaste,
     onNumberCopy: handleNumberCopy,
+    defaultEnterAction: defaultPasteBehaviour,
     onFilterCycle: handleFilterCycle,
     onDelete: handleDelete,
     onPin: handlePin,
     onCloseActions: () => setActionsOpen(false),
     onActions: handleActions,
+    onToggleDetail: () => setDetailOpen((o) => !o),
   });
 
   useEffect(() => {
@@ -238,10 +290,34 @@ function Overlay() {
   }, [results.length, selectedIndex]);
 
   useEffect(() => {
+    if (!selectedResult) {
+      setSelectedClipFullContent(null);
+      return;
+    }
+
+    let cancelled = false;
+    setSelectedClipFullContent(null);
+    void invoke<string>("get_clip_full_content", { clipId: selectedResult.id })
+      .then((content) => {
+        if (!cancelled) {
+          setSelectedClipFullContent(content);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setSelectedClipFullContent(selectedResult.content);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedResult?.id]);
+
+  useEffect(() => {
     setActionsOpen(false);
     setSelectedActionIndex(0);
-    // Don't close detail panel on query change — only on filter change
-  }, [activeFilter]);
+  }, [activeFilter, query]);
 
   const toggleActions = useCallback(() => {
     if (!selectedResult) return;
@@ -321,8 +397,11 @@ function Overlay() {
           results={results}
           selectedIndex={selectedIndex}
           totalCount={totalCount}
+          query={query}
           onSelect={setSelectedIndex}
           onCopy={handleCopy}
+          compactMode={compactMode}
+          showAppIcons={showAppIcons}
         />
 
       <StatusBar
@@ -337,6 +416,8 @@ function Overlay() {
       {actionsOpen && selectedResult && (
         <ActionsSheet
           clip={selectedResult}
+          clipContent={selectedClipContent}
+          thumbnail={selectedMedia?.thumbnail ?? null}
           actions={actions}
           selectedIndex={selectedActionIndex}
           collections={collections}
@@ -344,13 +425,21 @@ function Overlay() {
           onSelect={setSelectedActionIndex}
           onActivate={(actionIndex) => triggerAction(actionIndex)}
           onTransform={(_clipId, transformedContent) => {
-            void invoke("copy_to_clipboard", { clipId: selectedResult.id }).then(() => {
-              // Copy transformed content directly to clipboard instead
-              navigator.clipboard.writeText(transformedContent);
-            });
+            void navigator.clipboard.writeText(transformedContent)
+              .then(() => {
+                setActionsOpen(false);
+              })
+              .catch((error) => {
+                console.error("Transform copy failed:", error);
+              });
           }}
           onMoveToCollection={(clipId, collectionId) => {
             void invoke("move_clip_to_collection", { clipId, collectionId });
+          }}
+          onOpenUrl={(url) => {
+            void invoke("open_external_url", { url }).catch((error) => {
+              console.error("Open URL failed:", error);
+            });
           }}
         />
       )}
@@ -365,6 +454,11 @@ function Overlay() {
             onEdit={handleEdit}
             onCopy={(clipId) => {
               void invoke("copy_to_clipboard", { clipId });
+            }}
+            onOpenUrl={(url: string) => {
+              void invoke("open_external_url", { url }).catch((error) => {
+                console.error("Open URL failed:", error);
+              });
             }}
           />
         </div>

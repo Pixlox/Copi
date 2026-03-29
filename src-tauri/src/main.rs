@@ -18,7 +18,7 @@ mod search;
 mod settings;
 
 pub struct AppState {
-    pub db_read: Mutex<rusqlite::Connection>,
+    pub db_read_pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
     pub db_write: Mutex<rusqlite::Connection>,
     pub model: Option<std::sync::Arc<embed::EmbeddingModel>>,
     pub ocr_engine: Option<Box<dyn ocr::OcrEngine>>,
@@ -130,7 +130,7 @@ fn main() {
             };
 
             app.manage(AppState {
-                db_read: Mutex::new(db_conns.read),
+                db_read_pool: db_conns.read_pool,
                 db_write: Mutex::new(db_conns.write),
                 model: model_arc.clone(),
                 ocr_engine,
@@ -139,11 +139,12 @@ fn main() {
                 previous_frontmost_app: Mutex::new(None),
                 search_generation: AtomicU64::new(0),
                 search_status: Mutex::new(search::SearchStatusPayload {
-                    phase: if model_arc.is_some() { "warming".into() } else { "idle".into() },
+                    phase: if model_arc.is_some() { "starting".into() } else { "unavailable".into() },
                     queued_items: 0,
                     completed_items: 0,
+                    failed_items: 0,
                     total_items: 0,
-                    semantic_ready: model_arc.is_some(),
+                    semantic_ready: false,
                 }),
             });
             app.manage(MenuBarState {
@@ -310,10 +311,12 @@ fn main() {
             search::get_search_status,
             search::get_image_thumbnail,
             search::get_image_preview,
+            search::get_clip_full_content,
             search::toggle_pin,
             search::delete_clip,
             search::update_clip_content,
             clipboard::copy_to_clipboard,
+            clipboard::get_clip_icons_batch,
             show_overlay,
             hide_overlay,
             settings::get_config,
@@ -326,6 +329,7 @@ fn main() {
             collections::rename_collection,
             collections::list_collections,
             collections::move_clip_to_collection,
+            open_external_url,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -454,6 +458,42 @@ fn show_overlay(app: tauri::AppHandle) {
 #[tauri::command]
 fn hide_overlay(app: tauri::AppHandle, paste: bool) {
     hide_overlay_inner(&app, paste);
+}
+
+#[tauri::command]
+fn open_external_url(url: String) -> Result<(), String> {
+    let trimmed = url.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return Err("Only http/https URLs are allowed".to_string());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(trimmed)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", trimmed])
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(trimmed)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -595,9 +635,40 @@ fn restore_previous_app(app: &tauri::AppHandle) {
 
 #[cfg(target_os = "macos")]
 fn simulate_paste() {
-    std::thread::sleep(std::time::Duration::from_millis(50));
-    let _ = std::process::Command::new("osascript")
-        .arg("-e")
-        .arg("tell application \"System Events\" to keystroke \"v\" using command down")
-        .spawn();
+    std::thread::sleep(std::time::Duration::from_millis(80));
+    // Use CGEventPost for ~20ms latency (vs ~200ms with osascript)
+    // kVK_ANSI_V = 0x09, kCGHIDEventTap = 0, kCGEventFlagMaskCommand = 1 << 20
+    extern "C" {
+        fn CGEventCreateKeyboardEvent(
+            source: *const std::ffi::c_void,
+            keycode: u16,
+            key_down: bool,
+        ) -> *mut std::ffi::c_void;
+        fn CGEventSetFlags(event: *mut std::ffi::c_void, flags: u64);
+        fn CGEventPost(tap: u32, event: *mut std::ffi::c_void);
+        fn CFRelease(cf: *mut std::ffi::c_void);
+    }
+
+    const K_VK_ANSI_V: u16 = 0x09;
+    const K_CG_HID_EVENT_TAP: u32 = 0;
+    const K_CG_EVENT_FLAG_MASK_COMMAND: u64 = 1 << 20;
+
+    unsafe {
+        let source = std::ptr::null();
+        let key_down = CGEventCreateKeyboardEvent(source, K_VK_ANSI_V, true);
+        if !key_down.is_null() {
+            CGEventSetFlags(key_down, K_CG_EVENT_FLAG_MASK_COMMAND);
+            CGEventPost(K_CG_HID_EVENT_TAP, key_down);
+            CFRelease(key_down);
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let key_up = CGEventCreateKeyboardEvent(source, K_VK_ANSI_V, false);
+        if !key_up.is_null() {
+            CGEventSetFlags(key_up, K_CG_EVENT_FLAG_MASK_COMMAND);
+            CGEventPost(K_CG_HID_EVENT_TAP, key_up);
+            CFRelease(key_up);
+        }
+    }
 }

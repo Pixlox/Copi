@@ -39,10 +39,12 @@ static RE_MINUTES_AGO: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"(?i)\b(\d+)\s*m(?:in(?:utes?)?)?\s+ago\b").unwrap());
 static RE_SECONDS_AGO: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"(?i)\b(\d+)\s*s(?:ec(?:onds?)?)?\s+ago\b").unwrap());
-static RE_JUST_NOW: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"(?i)\b(?:just\s+now|a?\s*moment\s+ago|moments?\s+ago)\b").unwrap());
-static RE_FEW_MINUTES: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"(?i)\b(?:a?\s*(?:few|couple)\s+minutes?\s+ago)\b").unwrap());
+static RE_JUST_NOW: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\b(?:just\s+now|a?\s*moment\s+ago|moments?\s+ago)\b").unwrap()
+});
+static RE_FEW_MINUTES: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\b(?:a?\s*(?:few|couple)\s+minutes?\s+ago)\b").unwrap()
+});
 static RE_HOURS_AGO: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"(?i)\b(\d+)\s*h(?:ours?)?\s+ago\b").unwrap());
 static RE_ABOUT_HOURS_AGO: LazyLock<regex::Regex> = LazyLock::new(|| {
@@ -104,12 +106,10 @@ static RE_CLOCK: LazyLock<regex::Regex> = LazyLock::new(|| {
     .unwrap()
 });
 static RE_CLOCK_AMBIG: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"(?i)\b(?:around|about)\s+(\d{1,2})(?::(\d{2}))?\s*(?:o'?clock)?\b")
-        .unwrap()
+    regex::Regex::new(r"(?i)\b(?:around|about)\s+(\d{1,2})(?::(\d{2}))?\s*(?:o'?clock)?\b").unwrap()
 });
-static RE_BEFORE_AFTER_WORD: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"(?i)\b(before|after)\s+(noon|lunch|work)\b").unwrap()
-});
+static RE_BEFORE_AFTER_WORD: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?i)\b(before|after)\s+(noon|lunch|work)\b").unwrap());
 static RE_BETWEEN_HOURS: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(
         r"(?i)\bbetween\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s+and\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b",
@@ -122,21 +122,27 @@ static RE_SOURCE_STRICT: LazyLock<regex::Regex> = LazyLock::new(|| {
     )
     .unwrap()
 });
-static RE_SOURCE_FALLBACK: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"(?i)\b(?:from|in|via|on)\s+([A-Za-z][A-Za-z0-9]{1,25})\b").unwrap());
-static RE_MIN_LENGTH: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"(?i)\b(?:at\s+least|over|longer\s+than)\s+(\d{2,5})\s*(?:chars?|characters?)\b").unwrap()
+static RE_SOURCE_FALLBACK: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\b(?:from|in|via|on)\s+([A-Za-z][A-Za-z0-9]{1,25})\b").unwrap()
 });
-static RE_MULTILINE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"(?i)\b(?:multiline|multi[- ]line|paragraph|multiple\s+lines)\b").unwrap());
+static RE_MIN_LENGTH: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r"(?i)\b(?:at\s+least|over|longer\s+than)\s+(\d{2,5})\s*(?:chars?|characters?)\b",
+    )
+    .unwrap()
+});
+static RE_MULTILINE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\b(?:multiline|multi[- ]line|paragraph|multiple\s+lines)\b").unwrap()
+});
 static RE_CONTENT_TYPE_CODE: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(
         r"(?i)\b(?:snippets?|functions?|json|sql|bash|commands?|python|javascript|typescript|rust|source\s+code|code\s+snippet|code\s+block|endpoints?)\b",
     )
     .unwrap()
 });
-static RE_CONTENT_TYPE_IMAGE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"(?i)\b(?:screenshots?|pictures?|photos?|pics?|images?)\b").unwrap());
+static RE_CONTENT_TYPE_IMAGE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\b(?:screenshots?|pictures?|photos?|pics?|images?)\b").unwrap()
+});
 static RE_CONTENT_TYPE_URL: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"(?i)\b(?:urls?|links?|websites?|https?)\b").unwrap());
 static RE_CONTENT_TYPE_TEXT: LazyLock<regex::Regex> =
@@ -151,8 +157,30 @@ const APP_MAP: &[(&str, &[&str])] = &[
     ("arc", &["arc"]),
     ("brave", &["brave"]),
     ("edge", &["edge", "microsoft edge"]),
-    ("browser", &["safari", "chrome", "google chrome", "firefox", "arc", "brave", "edge"]),
-    ("web", &["safari", "chrome", "google chrome", "firefox", "arc", "brave", "edge"]),
+    (
+        "browser",
+        &[
+            "safari",
+            "chrome",
+            "google chrome",
+            "firefox",
+            "arc",
+            "brave",
+            "edge",
+        ],
+    ),
+    (
+        "web",
+        &[
+            "safari",
+            "chrome",
+            "google chrome",
+            "firefox",
+            "arc",
+            "brave",
+            "edge",
+        ],
+    ),
     ("notes", &["notes", "apple notes"]),
     ("notion", &["notion"]),
     ("obsidian", &["obsidian"]),
@@ -168,7 +196,10 @@ const APP_MAP: &[(&str, &[&str])] = &[
     ("vscode", &["visual studio code", "vscode", "code"]),
     ("code", &["visual studio code", "vscode", "code"]),
     ("xcode", &["xcode"]),
-    ("terminal", &["terminal", "iterm", "iterm2", "ghostty", "warp"]),
+    (
+        "terminal",
+        &["terminal", "iterm", "iterm2", "ghostty", "warp"],
+    ),
     ("iterm", &["iterm", "iterm2"]),
     ("warp", &["warp"]),
     ("cursor", &["cursor"]),
@@ -202,35 +233,428 @@ const LANGUAGE_ALIASES: &[(&str, &[&str])] = &[
 ];
 
 const STOPWORDS: &[&str] = &[
-    "a", "an", "and", "at", "for", "from", "i", "in", "is", "it", "my", "of", "on", "or", "the", "to", "via",
+    "a", "an", "and", "at", "for", "from", "i", "in", "is", "it", "my", "of", "on", "or", "the",
+    "to", "via",
 ];
 
 const INTENT_EXPANSIONS: &[(&[&str], &[&str])] = &[
-    (&["flight info", "boarding info", "flight details"], &["boarding", "pass", "itinerary", "gate", "terminal", "airline", "reservation", "ticket"]),
-    (&["boarding pass"], &["flight", "gate", "terminal", "ticket"]),
-    (&["auth code", "verification code", "login code", "otp", "2fa"], &["verification", "passcode", "one-time", "token", "signin"]),
-    (&["meeting notes", "meeting summary"], &["agenda", "notes", "action", "followup"]),
-    (&["meeting link", "zoom link", "meet link"], &["https", "url", "invite", "zoom", "meet"]),
-    (&["receipt", "invoice"], &["order", "payment", "total", "subtotal", "tax"]),
-    (&["tracking number", "tracking info"], &["shipment", "tracking", "delivery", "order"]),
-    (&["address"], &["street", "road", "avenue", "postcode", "zip"]),
-    (&["code block", "code snippet"], &["snippet", "function", "implementation", "source"]),
+    // === Travel & Logistics ===
+    (
+        &["flight info", "boarding info", "flight details"],
+        &[
+            "boarding",
+            "pass",
+            "itinerary",
+            "gate",
+            "terminal",
+            "airline",
+            "reservation",
+            "ticket",
+        ],
+    ),
+    (
+        &["boarding pass"],
+        &["flight", "gate", "terminal", "ticket"],
+    ),
+    (
+        &["hotel", "hotel reservation", "booking"],
+        &[
+            "reservation",
+            "confirmation",
+            "check-in",
+            "check-out",
+            "room",
+        ],
+    ),
+    (
+        &["car rental", "rental car"],
+        &["reservation", "pickup", "return", "vehicle"],
+    ),
+    (
+        &["trip", "travel itinerary"],
+        &["flight", "hotel", "booking", "schedule"],
+    ),
+    (
+        &["airport", "boarding", "departure"],
+        &["flight", "gate", "terminal", "airline"],
+    ),
+    // === Auth & Security ===
+    (
+        &["auth code", "verification code", "login code", "otp", "2fa"],
+        &["verification", "passcode", "one-time", "token", "signin"],
+    ),
+    (
+        &["password", "credentials", "login"],
+        &["username", "password", "email", "account", "secret"],
+    ),
+    (
+        &["api key", "access token", "bearer token"],
+        &["secret", "bearer", "authorization", "token"],
+    ),
+    // === Meetings & Calendar ===
+    (
+        &["meeting notes", "meeting summary"],
+        &["agenda", "notes", "action", "followup"],
+    ),
+    (
+        &["meeting link", "zoom link", "meet link", "video call"],
+        &["https", "url", "invite", "zoom", "meet"],
+    ),
+    (
+        &["calendar", "event", "appointment"],
+        &["schedule", "date", "time", "location"],
+    ),
+    (
+        &["standup", "stand-up", "daily"],
+        &["yesterday", "today", "blockers", "updates"],
+    ),
+    // === Commerce & Finance ===
+    (
+        &["receipt", "invoice"],
+        &["order", "payment", "total", "subtotal", "tax"],
+    ),
+    (
+        &["tax", "taxes", "tax number"],
+        &["ssn", "tin", "invoice", "payment", "amount", "refund"],
+    ),
+    (
+        &["tracking number", "tracking info"],
+        &["shipment", "tracking", "delivery", "order"],
+    ),
+    (
+        &["price", "cost", "pricing"],
+        &["amount", "total", "dollar", "usd", "eur"],
+    ),
+    (
+        &["bank", "account number"],
+        &["routing", "swift", "iban", "transfer"],
+    ),
+    (
+        &["expense", "expenses"],
+        &["receipt", "reimbursement", "amount", "category"],
+    ),
+    (
+        &["order", "purchase"],
+        &["confirmation", "shipping", "delivery", "item"],
+    ),
+    (
+        &["credit card", "card number"],
+        &["card", "payment", "visa", "mastercard", "expiry", "cvv"],
+    ),
+    // === Contact Info ===
+    (
+        &["address", "location"],
+        &["street", "road", "avenue", "postcode", "zip", "city"],
+    ),
+    (
+        &["phone number", "phone"],
+        &["mobile", "cell", "telephone", "contact"],
+    ),
+    (
+        &["email address", "email"],
+        &["@", "gmail", "outlook", "inbox"],
+    ),
+    // === Code & Development ===
+    (
+        &["code block", "code snippet"],
+        &["snippet", "function", "implementation", "source"],
+    ),
+    (
+        &["error", "error message", "stack trace"],
+        &["exception", "traceback", "panic", "failed", "bug"],
+    ),
+    (
+        &["pull request", "pr", "merge request"],
+        &["review", "branch", "commit", "diff", "github"],
+    ),
+    (
+        &["docker", "container"],
+        &["image", "dockerfile", "compose", "container"],
+    ),
+    (
+        &["config", "configuration", "settings"],
+        &["yaml", "json", "toml", "env", "environment"],
+    ),
+    (
+        &["endpoint", "api"],
+        &["url", "route", "request", "response", "http"],
+    ),
+    (
+        &["database", "query", "sql"],
+        &["select", "from", "where", "join", "table"],
+    ),
+    (
+        &["deploy", "deployment"],
+        &["build", "release", "staging", "production"],
+    ),
+    (
+        &["ssh", "terminal command"],
+        &["connect", "server", "host", "key", "command"],
+    ),
+    (
+        &["staging server", "production server", "ip address"],
+        &[
+            "ip",
+            "host",
+            "server",
+            "ssh",
+            "endpoint",
+            "staging",
+            "production",
+        ],
+    ),
+    (
+        &["git", "commit", "branch"],
+        &["repository", "push", "pull", "merge", "diff"],
+    ),
+    // === Documents & Notes ===
+    (
+        &["todo", "to-do", "task list"],
+        &["task", "checkbox", "item", "list", "done"],
+    ),
+    (&["notes", "note"], &["text", "memo", "reminder", "jot"]),
+    (
+        &["draft", "draft email"],
+        &["compose", "write", "message", "send"],
+    ),
+    (
+        &["apology email", "sorry email"],
+        &["apology", "sorry", "regards", "followup", "email"],
+    ),
+    (
+        &["contract", "agreement"],
+        &["terms", "signature", "sign", "clause", "legal"],
+    ),
+    (
+        &["document", "file"],
+        &["pdf", "download", "folder", "path"],
+    ),
+    (
+        &["privacy policy", "policy"],
+        &["privacy", "policy", "terms", "legal", "compliance"],
+    ),
+    // === Media ===
+    (
+        &["screenshot", "screen capture"],
+        &["image", "png", "screen", "capture"],
+    ),
+    (
+        &["score screenshot", "maimai score", "game score"],
+        &["score", "rating", "result", "screenshot", "image"],
+    ),
+    (
+        &["photo", "picture", "image"],
+        &["image", "jpg", "camera", "gallery"],
+    ),
+    (
+        &["link", "url", "website"],
+        &["https", "http", "web", "page", "site"],
+    ),
+    (
+        &["google doc", "project doc"],
+        &["docs.google.com", "document", "project", "link", "url"],
+    ),
+    // === Social & Communication ===
+    (
+        &["message", "text message"],
+        &["sms", "chat", "imessage", "conversation"],
+    ),
+    (
+        &["deadline", "boss said", "due date"],
+        &["deadline", "due", "date", "priority", "urgent", "message"],
+    ),
+    (
+        &["thread", "conversation"],
+        &["reply", "message", "chat", "discussion"],
+    ),
+    (
+        &["tweet", "post", "social media"],
+        &["twitter", "x.com", "status", "share"],
+    ),
+    (
+        &["chat", "dm", "direct message"],
+        &["message", "conversation", "thread"],
+    ),
+    // === Entertainment ===
+    (
+        &["playlist", "song", "music"],
+        &["spotify", "apple music", "track", "album"],
+    ),
+    (
+        &["video", "youtube"],
+        &["watch", "channel", "playlist", "stream"],
+    ),
+    (
+        &["recipe", "cooking"],
+        &["ingredients", "steps", "instructions", "cups"],
+    ),
+    // === Work & Productivity ===
+    (
+        &["project", "sprint"],
+        &["task", "deadline", "milestone", "progress"],
+    ),
+    (
+        &["bug", "issue", "ticket"],
+        &["report", "fix", "assign", "priority"],
+    ),
+    (
+        &["document", "doc"],
+        &["google docs", "notion", "confluence", "page"],
+    ),
+    (
+        &["spreadsheet", "excel"],
+        &["cells", "formula", "rows", "columns", "data"],
+    ),
+    (
+        &["presentation", "slides"],
+        &["powerpoint", "keynote", "slide", "deck"],
+    ),
 ];
 
 const NAMED_PERIODS: &[(&[&str], PeriodRange, f32)] = &[
-    (&["early morning"], PeriodRange { start_hour: 5, start_minute: 0, end_hour: 8, end_minute: 0, crosses_midnight: false }, 0.85),
-    (&["mid morning"], PeriodRange { start_hour: 8, start_minute: 0, end_hour: 10, end_minute: 30, crosses_midnight: false }, 0.85),
-    (&["late morning"], PeriodRange { start_hour: 10, start_minute: 30, end_hour: 12, end_minute: 0, crosses_midnight: false }, 0.85),
-    (&["this morning", "morning"], PeriodRange { start_hour: 5, start_minute: 0, end_hour: 12, end_minute: 0, crosses_midnight: false }, 0.85),
-    (&["at lunch", "lunchtime", "at noon", "noon", "lunch"], PeriodRange { start_hour: 11, start_minute: 30, end_hour: 13, end_minute: 30, crosses_midnight: false }, 0.85),
-    (&["after lunch"], PeriodRange { start_hour: 13, start_minute: 0, end_hour: 15, end_minute: 0, crosses_midnight: false }, 0.85),
-    (&["this afternoon", "afternoon"], PeriodRange { start_hour: 12, start_minute: 0, end_hour: 17, end_minute: 0, crosses_midnight: false }, 0.85),
-    (&["late afternoon"], PeriodRange { start_hour: 15, start_minute: 0, end_hour: 17, end_minute: 30, crosses_midnight: false }, 0.85),
-    (&["this evening", "evening"], PeriodRange { start_hour: 17, start_minute: 0, end_hour: 21, end_minute: 0, crosses_midnight: false }, 0.85),
-    (&["tonight", "night"], PeriodRange { start_hour: 21, start_minute: 0, end_hour: 23, end_minute: 59, crosses_midnight: false }, 0.85),
-    (&["midnight"], PeriodRange { start_hour: 23, start_minute: 0, end_hour: 1, end_minute: 0, crosses_midnight: true }, 0.85),
-    (&["dawn", "sunrise"], PeriodRange { start_hour: 5, start_minute: 0, end_hour: 7, end_minute: 30, crosses_midnight: false }, 0.85),
-    (&["dusk", "sunset"], PeriodRange { start_hour: 17, start_minute: 30, end_hour: 20, end_minute: 30, crosses_midnight: false }, 0.85),
+    (
+        &["early morning"],
+        PeriodRange {
+            start_hour: 5,
+            start_minute: 0,
+            end_hour: 8,
+            end_minute: 0,
+            crosses_midnight: false,
+        },
+        0.85,
+    ),
+    (
+        &["mid morning"],
+        PeriodRange {
+            start_hour: 8,
+            start_minute: 0,
+            end_hour: 10,
+            end_minute: 30,
+            crosses_midnight: false,
+        },
+        0.85,
+    ),
+    (
+        &["late morning"],
+        PeriodRange {
+            start_hour: 10,
+            start_minute: 30,
+            end_hour: 12,
+            end_minute: 0,
+            crosses_midnight: false,
+        },
+        0.85,
+    ),
+    (
+        &["this morning", "morning"],
+        PeriodRange {
+            start_hour: 5,
+            start_minute: 0,
+            end_hour: 12,
+            end_minute: 0,
+            crosses_midnight: false,
+        },
+        0.85,
+    ),
+    (
+        &["at lunch", "lunchtime", "at noon", "noon", "lunch"],
+        PeriodRange {
+            start_hour: 11,
+            start_minute: 30,
+            end_hour: 13,
+            end_minute: 30,
+            crosses_midnight: false,
+        },
+        0.85,
+    ),
+    (
+        &["after lunch"],
+        PeriodRange {
+            start_hour: 13,
+            start_minute: 0,
+            end_hour: 15,
+            end_minute: 0,
+            crosses_midnight: false,
+        },
+        0.85,
+    ),
+    (
+        &["this afternoon", "afternoon"],
+        PeriodRange {
+            start_hour: 12,
+            start_minute: 0,
+            end_hour: 17,
+            end_minute: 0,
+            crosses_midnight: false,
+        },
+        0.85,
+    ),
+    (
+        &["late afternoon"],
+        PeriodRange {
+            start_hour: 15,
+            start_minute: 0,
+            end_hour: 17,
+            end_minute: 30,
+            crosses_midnight: false,
+        },
+        0.85,
+    ),
+    (
+        &["this evening", "evening"],
+        PeriodRange {
+            start_hour: 17,
+            start_minute: 0,
+            end_hour: 21,
+            end_minute: 0,
+            crosses_midnight: false,
+        },
+        0.85,
+    ),
+    (
+        &["tonight", "night"],
+        PeriodRange {
+            start_hour: 21,
+            start_minute: 0,
+            end_hour: 23,
+            end_minute: 59,
+            crosses_midnight: false,
+        },
+        0.85,
+    ),
+    (
+        &["midnight"],
+        PeriodRange {
+            start_hour: 23,
+            start_minute: 0,
+            end_hour: 1,
+            end_minute: 0,
+            crosses_midnight: true,
+        },
+        0.85,
+    ),
+    (
+        &["dawn", "sunrise"],
+        PeriodRange {
+            start_hour: 5,
+            start_minute: 0,
+            end_hour: 7,
+            end_minute: 30,
+            crosses_midnight: false,
+        },
+        0.85,
+    ),
+    (
+        &["dusk", "sunset"],
+        PeriodRange {
+            start_hour: 17,
+            start_minute: 30,
+            end_hour: 20,
+            end_minute: 30,
+            crosses_midnight: false,
+        },
+        0.85,
+    ),
 ];
 
 pub fn parse_query(raw: &str) -> ParsedQuery {
@@ -276,8 +700,25 @@ pub fn parse_query(raw: &str) -> ParsedQuery {
     parsed.is_multiline = is_multiline;
 
     let semantic = normalize_whitespace(&remaining);
-    parsed.keywords = semantic_keywords(&semantic, parsed.content_type.as_deref());
-    parsed.semantic = semantic;
+
+    // If semantic is only stopwords, clear it so temporal/source filters can drive search
+    let semantic_is_only_stopwords = !semantic.is_empty()
+        && semantic
+            .split_whitespace()
+            .all(|w| STOPWORDS.contains(&w.to_lowercase().as_str()));
+
+    if semantic_is_only_stopwords {
+        parsed.semantic.clear();
+        parsed.keywords.clear();
+    } else {
+        // Pass original trimmed query for intent phrase detection
+        // This ensures "meeting link" triggers expansion even though "link" was extracted as content_type
+        let (keywords, enriched) =
+            semantic_keywords_with_enrichment(&semantic, parsed.content_type.as_deref(), trimmed);
+        parsed.keywords = keywords;
+        parsed.semantic = enriched;
+    }
+
     parsed.query_is_empty_after_parse = parsed.semantic.is_empty()
         && !parsed.has_temporal
         && parsed.content_type.is_none()
@@ -408,7 +849,15 @@ fn map_source_app(captured: &str) -> Vec<String> {
     Vec::new()
 }
 
-fn extract_meta(q: &str) -> (Option<String>, Option<bool>, Option<usize>, Option<bool>, Vec<(usize, usize)>) {
+fn extract_meta(
+    q: &str,
+) -> (
+    Option<String>,
+    Option<bool>,
+    Option<usize>,
+    Option<bool>,
+    Vec<(usize, usize)>,
+) {
     let mut content_type = None;
     let mut is_pinned = None;
     let mut min_length = None;
@@ -436,7 +885,9 @@ fn extract_meta(q: &str) -> (Option<String>, Option<bool>, Option<usize>, Option
 
     if let Some(captures) = RE_MIN_LENGTH.captures(q) {
         if let Some(full_match) = captures.get(0) {
-            min_length = captures.get(1).and_then(|m| m.as_str().parse::<usize>().ok());
+            min_length = captures
+                .get(1)
+                .and_then(|m| m.as_str().parse::<usize>().ok());
             spans.push((full_match.start(), full_match.end()));
         }
     }
@@ -453,11 +904,21 @@ fn extract_temporal(q: &str) -> Option<(i64, i64, f32, Vec<(usize, usize)>)> {
     if let Some((anchor_date, day_span, day_conf)) = extract_day_reference(q) {
         if let Some((period, period_span, period_conf)) = extract_named_period(q) {
             let (after, before) = period_bounds(anchor_date, period);
-            return Some((after, before, day_conf.min(period_conf), vec![day_span, period_span]));
+            return Some((
+                after,
+                before,
+                day_conf.min(period_conf),
+                vec![day_span, period_span],
+            ));
         }
 
         if let Some((after, before, conf, clock_span)) = extract_clock_time(q, Some(anchor_date)) {
-            return Some((after, before, day_conf.min(conf), vec![day_span, clock_span]));
+            return Some((
+                after,
+                before,
+                day_conf.min(conf),
+                vec![day_span, clock_span],
+            ));
         }
     }
 
@@ -482,7 +943,12 @@ fn extract_temporal(q: &str) -> Option<(i64, i64, f32, Vec<(usize, usize)>)> {
     if let Some((period, span, conf)) = extract_named_period(q) {
         let today = Local::now().date_naive();
         let (after, before) = period_bounds(today, period);
-        return Some((after, before.min(Local::now().timestamp()), conf, vec![span]));
+        return Some((
+            after,
+            before.min(Local::now().timestamp()),
+            conf,
+            vec![span],
+        ));
     }
 
     extract_range_temporal(q)
@@ -492,7 +958,11 @@ fn extract_day_reference(q: &str) -> Option<(NaiveDate, (usize, usize), f32)> {
     let now = Local::now();
 
     if let Some(m) = RE_YESTERDAY.find(q) {
-        return Some(((now - Duration::days(1)).date_naive(), (m.start(), m.end()), 0.98));
+        return Some((
+            (now - Duration::days(1)).date_naive(),
+            (m.start(), m.end()),
+            0.98,
+        ));
     }
     if let Some(m) = RE_TODAY.find(q) {
         return Some((now.date_naive(), (m.start(), m.end()), 0.98));
@@ -531,7 +1001,12 @@ fn extract_relative_temporal(q: &str) -> Option<(i64, i64, f32, Vec<(usize, usiz
         let center = now - Duration::minutes(value);
         let start = center - Duration::seconds((value as f64 * 60.0 * 0.3) as i64);
         let end = center + Duration::seconds((value as f64 * 60.0 * 0.3) as i64);
-        return Some((start.timestamp(), end.timestamp(), 0.97, vec![(full_match.start(), full_match.end())]));
+        return Some((
+            start.timestamp(),
+            end.timestamp(),
+            0.97,
+            vec![(full_match.start(), full_match.end())],
+        ));
     }
     if let Some(captures) = RE_SECONDS_AGO.captures(q) {
         let full_match = captures.get(0)?;
@@ -645,17 +1120,32 @@ fn extract_range_temporal(q: &str) -> Option<(i64, i64, f32, Vec<(usize, usize)>
     let now = Local::now();
     if let Some(m) = RE_THIS_WEEK.find(q) {
         let monday = start_of_week(now.date_naive());
-        return Some((full_day(monday).0, now.timestamp(), 0.92, vec![(m.start(), m.end())]));
+        return Some((
+            full_day(monday).0,
+            now.timestamp(),
+            0.92,
+            vec![(m.start(), m.end())],
+        ));
     }
     if let Some(m) = RE_LAST_WEEK.find(q) {
         let this_monday = start_of_week(now.date_naive());
         let last_monday = this_monday - Duration::days(7);
         let last_sunday = last_monday + Duration::days(6);
-        return Some((full_day(last_monday).0, full_day(last_sunday).1, 0.92, vec![(m.start(), m.end())]));
+        return Some((
+            full_day(last_monday).0,
+            full_day(last_sunday).1,
+            0.92,
+            vec![(m.start(), m.end())],
+        ));
     }
     if let Some(m) = RE_THIS_MONTH.find(q) {
         let first = NaiveDate::from_ymd_opt(now.year(), now.month(), 1)?;
-        return Some((full_day(first).0, now.timestamp(), 0.92, vec![(m.start(), m.end())]));
+        return Some((
+            full_day(first).0,
+            now.timestamp(),
+            0.92,
+            vec![(m.start(), m.end())],
+        ));
     }
     if let Some(m) = RE_LAST_MONTH.find(q) {
         let (year, month) = if now.month() == 1 {
@@ -665,22 +1155,40 @@ fn extract_range_temporal(q: &str) -> Option<(i64, i64, f32, Vec<(usize, usize)>
         };
         let first = NaiveDate::from_ymd_opt(year, month, 1)?;
         let last = NaiveDate::from_ymd_opt(year, month, last_day_of_month(year, month))?;
-        return Some((full_day(first).0, full_day(last).1, 0.92, vec![(m.start(), m.end())]));
+        return Some((
+            full_day(first).0,
+            full_day(last).1,
+            0.92,
+            vec![(m.start(), m.end())],
+        ));
     }
     if let Some(m) = RE_WEEKEND.find(q) {
         let recent_saturday = most_recent_weekday(now.date_naive(), Weekday::Sat, true);
-        let start = if q[m.start()..m.end()].to_lowercase().contains("last weekend") {
+        let start = if q[m.start()..m.end()]
+            .to_lowercase()
+            .contains("last weekend")
+        {
             recent_saturday - Duration::days(7)
         } else {
             recent_saturday
         };
-        return Some((full_day(start).0, full_day(start + Duration::days(1)).1, 0.90, vec![(m.start(), m.end())]));
+        return Some((
+            full_day(start).0,
+            full_day(start + Duration::days(1)).1,
+            0.90,
+            vec![(m.start(), m.end())],
+        ));
     }
     if let Some(captures) = RE_DAYS_AGO.captures(q) {
         let full_match = captures.get(0)?;
         let value = captures.get(1)?.as_str().parse::<i64>().ok().unwrap_or(1);
         let day = (now - Duration::days(value)).date_naive();
-        return Some((full_day(day).0, full_day(day).1, 0.92, vec![(full_match.start(), full_match.end())]));
+        return Some((
+            full_day(day).0,
+            full_day(day).1,
+            0.92,
+            vec![(full_match.start(), full_match.end())],
+        ));
     }
     if let Some(captures) = RE_WEEKS_AGO.captures(q) {
         let full_match = captures.get(0)?;
@@ -748,19 +1256,33 @@ fn extract_range_temporal(q: &str) -> Option<(i64, i64, f32, Vec<(usize, usize)>
     None
 }
 
-fn extract_clock_time(q: &str, anchor_date: Option<NaiveDate>) -> Option<(i64, i64, f32, (usize, usize))> {
+fn extract_clock_time(
+    q: &str,
+    anchor_date: Option<NaiveDate>,
+) -> Option<(i64, i64, f32, (usize, usize))> {
     if let Some(captures) = RE_BETWEEN_HOURS.captures(q) {
         let full_match = captures.get(0)?;
         let start_hour = captures.get(1)?.as_str().parse::<u32>().ok()?;
-        let start_minute = captures.get(2).and_then(|m| m.as_str().parse::<u32>().ok()).unwrap_or(0);
+        let start_minute = captures
+            .get(2)
+            .and_then(|m| m.as_str().parse::<u32>().ok())
+            .unwrap_or(0);
         let start_meridiem = captures.get(3).map(|m| m.as_str());
         let end_hour = captures.get(4)?.as_str().parse::<u32>().ok()?;
-        let end_minute = captures.get(5).and_then(|m| m.as_str().parse::<u32>().ok()).unwrap_or(0);
+        let end_minute = captures
+            .get(5)
+            .and_then(|m| m.as_str().parse::<u32>().ok())
+            .unwrap_or(0);
         let end_meridiem = captures.get(6).map(|m| m.as_str()).or(start_meridiem);
         let date = anchor_date.unwrap_or_else(|| Local::now().date_naive());
         let start_ts = resolve_clock_on(date, start_hour, start_minute, start_meridiem, false)?;
         let end_ts = resolve_clock_on(date, end_hour, end_minute, end_meridiem, false)? + (59 * 60);
-        return Some((start_ts, end_ts, 0.82, (full_match.start(), full_match.end())));
+        return Some((
+            start_ts,
+            end_ts,
+            0.82,
+            (full_match.start(), full_match.end()),
+        ));
     }
 
     if let Some(captures) = RE_BEFORE_AFTER_WORD.captures(q) {
@@ -780,14 +1302,25 @@ fn extract_clock_time(q: &str, anchor_date: Option<NaiveDate>) -> Option<(i64, i
         } else {
             (pivot, full_day(date).1)
         };
-        return Some((result.0, result.1, 0.80, (full_match.start(), full_match.end())));
+        return Some((
+            result.0,
+            result.1,
+            0.80,
+            (full_match.start(), full_match.end()),
+        ));
     }
 
     if let Some(captures) = RE_CLOCK.captures(q) {
         let full_match = captures.get(0)?;
-        let prefix = captures.get(1).map(|m| m.as_str().to_lowercase()).unwrap_or_default();
+        let prefix = captures
+            .get(1)
+            .map(|m| m.as_str().to_lowercase())
+            .unwrap_or_default();
         let hour = captures.get(2)?.as_str().parse::<u32>().ok()?;
-        let minute = captures.get(3).and_then(|m| m.as_str().parse::<u32>().ok()).unwrap_or(0);
+        let minute = captures
+            .get(3)
+            .and_then(|m| m.as_str().parse::<u32>().ok())
+            .unwrap_or(0);
         let meridiem = captures.get(4).map(|m| m.as_str())?;
         let (after, before) = if let Some(date) = anchor_date {
             let pivot = resolve_clock_on(date, hour, minute, Some(meridiem), false)?;
@@ -796,33 +1329,59 @@ fn extract_clock_time(q: &str, anchor_date: Option<NaiveDate>) -> Option<(i64, i
             } else if prefix == "after" {
                 (pivot, full_day(date).1)
             } else {
-                let tolerance = if prefix == "around" || prefix == "about" { 45 * 60 } else { 20 * 60 };
+                let tolerance = if prefix == "around" || prefix == "about" {
+                    45 * 60
+                } else {
+                    20 * 60
+                };
                 (pivot - tolerance, pivot + tolerance)
             }
         } else {
             resolve_clock_without_anchor(hour, minute, meridiem, &prefix)?
         };
-        let confidence = if prefix == "around" || prefix == "about" { 0.82 } else { 0.88 };
-        return Some((after, before, confidence, (full_match.start(), full_match.end())));
+        let confidence = if prefix == "around" || prefix == "about" {
+            0.82
+        } else {
+            0.88
+        };
+        return Some((
+            after,
+            before,
+            confidence,
+            (full_match.start(), full_match.end()),
+        ));
     }
 
     if let Some(captures) = RE_CLOCK_AMBIG.captures(q) {
         let full_match = captures.get(0)?;
         let hour = captures.get(1)?.as_str().parse::<u32>().ok()?;
-        let minute = captures.get(2).and_then(|m| m.as_str().parse::<u32>().ok()).unwrap_or(0);
+        let minute = captures
+            .get(2)
+            .and_then(|m| m.as_str().parse::<u32>().ok())
+            .unwrap_or(0);
         if !(1..=12).contains(&hour) {
             return None;
         }
         let meridiem = if (7..=11).contains(&hour) { "am" } else { "pm" };
         let date = anchor_date.unwrap_or_else(|| Local::now().date_naive());
         let pivot = resolve_clock_on(date, hour, minute, Some(meridiem), false)?;
-        return Some((pivot - 3600, pivot + 3600, 0.65, (full_match.start(), full_match.end())));
+        return Some((
+            pivot - 3600,
+            pivot + 3600,
+            0.65,
+            (full_match.start(), full_match.end()),
+        ));
     }
 
     None
 }
 
-fn resolve_clock_without_anchor(hour: u32, minute: u32, meridiem: &str, prefix: &str) -> Option<(i64, i64)> {
+fn resolve_clock_without_anchor(
+    hour: u32,
+    minute: u32,
+    meridiem: &str,
+    prefix: &str,
+) -> Option<(i64, i64)> {
     let now = Local::now();
     let today = now.date_naive();
     let mut date = today;
@@ -836,12 +1395,22 @@ fn resolve_clock_without_anchor(hour: u32, minute: u32, meridiem: &str, prefix: 
     } else if prefix == "after" {
         Some((pivot, full_day(date).1))
     } else {
-        let tolerance = if prefix == "around" || prefix == "about" { 45 * 60 } else { 20 * 60 };
+        let tolerance = if prefix == "around" || prefix == "about" {
+            45 * 60
+        } else {
+            20 * 60
+        };
         Some((pivot - tolerance, pivot + tolerance))
     }
 }
 
-fn resolve_clock_on(date: NaiveDate, hour: u32, minute: u32, meridiem: Option<&str>, fallback_pm_for_small_hours: bool) -> Option<i64> {
+fn resolve_clock_on(
+    date: NaiveDate,
+    hour: u32,
+    minute: u32,
+    meridiem: Option<&str>,
+    fallback_pm_for_small_hours: bool,
+) -> Option<i64> {
     let normalized = if let Some(meridiem) = meridiem {
         let mut hour_24 = hour % 12;
         if meridiem.eq_ignore_ascii_case("pm") {
@@ -873,7 +1442,8 @@ fn period_bounds(date: NaiveDate, period: PeriodRange) -> (i64, i64) {
 fn resolve_weekday(today: NaiveDate, weekday: Weekday, modifier: Option<&str>) -> NaiveDate {
     match modifier {
         Some("this") => {
-            let this_week = start_of_week(today) + Duration::days(weekday.num_days_from_monday() as i64);
+            let this_week =
+                start_of_week(today) + Duration::days(weekday.num_days_from_monday() as i64);
             if this_week <= today {
                 this_week
             } else {
@@ -885,7 +1455,11 @@ fn resolve_weekday(today: NaiveDate, weekday: Weekday, modifier: Option<&str>) -
 }
 
 fn most_recent_weekday(today: NaiveDate, weekday: Weekday, allow_today: bool) -> NaiveDate {
-    let mut date = if allow_today { today } else { today - Duration::days(1) };
+    let mut date = if allow_today {
+        today
+    } else {
+        today - Duration::days(1)
+    };
     for _ in 0..7 {
         if date.weekday() == weekday {
             return date;
@@ -943,7 +1517,14 @@ fn parse_weekday(name: &str) -> Option<Weekday> {
     }
 }
 
-fn semantic_keywords(text: &str, content_type: Option<&str>) -> Vec<String> {
+/// Returns (keywords, enriched_semantic) where enriched includes intent expansion terms.
+/// The enriched semantic is used for embedding, giving the model better context.
+/// original_query is used for intent phrase detection (before content_type extraction).
+fn semantic_keywords_with_enrichment(
+    text: &str,
+    content_type: Option<&str>,
+    original_query: &str,
+) -> (Vec<String>, String) {
     let mut keywords = text
         .split_whitespace()
         .map(|part| {
@@ -958,11 +1539,19 @@ fn semantic_keywords(text: &str, content_type: Option<&str>) -> Vec<String> {
             acc
         });
 
-    let semantic_lower = text.to_lowercase();
+    let mut enriched = text.to_string();
+    // Use original query for intent phrase detection (before content_type extraction removed words)
+    let original_lower = original_query.to_lowercase();
+
     for (phrases, expansions) in INTENT_EXPANSIONS {
-        if phrases.iter().any(|phrase| semantic_lower.contains(phrase)) {
+        if phrases.iter().any(|phrase| original_lower.contains(phrase)) {
             for expansion in *expansions {
                 push_keyword(&mut keywords, expansion);
+                // Add expansion to enriched semantic for better embedding
+                if !enriched.to_lowercase().contains(expansion) {
+                    enriched.push(' ');
+                    enriched.push_str(expansion);
+                }
             }
         }
     }
@@ -970,6 +1559,10 @@ fn semantic_keywords(text: &str, content_type: Option<&str>) -> Vec<String> {
     if keywords.iter().any(|keyword| keyword == "flight") {
         for extra in ["boarding", "pass", "itinerary", "gate"] {
             push_keyword(&mut keywords, extra);
+            if !enriched.to_lowercase().contains(extra) {
+                enriched.push(' ');
+                enriched.push_str(extra);
+            }
         }
     }
 
@@ -985,7 +1578,7 @@ fn semantic_keywords(text: &str, content_type: Option<&str>) -> Vec<String> {
         }
     }
 
-    keywords
+    (keywords, enriched)
 }
 
 fn push_keyword(keywords: &mut Vec<String>, value: &str) {
@@ -1069,32 +1662,46 @@ fn detect_latin_language(text: &str) -> Option<&'static str> {
     const LATIN_HINTS: &[(&str, &[&str], &[char])] = &[
         (
             "en",
-            &["the", "and", "for", "with", "from", "this", "that", "your", "please", "thanks"],
+            &[
+                "the", "and", "for", "with", "from", "this", "that", "your", "please", "thanks",
+            ],
             &[],
         ),
         (
             "es",
-            &["el", "la", "de", "que", "para", "con", "por", "una", "hola", "gracias"],
+            &[
+                "el", "la", "de", "que", "para", "con", "por", "una", "hola", "gracias",
+            ],
             &['ñ', 'á', 'é', 'í', 'ó', 'ú'],
         ),
         (
             "fr",
-            &["le", "la", "de", "et", "pour", "avec", "une", "bonjour", "merci", "vous"],
-            &['à', 'â', 'ç', 'é', 'è', 'ê', 'ë', 'î', 'ï', 'ô', 'ù', 'û', 'ü'],
+            &[
+                "le", "la", "de", "et", "pour", "avec", "une", "bonjour", "merci", "vous",
+            ],
+            &[
+                'à', 'â', 'ç', 'é', 'è', 'ê', 'ë', 'î', 'ï', 'ô', 'ù', 'û', 'ü',
+            ],
         ),
         (
             "de",
-            &["der", "die", "das", "und", "mit", "für", "nicht", "ein", "eine", "danke"],
+            &[
+                "der", "die", "das", "und", "mit", "für", "nicht", "ein", "eine", "danke",
+            ],
             &['ä', 'ö', 'ü', 'ß'],
         ),
         (
             "pt",
-            &["de", "que", "para", "com", "uma", "não", "você", "obrigado", "olá"],
+            &[
+                "de", "que", "para", "com", "uma", "não", "você", "obrigado", "olá",
+            ],
             &['ã', 'õ', 'á', 'â', 'ê', 'é', 'í', 'ó', 'ô', 'ú', 'ç'],
         ),
         (
             "it",
-            &["di", "che", "per", "con", "una", "non", "sono", "come", "ciao", "grazie"],
+            &[
+                "di", "che", "per", "con", "una", "non", "sono", "come", "ciao", "grazie",
+            ],
             &['à', 'è', 'é', 'ì', 'ò', 'ù'],
         ),
     ];
@@ -1152,7 +1759,9 @@ mod tests {
     fn parses_language_and_semantic() {
         let parsed = parse_query("auth code in japanese");
         assert!(parsed.languages.iter().any(|lang| lang == "ja"));
-        assert_eq!(parsed.semantic, "auth code");
+        // Semantic is enriched with intent expansion terms
+        assert!(parsed.semantic.contains("auth code"));
+        assert!(parsed.semantic.contains("verification"));
     }
 
     #[test]
@@ -1181,5 +1790,239 @@ mod tests {
         assert!(parsed.temporal_after.is_some());
         assert!(parsed.temporal_before.is_some());
         assert!(parsed.semantic.is_empty());
+    }
+
+    #[test]
+    fn temporal_only_query_clears_stopword_semantic() {
+        let parsed = parse_query("from yesterday");
+        assert!(
+            parsed.semantic.is_empty(),
+            "semantic should be empty when it's only stopwords after temporal extraction"
+        );
+        assert!(parsed.has_temporal);
+        assert!(parsed.keywords.is_empty());
+    }
+
+    #[test]
+    fn intent_expansion_enriches_keywords() {
+        let parsed = parse_query("flight info");
+        assert!(
+            parsed.keywords.contains(&"boarding".to_string()),
+            "should contain 'boarding'"
+        );
+        assert!(
+            parsed.keywords.contains(&"itinerary".to_string()),
+            "should contain 'itinerary'"
+        );
+        assert!(
+            parsed.keywords.contains(&"gate".to_string()),
+            "should contain 'gate'"
+        );
+    }
+
+    #[test]
+    fn intent_expansion_enriches_semantic_for_embedding() {
+        let parsed = parse_query("flight info");
+        assert!(
+            parsed.semantic.contains("boarding"),
+            "semantic should contain 'boarding'"
+        );
+        assert!(
+            parsed.semantic.contains("itinerary"),
+            "semantic should contain 'itinerary'"
+        );
+    }
+
+    #[test]
+    fn temporal_with_semantic_preserves_text() {
+        let parsed = parse_query("recipe from yesterday");
+        // Semantic is enriched with expansion terms
+        assert!(parsed.semantic.contains("recipe"), "should contain recipe");
+        assert!(parsed.has_temporal);
+        assert!(parsed.keywords.contains(&"recipe".to_string()));
+    }
+
+    #[test]
+    fn source_app_with_temporal_works() {
+        let parsed = parse_query("from slack yesterday");
+        assert!(parsed.source_apps.iter().any(|a| a == "slack"));
+        assert!(parsed.has_temporal);
+    }
+
+    #[test]
+    fn auth_code_expansion() {
+        let parsed = parse_query("auth code");
+        assert!(parsed.keywords.contains(&"verification".to_string()));
+        assert!(parsed.keywords.contains(&"token".to_string()));
+    }
+
+    #[test]
+    fn error_expansion() {
+        let parsed = parse_query("error message");
+        assert!(parsed.keywords.contains(&"exception".to_string()));
+        assert!(parsed.keywords.contains(&"traceback".to_string()));
+    }
+
+    #[test]
+    fn receipt_expansion() {
+        let parsed = parse_query("receipt");
+        assert!(parsed.keywords.contains(&"payment".to_string()));
+        assert!(parsed.keywords.contains(&"total".to_string()));
+    }
+
+    #[test]
+    fn code_block_expansion() {
+        let parsed = parse_query("code block");
+        assert!(parsed.keywords.contains(&"snippet".to_string()));
+        assert!(parsed.keywords.contains(&"function".to_string()));
+    }
+
+    #[test]
+    fn meeting_link_expansion() {
+        let parsed = parse_query("meeting link");
+        assert!(parsed.keywords.contains(&"zoom".to_string()));
+        assert!(parsed.keywords.contains(&"invite".to_string()));
+    }
+
+    #[test]
+    fn todo_list_expansion() {
+        let parsed = parse_query("todo list");
+        assert!(parsed.keywords.contains(&"task".to_string()));
+        assert!(parsed.keywords.contains(&"checkbox".to_string()));
+    }
+
+    #[test]
+    fn docker_expansion() {
+        let parsed = parse_query("docker");
+        assert!(parsed.keywords.contains(&"container".to_string()));
+        assert!(parsed.keywords.contains(&"dockerfile".to_string()));
+    }
+
+    #[test]
+    fn endpoint_is_content_type() {
+        let parsed = parse_query("endpoint");
+        // "endpoint" is extracted as content_type="code" (matches RE_CONTENT_TYPE_CODE)
+        assert_eq!(parsed.content_type, Some("code".to_string()));
+    }
+
+    #[test]
+    fn address_expansion() {
+        let parsed = parse_query("address");
+        assert!(parsed.keywords.contains(&"street".to_string()));
+        assert!(parsed.keywords.contains(&"zip".to_string()));
+    }
+
+    #[test]
+    fn tracking_number_expansion() {
+        let parsed = parse_query("tracking number");
+        assert!(parsed.keywords.contains(&"shipment".to_string()));
+        assert!(parsed.keywords.contains(&"delivery".to_string()));
+    }
+
+    #[test]
+    fn password_expansion() {
+        let parsed = parse_query("password");
+        assert!(parsed.keywords.contains(&"username".to_string()));
+        assert!(parsed.keywords.contains(&"account".to_string()));
+    }
+
+    #[test]
+    fn calendar_event_expansion() {
+        let parsed = parse_query("calendar");
+        assert!(parsed.keywords.contains(&"schedule".to_string()));
+        assert!(parsed.keywords.contains(&"date".to_string()));
+    }
+
+    #[test]
+    fn screenshot_is_content_type() {
+        let parsed = parse_query("screenshot");
+        // "screenshot" is extracted as content_type="image", not as a keyword
+        assert_eq!(parsed.content_type, Some("image".to_string()));
+    }
+
+    #[test]
+    fn git_commit_expansion() {
+        let parsed = parse_query("git");
+        assert!(parsed.keywords.contains(&"repository".to_string()));
+        assert!(parsed.keywords.contains(&"merge".to_string()));
+    }
+
+    #[test]
+    fn spreadsheet_expansion() {
+        let parsed = parse_query("spreadsheet");
+        assert!(parsed.keywords.contains(&"cells".to_string()));
+        assert!(parsed.keywords.contains(&"formula".to_string()));
+    }
+
+    #[test]
+    fn presentation_expansion() {
+        let parsed = parse_query("presentation");
+        assert!(parsed.keywords.contains(&"slide".to_string()));
+        assert!(parsed.keywords.contains(&"deck".to_string()));
+    }
+
+    #[test]
+    fn chat_dm_expansion() {
+        let parsed = parse_query("chat");
+        assert!(parsed.keywords.contains(&"message".to_string()));
+        assert!(parsed.keywords.contains(&"conversation".to_string()));
+    }
+
+    #[test]
+    fn playlist_music_expansion() {
+        let parsed = parse_query("playlist");
+        assert!(parsed.keywords.contains(&"spotify".to_string()));
+        assert!(parsed.keywords.contains(&"track".to_string()));
+    }
+
+    #[test]
+    fn privacy_policy_expansion() {
+        let parsed = parse_query("privacy policy");
+        assert!(parsed.keywords.contains(&"privacy".to_string()));
+        assert!(parsed.keywords.contains(&"legal".to_string()));
+    }
+
+    #[test]
+    fn staging_server_expansion() {
+        let parsed = parse_query("staging server ip address");
+        assert!(parsed.keywords.contains(&"ip".to_string()));
+        assert!(parsed.keywords.contains(&"ssh".to_string()));
+    }
+
+    #[test]
+    fn apology_email_expansion() {
+        let parsed = parse_query("apology email");
+        assert!(parsed.keywords.contains(&"sorry".to_string()));
+        assert!(parsed.keywords.contains(&"followup".to_string()));
+    }
+
+    #[test]
+    fn tax_expansion() {
+        let parsed = parse_query("the number i copied when i was doing taxes");
+        assert!(parsed.keywords.contains(&"ssn".to_string()));
+        assert!(parsed.keywords.contains(&"refund".to_string()));
+    }
+
+    #[test]
+    fn cross_signal_query() {
+        let parsed = parse_query("auth code from slack yesterday");
+        assert!(parsed.keywords.contains(&"verification".to_string()));
+        assert!(parsed.source_apps.iter().any(|a| a == "slack"));
+        assert!(parsed.has_temporal);
+    }
+
+    #[test]
+    fn url_from_source() {
+        let parsed = parse_query("url from slack");
+        assert_eq!(parsed.content_type, Some("url".to_string()));
+        assert!(parsed.source_apps.iter().any(|a| a == "slack"));
+    }
+
+    #[test]
+    fn code_from_vscode() {
+        let parsed = parse_query("code from vscode");
+        // "code" matches both content_type and source_app, source_app wins
+        // because it's a more specific filter
+        assert!(parsed.source_apps.iter().any(|a| a == "visual studio code"));
     }
 }

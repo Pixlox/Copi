@@ -1,5 +1,3 @@
-import { useState, useEffect } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import { Pin } from "lucide-react";
 import { ClipResult } from "../hooks/useSearch";
 
@@ -7,8 +5,13 @@ interface ResultRowProps {
   result: ClipResult;
   isSelected: boolean;
   index: number;
+  query: string;
+  compactMode: boolean;
+  showAppIcons: boolean;
+  imageThumbnailData?: string | null;
   onClick: () => void;
   onDoubleClick: () => void;
+  appIcon?: string | null;
 }
 
 function timeAgo(timestamp: number): string {
@@ -38,34 +41,66 @@ function cleanPreview(text: string): string {
   return text.replace(/[\r\n]+/g, " ").replace(/\s+/g, " ").trim();
 }
 
-function ResultRow({ result, isSelected, index, onClick, onDoubleClick }: ResultRowProps) {
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function highlightMatches(text: string, query: string): string {
+  if (!query.trim()) return escapeHtml(text);
+  const terms = query.toLowerCase().split(/\s+/).filter(t => t.length >= 2);
+  let result = escapeHtml(text);
+  for (const term of terms) {
+    const regex = new RegExp(`(${escapeRegex(term)})`, "gi");
+    result = result.replace(regex, '<mark class="search-highlight">$1</mark>');
+  }
+  return result;
+}
+
+function extractSnippet(text: string, query: string, contextChars: number = 80): string {
+  const lower = text.toLowerCase();
+  const terms = query.toLowerCase().split(/\s+/).filter(t => t.length >= 2);
+  if (terms.length === 0) return text;
+
+  let bestPos = -1;
+  for (const term of terms) {
+    const pos = lower.indexOf(term);
+    if (pos !== -1) { bestPos = pos; break; }
+  }
+
+  if (bestPos === -1) return text;
+
+  const start = Math.max(0, bestPos - contextChars);
+  const end = Math.min(text.length, bestPos + contextChars + 20);
+  let snippet = text.slice(start, end);
+  if (start > 0) snippet = "..." + snippet;
+  if (end < text.length) snippet = snippet + "...";
+  return snippet;
+}
+
+function ResultRow({
+  result,
+  isSelected,
+  index,
+  query,
+  compactMode,
+  showAppIcons,
+  imageThumbnailData,
+  onClick,
+  onDoubleClick,
+  appIcon,
+}: ResultRowProps) {
   const badge = getTypeBadge(result.content_type);
-  const preview = cleanPreview(result.content);
-  const [imageThumbnail, setImageThumbnail] = useState<string | null>(result.image_thumbnail);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    setImageThumbnail(result.image_thumbnail ?? null);
-
-    if (result.content_type === "image" && !result.image_thumbnail) {
-      invoke<string | null>("get_image_thumbnail", { clipId: result.id })
-        .then((data) => {
-          if (!cancelled) {
-            setImageThumbnail(data ?? null);
-          }
-        })
-        .catch(() => {
-          if (!cancelled) {
-            setImageThumbnail(null);
-          }
-        });
-    }
-
-    return () => {
-      cancelled = true;
-    };
-  }, [result.content_type, result.id, result.image_thumbnail]);
+  const rawPreview = cleanPreview(result.content);
+  const preview = query.trim() ? extractSnippet(rawPreview, query) : rawPreview;
+  const imageThumbnail = imageThumbnailData ?? null;
 
   return (
     <div
@@ -94,14 +129,14 @@ function ResultRow({ result, isSelected, index, onClick, onDoubleClick }: Result
       <div className="flex-1 min-w-0 overflow-hidden">
         {result.content_type === "url" ? (
           <div className="flex flex-col min-w-0">
-            <span className="text-[13px] font-medium truncate" style={{ color: "var(--text-primary)" }}>{getDomain(result.content)}</span>
-            <span className="text-[11px] truncate" style={{ color: "var(--text-tertiary)" }}>{result.content}</span>
+            <span className={`${compactMode ? "text-[12px]" : "text-[13px]"} font-medium truncate`} style={{ color: "var(--text-primary)" }}>{getDomain(result.content)}</span>
+            <span className="text-[11px] truncate" style={{ color: "var(--text-tertiary)" }} dangerouslySetInnerHTML={{ __html: highlightMatches(preview, query) }} />
           </div>
         ) : result.content_type === "code" && result.content_highlighted ? (
           <div
             className="text-[12px] leading-snug line-clamp-2 overflow-hidden"
             style={{ color: "var(--text-secondary)" }}
-            dangerouslySetInnerHTML={{ __html: result.content_highlighted }}
+            dangerouslySetInnerHTML={{ __html: query.trim() ? highlightMatches(preview, query) : result.content_highlighted }}
           />
         ) : result.content_type === "image" ? (
           <div className="flex items-center gap-2.5 h-full">
@@ -123,14 +158,12 @@ function ResultRow({ result, isSelected, index, onClick, onDoubleClick }: Result
             <div className="flex flex-col min-w-0">
               <span className="text-[13px]" style={{ color: "var(--text-secondary)" }}>Image</span>
               {result.ocr_text && (
-                <span className="text-[11px] truncate" style={{ color: "var(--text-tertiary)" }}>{cleanPreview(result.ocr_text)}</span>
+                <span className="text-[11px] truncate" style={{ color: "var(--text-tertiary)" }} dangerouslySetInnerHTML={{ __html: highlightMatches(cleanPreview(result.ocr_text), query) }} />
               )}
             </div>
           </div>
         ) : (
-          <span className="text-[13px] leading-snug line-clamp-2 overflow-hidden block" style={{ color: "var(--text-secondary)" }}>
-            {preview}
-          </span>
+          <span className={`${compactMode ? "text-[12px]" : "text-[13px]"} leading-snug line-clamp-2 overflow-hidden block`} style={{ color: "var(--text-secondary)" }} dangerouslySetInnerHTML={{ __html: highlightMatches(preview, query) }} />
         )}
       </div>
 
@@ -152,17 +185,19 @@ function ResultRow({ result, isSelected, index, onClick, onDoubleClick }: Result
             <Pin size={10} strokeWidth={2.2} />
           </span>
         )}
-        <div className="w-4 h-4 flex items-center justify-center">
-          {result.source_app_icon ? (
-            <img
-              src={`data:image/png;base64,${result.source_app_icon}`}
-              alt=""
-              className="w-4 h-4 rounded-sm"
-            />
-          ) : (
-            <div className="w-4 h-4 rounded" style={{ background: "var(--surface-primary)" }} />
-          )}
-        </div>
+        {showAppIcons && (
+          <div className="w-4 h-4 flex items-center justify-center">
+            {appIcon ? (
+              <img
+                src={`data:image/png;base64,${appIcon}`}
+                alt=""
+                className="w-4 h-4 rounded-sm"
+              />
+            ) : (
+              <div className="w-4 h-4 rounded" style={{ background: "var(--surface-primary)" }} />
+            )}
+          </div>
+        )}
       </div>
     </div>
   );

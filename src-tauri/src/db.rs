@@ -3,7 +3,7 @@ use sqlite_vec::sqlite3_vec_init;
 use tauri::Manager;
 
 pub struct DbConnections {
-    pub read: Connection,
+    pub read_pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
     pub write: Connection,
 }
 
@@ -31,11 +31,31 @@ pub fn init_db(app: &tauri::AppHandle) -> Result<DbConnections> {
     write.pragma_update(None, "busy_timeout", 5000)?;
     write.pragma_update(None, "temp_store", "MEMORY")?;
 
-    // Reader connection — reads from WAL snapshot, never blocks on writes
-    let read = Connection::open(&db_path)?;
-    read.pragma_update(None, "journal_mode", "WAL")?;
-    read.pragma_update(None, "busy_timeout", 5000)?;
-    read.pragma_update(None, "temp_store", "MEMORY")?;
+    // Read pool — 4 concurrent read connections leveraging WAL mode
+    let manager = r2d2_sqlite::SqliteConnectionManager::file(&db_path)
+        .with_flags(
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_init(|c| {
+            c.pragma_update(None, "journal_mode", "WAL")
+                .map_err(|_| rusqlite::Error::ExecuteReturnedResults)?;
+            c.pragma_update(None, "busy_timeout", 5000)
+                .map_err(|_| rusqlite::Error::ExecuteReturnedResults)?;
+            c.pragma_update(None, "temp_store", "MEMORY")
+                .map_err(|_| rusqlite::Error::ExecuteReturnedResults)?;
+            Ok(())
+        });
+    let read_pool = r2d2::Pool::builder()
+        .max_size(4)
+        .build(manager)
+        .map_err(|e| {
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISUSE),
+                Some(format!("Failed to create read pool: {}", e)),
+            )
+        })?;
 
     // Schema + migrations (use writer connection)
     write.execute_batch(
@@ -73,7 +93,6 @@ pub fn init_db(app: &tauri::AppHandle) -> Result<DbConnections> {
     )?;
 
     // FTS5 table with prefix indexes for search-as-you-type
-    // Check if we need to rebuild (missing prefix config)
     let fts_needs_rebuild: bool = write
         .query_row(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='clips_fts'",
@@ -118,14 +137,14 @@ pub fn init_db(app: &tauri::AppHandle) -> Result<DbConnections> {
         ",
     )?;
 
-    // Vector embeddings table
+    // Vector embeddings table — 384 dims for multilingual-e5-small
     let needs_recreate: bool = write
         .query_row(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='clip_embeddings'",
             [],
             |row| {
                 let sql: String = row.get(0).unwrap_or_default();
-                Ok(!sql.contains("float[768]"))
+                Ok(!sql.contains("float[384]"))
             },
         )
         .unwrap_or(true);
@@ -133,7 +152,7 @@ pub fn init_db(app: &tauri::AppHandle) -> Result<DbConnections> {
     if needs_recreate {
         write.execute("DROP TABLE IF EXISTS clip_embeddings", [])?;
         write.execute(
-            "CREATE VIRTUAL TABLE clip_embeddings USING vec0(embedding float[768])",
+            "CREATE VIRTUAL TABLE clip_embeddings USING vec0(embedding float[384])",
             [],
         )?;
     }
@@ -151,7 +170,7 @@ pub fn init_db(app: &tauri::AppHandle) -> Result<DbConnections> {
     )?;
 
     const SEARCH_SCHEMA_VERSION_KEY: &str = "search_schema_version";
-    const SEARCH_SCHEMA_VERSION: &str = "v3";
+    const SEARCH_SCHEMA_VERSION: &str = "v4"; // bumped for e5-small model switch
     let recorded_schema_version: Option<String> = write
         .query_row(
             "SELECT value FROM settings WHERE key = ?1",
@@ -174,9 +193,9 @@ pub fn init_db(app: &tauri::AppHandle) -> Result<DbConnections> {
         eprintln!("[DB] FTS5 index rebuilt and search schema version refreshed");
     }
 
-    eprintln!("[DB] Database ready (dual connections, WAL mode)");
+    eprintln!("[DB] Database ready (pool={}, WAL mode)", 4);
 
-    Ok(DbConnections { read, write })
+    Ok(DbConnections { read_pool, write })
 }
 
 fn run_migrations(conn: &Connection) -> Result<()> {
@@ -225,5 +244,84 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    // Migrate existing raw RGBA images to PNG (saves ~10-20x space)
+    // Detect: image_data length > (image_width * image_height * 2) = likely raw RGBA
+    migrate_raw_images_to_png(conn)?;
+
     Ok(())
+}
+
+fn migrate_raw_images_to_png(conn: &Connection) -> Result<()> {
+    const MIGRATION_KEY: &str = "raw_rgba_to_png_v1_migrated";
+    let done: Option<String> = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            [MIGRATION_KEY],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    if done.is_some() {
+        return Ok(());
+    }
+
+    // Find images that are likely raw RGBA
+    let mut stmt = conn.prepare(
+        "SELECT id, image_data, image_width, image_height FROM clips
+         WHERE content_type = 'image' AND image_data IS NOT NULL AND image_width > 0 AND image_height > 0"
+    )?;
+
+    let images: Vec<(i64, Vec<u8>, i64, i64)> = stmt
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut migrated = 0usize;
+    for (id, data, width, height) in images {
+        let expected_rgba_size = (width * height * 4) as usize;
+        // If data size matches raw RGBA, convert to PNG
+        if data.len() >= expected_rgba_size && data.len() <= expected_rgba_size + 1024 {
+            if let Some(png_bytes) = rgba_to_png_bytes(&data, width as usize, height as usize) {
+                let _ = conn.execute(
+                    "UPDATE clips SET image_data = ?1 WHERE id = ?2",
+                    rusqlite::params![png_bytes, id],
+                );
+                migrated += 1;
+            }
+        }
+    }
+
+    conn.execute(
+        "INSERT OR REPLACE INTO settings(key, value) VALUES (?1, '1')",
+        [MIGRATION_KEY],
+    )?;
+
+    if migrated > 0 {
+        eprintln!("[DB] Migrated {} raw RGBA images to PNG", migrated);
+    }
+
+    Ok(())
+}
+
+fn rgba_to_png_bytes(bytes: &[u8], width: usize, height: usize) -> Option<Vec<u8>> {
+    let mut png_bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut png_bytes, width as u32, height as u32);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        if let Ok(mut writer) = encoder.write_header() {
+            if writer.write_image_data(bytes).is_err() {
+                return None;
+            }
+        } else {
+            return None;
+        }
+    }
+    if png_bytes.is_empty() {
+        None
+    } else {
+        Some(png_bytes)
+    }
 }

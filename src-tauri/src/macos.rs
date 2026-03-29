@@ -141,6 +141,18 @@ fn dirs_cache_dir() -> Option<std::path::PathBuf> {
     None
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) fn get_pasteboard_change_count() -> i64 {
+    use objc2_app_kit::NSPasteboard;
+    let pb = NSPasteboard::generalPasteboard();
+    pb.changeCount() as i64
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn get_pasteboard_change_count() -> i64 {
+    0
+}
+
 fn sanitize_filename(name: &str) -> String {
     name.chars()
         .map(|c| {

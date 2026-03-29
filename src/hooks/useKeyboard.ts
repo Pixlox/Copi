@@ -13,11 +13,13 @@ interface UseKeyboardOptions {
   onCopy: (index: number) => void;
   onPaste: (index: number) => void;
   onNumberCopy: (resultIndex: number) => void;
+  defaultEnterAction: "copy" | "paste";
   onFilterCycle: () => void;
   onDelete: (index: number) => void;
   onPin: (index: number) => void;
   onCloseActions: () => void;
   onActions: (index: number) => void;
+  onToggleDetail: () => void;
 }
 
 export function useKeyboard({
@@ -32,11 +34,13 @@ export function useKeyboard({
   onCopy,
   onPaste,
   onNumberCopy,
+  defaultEnterAction,
   onFilterCycle,
   onDelete,
   onPin,
   onCloseActions,
   onActions,
+  onToggleDetail,
 }: UseKeyboardOptions) {
   const handleKeyDown = useCallback(
     (e: KeyboardEvent) => {
@@ -68,17 +72,16 @@ export function useKeyboard({
       if (actionsOpen) {
         if (e.key === "ArrowDown" || e.key === "ArrowRight") {
           e.preventDefault();
-          if (actionCount > 0) {
-            onSelectAction(Math.min(selectedActionIndex + 1, actionCount - 1));
-          }
           return;
         }
 
         if (e.key === "ArrowUp" || e.key === "ArrowLeft") {
           e.preventDefault();
-          if (actionCount > 0) {
-            onSelectAction(Math.max(selectedActionIndex - 1, 0));
-          }
+          return;
+        }
+
+        if (e.key === "Enter") {
+          e.preventDefault();
           return;
         }
 
@@ -86,38 +89,6 @@ export function useKeyboard({
           e.preventDefault();
           onCloseActions();
           return;
-        }
-
-        if (e.key === "d" && isMeta) {
-          e.preventDefault();
-          if (selectedIndex >= 0 && selectedIndex < resultCount) {
-            onDelete(selectedIndex);
-          }
-          return;
-        }
-
-        if (e.key === "p" && isMeta) {
-          e.preventDefault();
-          if (selectedIndex >= 0 && selectedIndex < resultCount) {
-            onPin(selectedIndex);
-          }
-          return;
-        }
-
-        if (e.key === "Enter" && e.shiftKey) {
-          e.preventDefault();
-          if (selectedIndex >= 0 && selectedIndex < resultCount) {
-            onCopy(selectedIndex);
-            onCloseActions();
-          }
-          return;
-        }
-
-        if (e.key === "Enter" && !isMeta) {
-          e.preventDefault();
-          if (selectedActionIndex >= 0 && selectedActionIndex < actionCount) {
-            onAction(selectedActionIndex);
-          }
         }
         return;
       }
@@ -142,7 +113,11 @@ export function useKeyboard({
       if (e.key === "Enter" && !e.shiftKey && !isMeta) {
         e.preventDefault();
         if (selectedIndex >= 0 && selectedIndex < resultCount) {
-          onPaste(selectedIndex);
+          if (defaultEnterAction === "copy") {
+            onCopy(selectedIndex);
+          } else {
+            onPaste(selectedIndex);
+          }
         }
         return;
       }
@@ -190,6 +165,13 @@ export function useKeyboard({
         return;
       }
 
+      // Cmd+I - toggle detail/preview panel
+      if (e.key === "i" && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        onToggleDetail();
+        return;
+      }
+
       // Cmd+P - pin/unpin
       if (e.key === "p" && (e.metaKey || e.ctrlKey)) {
         e.preventDefault();
@@ -211,11 +193,13 @@ export function useKeyboard({
       onCopy,
       onPaste,
       onNumberCopy,
+      defaultEnterAction,
       onFilterCycle,
       onDelete,
       onPin,
       onCloseActions,
       onActions,
+      onToggleDetail,
     ]
   );
 

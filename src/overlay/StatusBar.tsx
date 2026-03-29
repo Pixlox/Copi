@@ -38,11 +38,24 @@ function detectFilters(query: string): string[] {
 }
 
 function formatSearchStatus(status: SearchStatus): string | null {
-  if (status.phase === "backfill_embeddings" && status.totalItems > 0) {
-    return `Semantic ${status.completedItems}/${status.totalItems}`;
+  if (status.phase === "indexing" && status.totalItems > 0) {
+    const processed = Math.min(status.totalItems, status.completedItems + status.failedItems);
+    if (status.failedItems > 0) {
+      return `Indexing ${processed}/${status.totalItems} (${status.failedItems} failed)`;
+    }
+    return `Indexing ${processed}/${status.totalItems}`;
   }
-  if (!status.semanticReady) {
-    return "Semantic warming";
+  if (status.phase === "starting") {
+    return "Preparing search...";
+  }
+  if (status.phase === "unavailable") {
+    return "Semantic unavailable";
+  }
+  if (status.phase === "error") {
+    return "Semantic index error";
+  }
+  if (!status.semanticReady && status.phase === "idle") {
+    return "Semantic pending";
   }
   return null;
 }

@@ -89,21 +89,28 @@ export default function CollectionSidebar({
                 />
               </div>
             ) : (
-              <button
-                type="button"
-                data-no-drag
-                onClick={() => onSelect(col.id)}
+                <div
+                  data-no-drag
+                  onClick={() => onSelect(col.id)}
                 onContextMenu={(e) => {
                   e.preventDefault();
                   setRenamingId(col.id);
                   setRenameValue(col.name);
                 }}
-                className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-[12px] transition-colors"
-                style={{
-                  background: selectedId === col.id ? "var(--surface-active)" : "transparent",
-                  color: selectedId === col.id ? "var(--text-primary)" : "var(--text-secondary)",
-                }}
-              >
+                  className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-[12px] transition-colors cursor-pointer"
+                  style={{
+                    background: selectedId === col.id ? "var(--surface-active)" : "transparent",
+                    color: selectedId === col.id ? "var(--text-primary)" : "var(--text-secondary)",
+                  }}
+                  role="button"
+                  tabIndex={0}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      onSelect(col.id);
+                    }
+                  }}
+                >
                 <Folder size={13} style={{ color: col.color }} />
                 <span className="flex-1 truncate text-left">{col.name}</span>
                 <span
@@ -112,22 +119,22 @@ export default function CollectionSidebar({
                 >
                   {col.clip_count}
                 </span>
-                <button
-                  type="button"
-                  data-no-drag
+                  <button
+                    type="button"
+                    data-no-drag
                   onClick={(e) => {
                     e.stopPropagation();
                     onDelete(col.id);
                   }}
                   className="hidden rounded p-0.5 group-hover:block"
                   style={{ color: "var(--text-tertiary)" }}
-                >
-                  <X size={10} />
-                </button>
-              </button>
-            )}
-          </div>
-        ))}
+                  >
+                    <X size={10} />
+                  </button>
+                </div>
+              )}
+            </div>
+          ))}
       </div>
 
       {/* Create collection */}
