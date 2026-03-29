@@ -531,6 +531,7 @@ impl OcrEngine for WindowsMediaOcr {
                 let mut capacity: u32 = 0;
                 mem_buffer
                     .GetBuffer(&mut data_ptr, &mut capacity)
+                    .ok()
                     .map_err(|e| format!("Failed to get buffer pointer: {}", e))?;
 
                 if capacity as usize >= bgra_data.len() {
