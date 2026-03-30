@@ -1213,6 +1213,14 @@ input::placeholder {
   color: var(--text-secondary);
 }
 
+.settings-attribution {
+  margin-top: 8px;
+  text-align: center;
+  font-size: 11px;
+  color: var(--text-tertiary);
+  user-select: none;
+}
+
 /* ═══ Settings Chips (for collections) ═════════════════════════════ */
 
 .settings-chips {

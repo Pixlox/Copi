@@ -415,6 +415,8 @@ function DataSection({
           </button>
         </SettingRow>
       </SettingCard>
+
+      <div className="settings-attribution">Made with {"<3"} by Pixlox</div>
     </>
   );
 }
