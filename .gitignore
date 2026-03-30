@@ -23,6 +23,8 @@ release-helper.sh
 *.p12
 *.pfx
 
+docs/
+
 src-tauri/gen/
 
 models/
