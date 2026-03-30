@@ -55,6 +55,19 @@ fn log_startup_line(message: &str) {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn mark_overlay_blur_ignore(app: &tauri::AppHandle, duration_ms: u64) {
+    if let Some(state) = app.try_state::<AppState>() {
+        let deadline = current_time_millis().saturating_add(duration_ms);
+        let existing = state.overlay_drag_ignore_until_ms.load(Ordering::Relaxed);
+        if deadline > existing {
+            state
+                .overlay_drag_ignore_until_ms
+                .store(deadline, Ordering::Relaxed);
+        }
+    }
+}
+
 pub struct AppState {
     pub db_read_pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
     pub db_write: Mutex<rusqlite::Connection>,
@@ -65,6 +78,7 @@ pub struct AppState {
     pub clipboard_watcher_running: Mutex<bool>,
     pub previous_frontmost_app: Mutex<Option<String>>,
     pub previous_foreground_window: Mutex<Option<isize>>,
+    pub overlay_drag_ignore_until_ms: AtomicU64,
     pub search_generation: AtomicU64,
     pub runtime_started: AtomicBool,
     pub search_status: Mutex<search::SearchStatusPayload>,
@@ -130,12 +144,43 @@ fn main() {
                 }
             }
             tauri::WindowEvent::Focused(focused) => {
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
                 if _window.label() == "overlay" && !*focused {
+                    #[cfg(target_os = "windows")]
+                    if should_ignore_overlay_blur(_window.app_handle()) {
+                        return;
+                    }
                     hide_overlay_inner(_window.app_handle(), false);
                 }
+
+                #[cfg(target_os = "windows")]
+                if _window.label() == "overlay" && !*focused {
+                    let app_handle = _window.app_handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(140)).await;
+
+                        if should_ignore_overlay_blur(&app_handle) {
+                            return;
+                        }
+
+                        if let Some(window) = app_handle.get_webview_window("overlay") {
+                            if window.is_focused().unwrap_or(false) {
+                                return;
+                            }
+                        }
+
+                        hide_overlay_inner(&app_handle, false);
+                    });
+                }
+
                 #[cfg(target_os = "macos")]
                 let _ = focused;
+            }
+            #[cfg(target_os = "windows")]
+            tauri::WindowEvent::Resized(_) => {
+                if _window.label() == "overlay" {
+                    mark_overlay_blur_ignore(_window.app_handle(), 700);
+                }
             }
             _ => {}
         })
@@ -245,6 +290,7 @@ fn main() {
                 clipboard_watcher_running: Mutex::new(true),
                 previous_frontmost_app: Mutex::new(None),
                 previous_foreground_window: Mutex::new(None),
+                overlay_drag_ignore_until_ms: AtomicU64::new(0),
                 search_generation: AtomicU64::new(0),
                 runtime_started: AtomicBool::new(false),
                 search_status: Mutex::new(search::SearchStatusPayload {
@@ -525,6 +571,7 @@ fn main() {
             hide_setup_window,
             show_overlay,
             hide_overlay,
+            set_overlay_drag_state,
             settings::get_config,
             settings::set_config,
             settings::get_db_size,
@@ -566,6 +613,23 @@ fn is_setup_required(app: &tauri::AppHandle) -> bool {
                 .map(|status| status.setup_required)
         })
         .unwrap_or(true)
+}
+
+#[cfg(target_os = "windows")]
+fn current_time_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[cfg(target_os = "windows")]
+fn should_ignore_overlay_blur(app: &tauri::AppHandle) -> bool {
+    let deadline = app
+        .try_state::<AppState>()
+        .map(|state| state.overlay_drag_ignore_until_ms.load(Ordering::Relaxed))
+        .unwrap_or(0);
+    deadline > current_time_millis()
 }
 
 fn app_state_ready(app: &tauri::AppHandle) -> bool {
@@ -869,6 +933,27 @@ fn show_overlay(app: tauri::AppHandle) {
 #[tauri::command]
 fn hide_overlay(app: tauri::AppHandle, paste: bool) {
     hide_overlay_inner(&app, paste);
+}
+
+#[tauri::command]
+fn set_overlay_drag_state(app: tauri::AppHandle, active: bool) {
+    #[cfg(target_os = "windows")]
+    if let Some(state) = app.try_state::<AppState>() {
+        let deadline = if active {
+            current_time_millis() + 900
+        } else {
+            current_time_millis() + 180
+        };
+        state
+            .overlay_drag_ignore_until_ms
+            .store(deadline, Ordering::Relaxed);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = app;
+        let _ = active;
+    }
 }
 #[tauri::command]
 fn hide_setup_window(app: tauri::AppHandle) {

@@ -343,13 +343,23 @@ function Overlay() {
     const dy = e.clientY - dragStart.current.y;
     if (!isDragging.current && (Math.abs(dx) > 3 || Math.abs(dy) > 3)) {
       isDragging.current = true;
-      getCurrentWindow().startDragging();
+      void invoke("set_overlay_drag_state", { active: true });
+      getCurrentWindow()
+        .startDragging()
+        .finally(() => invoke("set_overlay_drag_state", { active: false }).catch(() => undefined));
     }
   }, []);
 
   const onMouseUp = useCallback(() => {
     dragStart.current = null;
     isDragging.current = false;
+    void invoke("set_overlay_drag_state", { active: false });
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      void invoke("set_overlay_drag_state", { active: false });
+    };
   }, []);
 
   return (
