@@ -353,6 +353,10 @@ input, button, .filter-pill, select, textarea {
   background: var(--surface-primary);
 }
 
+.setup-status-icon--success {
+  background: transparent;
+}
+
 .setup-icon {
   color: var(--text-secondary);
 }
@@ -434,6 +438,663 @@ input, button, .filter-pill, select, textarea {
 
 .setup-button-primary:hover {
   background: #0070e0;
+}
+
+/* ═══ Launch Experience (Cinematic Onboarding) ═════════════════════ */
+
+/* Animation Variables */
+:root {
+  --launch-glow-color: rgba(180, 140, 200, 0.12);
+  --launch-particle-color: rgba(180, 140, 200, 0.25);
+  --launch-accent: #0A84FF;
+  --launch-success: #28a745;
+}
+
+/* ─── Particles Background ─────────────────────────────────────────── */
+
+.launch-particles {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 1s ease-out;
+}
+
+.launch-particles--visible {
+  opacity: 1;
+}
+
+.launch-particle {
+  position: absolute;
+  border-radius: 50%;
+  background: radial-gradient(circle at 30% 30%, 
+    rgba(192, 156, 206, 0.22), 
+    rgba(168, 126, 188, 0.1) 50%, 
+    transparent 70%);
+  filter: blur(2.5px);
+  will-change: transform;
+}
+
+/* Different drift patterns for variety */
+@keyframes particle-drift-1 {
+  0%, 100% {
+    transform: translate(0, 0) scale(1);
+  }
+  25% {
+    transform: translate(30px, -40px) scale(1.1);
+  }
+  50% {
+    transform: translate(-20px, -80px) scale(0.9);
+  }
+  75% {
+    transform: translate(40px, -40px) scale(1.05);
+  }
+}
+
+@keyframes particle-drift-2 {
+  0%, 100% {
+    transform: translate(0, 0) rotate(0deg);
+  }
+  33% {
+    transform: translate(-50px, -30px) rotate(120deg);
+  }
+  66% {
+    transform: translate(30px, -60px) rotate(240deg);
+  }
+}
+
+@keyframes particle-drift-3 {
+  0%, 100% {
+    transform: translateY(0) scale(1);
+    opacity: var(--particle-opacity, 0.3);
+  }
+  50% {
+    transform: translateY(-100px) scale(1.2);
+    opacity: calc(var(--particle-opacity, 0.3) * 1.5);
+  }
+}
+
+.launch-particle--drift-1 {
+  animation: particle-drift-1 var(--particle-duration, 25s) ease-in-out infinite;
+}
+
+.launch-particle--drift-2 {
+  animation: particle-drift-2 var(--particle-duration, 25s) ease-in-out infinite;
+}
+
+.launch-particle--drift-3 {
+  animation: particle-drift-3 var(--particle-duration, 25s) ease-in-out infinite;
+}
+
+/* Ambient center glow */
+.launch-ambient-glow {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 400px;
+  height: 400px;
+  transform: translate(-50%, -50%);
+  background: radial-gradient(circle, rgba(172, 132, 194, 0.05) 0%, transparent 72%);
+  opacity: 0.45;
+  pointer-events: none;
+}
+
+/* ─── Logo Assembly Animation ──────────────────────────────────────── */
+
+.launch-logo-container {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.launch-logo {
+  width: 120px;
+  height: 120px;
+  filter: drop-shadow(0 8px 32px rgba(0, 0, 0, 0.3));
+}
+
+/* Back clipboard - enters from right */
+.launch-logo-back {
+  opacity: 0;
+  transform: translateX(60px) rotate(8deg);
+  transition: all 500ms cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+.launch-logo-back--visible {
+  opacity: 1;
+  transform: translateX(0) rotate(0deg);
+}
+
+/* Front clipboard - enters from left */
+.launch-logo-front {
+  opacity: 0;
+  transform: translateX(-60px) rotate(-8deg);
+  transition: all 500ms cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+.launch-logo-front--visible {
+  opacity: 1;
+  transform: translateX(0) rotate(0deg);
+}
+
+/* Text lines - fade in with stagger */
+.launch-logo-lines {
+  opacity: 0;
+  transform: scaleX(0);
+  transform-origin: left center;
+}
+
+.launch-logo-lines--visible {
+  animation: logo-lines-appear 400ms ease-out forwards;
+}
+
+.launch-logo-lines--visible rect {
+  animation: logo-line-item 300ms ease-out forwards;
+  opacity: 0;
+}
+
+.launch-logo-lines--visible rect:nth-child(1) { animation-delay: 0ms; }
+.launch-logo-lines--visible rect:nth-child(2) { animation-delay: 80ms; }
+.launch-logo-lines--visible rect:nth-child(3) { animation-delay: 160ms; }
+
+@keyframes logo-lines-appear {
+  0% {
+    opacity: 0;
+    transform: scaleX(0);
+  }
+  100% {
+    opacity: 1;
+    transform: scaleX(1);
+  }
+}
+
+@keyframes logo-line-item {
+  0% {
+    opacity: 0;
+    transform: translateX(-10px);
+  }
+  100% {
+    opacity: 0.15;
+    transform: translateX(0);
+  }
+}
+
+/* Background glow on complete - subtle */
+.launch-logo-bg--glow {
+  /* No glow effect - keeping it clean */
+}
+
+/* Glow ring around logo - disabled */
+.launch-logo-glow-ring {
+  display: none;
+}
+
+/* ─── Typewriter Effect ────────────────────────────────────────────── */
+
+.launch-typewriter {
+  display: inline-flex;
+  align-items: center;
+}
+
+.launch-typewriter-text {
+  opacity: 0;
+  animation: typewriter-fade-in 360ms ease-out forwards;
+}
+
+@keyframes typewriter-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.launch-typewriter-cursor {
+  display: inline-block;
+  margin-left: 1px;
+  color: var(--text-tertiary);
+  font-weight: 300;
+  opacity: 0.35;
+  animation: cursor-blink 1000ms ease-in-out infinite;
+}
+
+.launch-typewriter-cursor--typing {
+  animation: none;
+  opacity: 0.8;
+}
+
+@keyframes cursor-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+/* ─── Progress Wave Animation ──────────────────────────────────────── */
+
+.launch-progress {
+  position: relative;
+  width: 100%;
+}
+
+.launch-progress-track {
+  height: 6px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.1);
+  overflow: hidden;
+  position: relative;
+}
+
+.launch-progress-fill {
+  position: absolute;
+  inset: 0;
+  transform-origin: left center;
+  background: linear-gradient(90deg, 
+    var(--launch-accent), 
+    #5AC8FA, 
+    var(--launch-accent));
+  background-size: 200% 100%;
+  animation: progress-gradient-shift 3s linear infinite;
+  border-radius: inherit;
+  transition: transform 300ms ease-out;
+}
+
+@keyframes progress-gradient-shift {
+  0% { background-position: 0% 50%; }
+  100% { background-position: 200% 50%; }
+}
+
+.launch-progress-shimmer {
+  display: none;
+}
+
+.launch-progress-wave--indeterminate {
+  position: absolute;
+  height: 100%;
+  width: 40%;
+  background: linear-gradient(90deg, 
+    transparent, 
+    var(--launch-accent), 
+    #5AC8FA, 
+    var(--launch-accent), 
+    transparent);
+  border-radius: inherit;
+  animation: progress-wave-move 1.5s ease-in-out infinite;
+}
+
+@keyframes progress-wave-move {
+  0% { left: -40%; }
+  100% { left: 100%; }
+}
+
+.launch-progress-glow {
+  position: absolute;
+  bottom: -4px;
+  left: 0;
+  right: 0;
+  height: 10px;
+  background: linear-gradient(to top, var(--launch-glow-color), transparent);
+  filter: blur(10px);
+  transition: opacity 300ms ease;
+  pointer-events: none;
+}
+
+/* ─── Success Burst Effect ─────────────────────────────────────────── */
+
+.launch-burst {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 1px;
+  height: 1px;
+  pointer-events: none;
+}
+
+.launch-burst-particle {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  border-radius: 50%;
+  background: radial-gradient(circle, #fff 0%, var(--launch-success) 50%, transparent 100%);
+  transform: translate(-50%, -50%);
+  animation: burst-particle-fly 500ms cubic-bezier(0.25, 0.46, 0.45, 0.94) forwards;
+}
+
+@keyframes burst-particle-fly {
+  0% {
+    transform: translate(-50%, -50%) scale(1);
+    opacity: 1;
+  }
+  100% {
+    transform: translate(
+      calc(-50% + var(--burst-x, 0px)), 
+      calc(-50% + var(--burst-y, 0px))
+    ) scale(0);
+    opacity: 0;
+  }
+}
+
+.launch-burst-flash {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 100px;
+  height: 100px;
+  transform: translate(-50%, -50%);
+  background: radial-gradient(circle, rgba(50, 215, 75, 0.6) 0%, transparent 70%);
+  border-radius: 50%;
+  animation: burst-flash 400ms ease-out forwards;
+}
+
+@keyframes burst-flash {
+  0% {
+    transform: translate(-50%, -50%) scale(0);
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.8;
+  }
+  100% {
+    transform: translate(-50%, -50%) scale(2);
+    opacity: 0;
+  }
+}
+
+/* ─── Animated Checkmark ───────────────────────────────────────────── */
+
+.launch-checkmark {
+  width: 48px;
+  height: 48px;
+}
+
+.setup-status-icon--success .launch-checkmark {
+  width: 44px;
+  height: 44px;
+}
+
+.launch-checkmark-circle {
+  fill: none;
+  stroke: var(--launch-success);
+  stroke-width: 2;
+  stroke-dasharray: 166;
+  stroke-dashoffset: 166;
+  animation: checkmark-circle 600ms ease-out forwards;
+}
+
+.launch-checkmark-check {
+  fill: none;
+  stroke: var(--launch-success);
+  stroke-width: 3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-dasharray: 48;
+  stroke-dashoffset: 48;
+  animation: checkmark-check 400ms ease-out 400ms forwards;
+}
+
+@keyframes checkmark-circle {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+@keyframes checkmark-check {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+/* ─── Download Icon Animations ─────────────────────────────────────── */
+
+.launch-download-icon {
+  color: var(--text-secondary);
+  transition: all 300ms ease;
+}
+
+.launch-download-icon--active {
+  color: var(--launch-accent);
+  animation: download-bounce 1s ease-in-out infinite;
+}
+
+@keyframes download-bounce {
+  0%, 100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(3px);
+  }
+}
+
+/* Spinning loader */
+.launch-spinner {
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ─── Card Animations ──────────────────────────────────────────────── */
+
+.launch-card {
+  opacity: 0;
+  transform: translateY(30px);
+  transition: all 620ms cubic-bezier(0.22, 0.84, 0.32, 1);
+}
+
+.launch-card--visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.launch-card .setup-status-text,
+.launch-card .setup-explanation,
+.launch-card .setup-button,
+.launch-card .launch-progress {
+  opacity: 0;
+  transform: translateY(6px);
+  transition: opacity 280ms ease, transform 280ms ease;
+}
+
+.launch-card--visible .setup-status-text,
+.launch-card--visible .setup-explanation,
+.launch-card--visible .setup-button,
+.launch-card--visible .launch-progress {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.launch-card--visible .setup-status-text { transition-delay: 80ms; }
+.launch-card--visible .setup-explanation { transition-delay: 120ms; }
+.launch-card--visible .launch-progress { transition-delay: 150ms; }
+.launch-card--visible .setup-button { transition-delay: 170ms; }
+
+.launch-card--success {
+  border-color: rgba(40, 167, 69, 0.2) !important;
+}
+
+/* ─── Button Animations ────────────────────────────────────────────── */
+
+.launch-button {
+  position: relative;
+  overflow: hidden;
+  transition: all 200ms ease;
+}
+
+.launch-button:hover {
+  transform: translateY(-0.5px);
+}
+
+.launch-button:active {
+  transform: translateY(0);
+}
+
+.launch-button--success { background: #249a5f !important; }
+
+/* ─── Container ────────────────────────────────────────────────────── */
+
+.launch-container {
+  transition: all 220ms ease;
+}
+
+/* ─── Title Animations ─────────────────────────────────────────────── */
+
+.launch-title {
+  font-size: 28px;
+  font-weight: 600;
+  letter-spacing: -0.03em;
+  margin: 0;
+  opacity: 0;
+  transform: translateY(20px) scale(0.95);
+  filter: blur(8px);
+  transition: all 600ms cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+.launch-title--visible {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+  filter: blur(0);
+}
+
+.launch-tagline {
+  font-size: 15px;
+  color: var(--text-secondary);
+  margin: 0;
+  opacity: 0;
+  transform: translateY(10px);
+  transition: all 400ms ease-out;
+}
+
+.launch-tagline--visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* ─── Hotkey Badge Animation ───────────────────────────────────────── */
+
+.launch-hotkey {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 12px;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  font-size: 13px;
+  color: var(--text-primary);
+  opacity: 0;
+  transform: translateY(10px);
+  transition: all 400ms ease-out;
+}
+
+.launch-hotkey--visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.launch-hotkey kbd {
+  padding: 2px 6px;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 4px;
+  font-size: 12px;
+}
+
+/* ─── Stage Transitions ────────────────────────────────────────────── */
+
+.launch-stage {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 24px;
+}
+
+.launch-stage-branding {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  text-align: center;
+}
+
+.launch-stage-action {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 20px;
+  min-height: 180px;
+}
+
+/* ─── Window Fade In ───────────────────────────────────────────────── */
+
+@keyframes window-fade-in {
+  0% {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.launch-window {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 100%;
+  overflow: hidden;
+  border-radius: 16px;
+  background: rgba(20, 20, 22, 0.85);
+  color: var(--text-primary);
+  cursor: default;
+  opacity: 0;
+  transform: scale(0.975) translateY(8px);
+  filter: blur(8px);
+  transition: opacity 360ms cubic-bezier(0.22, 0.84, 0.32, 1),
+              transform 360ms cubic-bezier(0.22, 0.84, 0.32, 1),
+              filter 360ms cubic-bezier(0.22, 0.84, 0.32, 1);
+}
+
+.launch-window--visible {
+  opacity: 1;
+  transform: scale(1) translateY(0);
+  filter: blur(0);
+}
+
+.platform-windows .launch-window {
+  background: rgba(24, 24, 27, 0.98);
+}
+
+.light .launch-window {
+  background: rgba(250, 250, 252, 0.92);
+}
+
+/* Light mode particle adjustments */
+.light .launch-particle {
+  background: radial-gradient(circle at 30% 30%, 
+    rgba(168, 128, 186, 0.18), 
+    rgba(144, 104, 164, 0.08) 50%, 
+    transparent 70%);
+}
+
+.light .launch-ambient-glow {
+  background: radial-gradient(circle, rgba(160, 120, 180, 0.04) 0%, transparent 72%);
+}
+
+.light .launch-hotkey {
+  background: rgba(0, 0, 0, 0.04);
+  border-color: rgba(0, 0, 0, 0.08);
+}
+
+.light .launch-hotkey kbd {
+  background: rgba(0, 0, 0, 0.06);
+}
+
+.light .launch-title {
+  color: var(--text-primary);
 }
 
 /* ═══ Code block ═══════════════════════════════════════════════════ */
