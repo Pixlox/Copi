@@ -20,6 +20,41 @@ mod query_parser;
 mod search;
 mod settings;
 
+#[cfg(target_os = "windows")]
+fn startup_log_path() -> std::path::PathBuf {
+    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+        return std::path::PathBuf::from(local_app_data)
+            .join("com.copi.app")
+            .join("logs")
+            .join("startup.log");
+    }
+
+    std::env::temp_dir().join("copi").join("logs").join("startup.log")
+}
+
+#[cfg(target_os = "windows")]
+fn log_startup_line(message: &str) {
+    use std::io::Write;
+
+    let path = startup_log_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "[{}] {}", timestamp, message);
+    }
+}
+
 pub struct AppState {
     pub db_read_pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
     pub db_write: Mutex<rusqlite::Connection>,
@@ -63,17 +98,29 @@ tauri_panel! {
 }
 
 fn main() {
+    #[cfg(target_os = "windows")]
+    log_startup_line("=== Copi launch started ===");
+
+    std::panic::set_hook(Box::new(|info| {
+        #[cfg(target_os = "windows")]
+        {
+            let payload = info
+                .payload()
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| info.payload().downcast_ref::<String>().map(|s| s.as_str()))
+                .unwrap_or("unknown panic payload");
+            let location = info
+                .location()
+                .map(|loc| format!("{}:{}", loc.file(), loc.line()))
+                .unwrap_or_else(|| "unknown location".to_string());
+            log_startup_line(&format!("panic at {}: {}", location, payload));
+            let backtrace = std::backtrace::Backtrace::force_capture();
+            log_startup_line(&format!("backtrace: {}", backtrace));
+        }
+    }));
+
     tauri::Builder::default()
-        .plugin(
-            tauri_plugin_global_shortcut::Builder::new()
-                .with_handler(|app, shortcut, event| {
-                    let _ = shortcut;
-                    if event.state == ShortcutState::Pressed {
-                        toggle_overlay(app);
-                    }
-                })
-                .build(),
-        )
         .on_window_event(|_window, event| match event {
             tauri::WindowEvent::CloseRequested { api, .. } => {
                 if matches!(_window.label(), "settings" | "setup") {
@@ -93,6 +140,9 @@ fn main() {
             _ => {}
         })
         .setup(|app| {
+            #[cfg(target_os = "windows")]
+            log_startup_line("setup entered");
+
             #[cfg(target_os = "macos")]
             {
                 let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
@@ -112,18 +162,46 @@ fn main() {
             // Desktop plugins
             #[cfg(desktop)]
             {
-                handle.plugin(tauri_plugin_updater::Builder::new().build())?;
-                handle.plugin(tauri_plugin_dialog::init())?;
-                handle.plugin(tauri_plugin_process::init())?;
-                let autostart_builder = tauri_plugin_autostart::Builder::new().app_name("Copi");
-                #[cfg(target_os = "macos")]
-                let autostart_builder = autostart_builder
-                    .macos_launcher(tauri_plugin_autostart::MacosLauncher::LaunchAgent);
-                handle.plugin(autostart_builder.build())?;
+                let plugin_init_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+                    handle.plugin(tauri_plugin_updater::Builder::new().build())?;
+                    handle.plugin(tauri_plugin_dialog::init())?;
+                    handle.plugin(tauri_plugin_process::init())?;
+                    let autostart_builder =
+                        tauri_plugin_autostart::Builder::new().app_name("Copi");
+                    #[cfg(target_os = "macos")]
+                    let autostart_builder = autostart_builder
+                        .macos_launcher(tauri_plugin_autostart::MacosLauncher::LaunchAgent);
+                    handle.plugin(autostart_builder.build())?;
+                    Ok(())
+                })();
+
+                #[cfg(target_os = "windows")]
+                {
+                    if let Err(error) = plugin_init_result {
+                        eprintln!("[Copi] Plugin init failed: {}", error);
+                        log_startup_line(&format!("plugin init failed: {}", error));
+                    } else {
+                        log_startup_line("plugins initialized");
+                    }
+                }
+
+                #[cfg(not(target_os = "windows"))]
+                plugin_init_result?;
             }
 
             // Initialize database (dual connections for read/write separation)
-            let db_conns = db::init_db(&handle).expect("Failed to initialize database");
+            let db_conns = match db::init_db(&handle) {
+                Ok(conns) => {
+                    #[cfg(target_os = "windows")]
+                    log_startup_line("database initialized");
+                    conns
+                }
+                Err(error) => {
+                    #[cfg(target_os = "windows")]
+                    log_startup_line(&format!("database init failed: {}", error));
+                    return Err(Box::new(error));
+                }
+            };
             let (clip_tx, clip_rx) = tokio::sync::mpsc::channel::<i64>(512);
             if let Err(error) = model_setup::migrate_legacy_model_dir(&handle) {
                 eprintln!("[Copi] Model migration: {}", error);
@@ -213,6 +291,30 @@ fn main() {
                 tray_icon: Mutex::new(None),
             });
 
+            let shortcut_plugin_result = handle.plugin(
+                tauri_plugin_global_shortcut::Builder::new()
+                    .with_handler(|app, shortcut, event| {
+                        let _ = shortcut;
+                        if event.state == ShortcutState::Pressed {
+                            toggle_overlay(app);
+                        }
+                    })
+                    .build(),
+            );
+
+            #[cfg(target_os = "windows")]
+            {
+                if let Err(error) = shortcut_plugin_result {
+                    eprintln!("[Copi] Global shortcut plugin failed: {}", error);
+                    log_startup_line(&format!("shortcut plugin failed: {}", error));
+                } else {
+                    log_startup_line("shortcut plugin initialized");
+                }
+            }
+
+            #[cfg(not(target_os = "windows"))]
+            shortcut_plugin_result?;
+
             // Convert overlay to NSPanel (inside setup — EcoPaste pattern)
             #[cfg(target_os = "macos")]
             {
@@ -288,76 +390,122 @@ fn main() {
             }
 
             // Tray icon
-            let settings_item =
-                MenuItem::with_id(&handle, "settings", "Settings\u{2026}", true, None::<&str>)?;
-            let pause_item =
-                MenuItem::with_id(&handle, "pause", "Pause Monitoring", true, None::<&str>)?;
-            let quit = MenuItem::with_id(&handle, "quit", "Quit Copi", true, None::<&str>)?;
-            let menu = Menu::with_items(
-                &handle,
-                &[
-                    &settings_item,
-                    &PredefinedMenuItem::separator(&handle)?,
-                    &pause_item,
-                    &PredefinedMenuItem::separator(&handle)?,
-                    &quit,
-                ],
-            )?;
+            let tray_init_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+                let settings_item = MenuItem::with_id(
+                    &handle,
+                    "settings",
+                    "Settings\u{2026}",
+                    true,
+                    None::<&str>,
+                )?;
+                let pause_item = MenuItem::with_id(
+                    &handle,
+                    "pause",
+                    "Pause Monitoring",
+                    true,
+                    None::<&str>,
+                )?;
+                let quit = MenuItem::with_id(&handle, "quit", "Quit Copi", true, None::<&str>)?;
+                let menu = Menu::with_items(
+                    &handle,
+                    &[
+                        &settings_item,
+                        &PredefinedMenuItem::separator(&handle)?,
+                        &pause_item,
+                        &PredefinedMenuItem::separator(&handle)?,
+                        &quit,
+                    ],
+                )?;
 
-            let mut tray_builder = TrayIconBuilder::with_id("copi-menubar")
-                .menu(&menu)
-                .tooltip("Copi")
-                .show_menu_on_left_click(true)
-                .on_menu_event(|app, event| match event.id().as_ref() {
-                    "settings" => {
-                        show_settings_window_inner(app);
-                    }
-                    "pause" => {
-                        let state = app.state::<AppState>();
-                        let mut running = state.clipboard_watcher_running.lock().unwrap();
-                        *running = !*running;
-                        if *running {
-                            eprintln!("[Tray] Clipboard monitoring resumed");
-                        } else {
-                            eprintln!("[Tray] Clipboard monitoring paused");
+                let mut tray_builder = TrayIconBuilder::with_id("copi-menubar")
+                    .menu(&menu)
+                    .tooltip("Copi")
+                    .show_menu_on_left_click(true)
+                    .on_menu_event(|app, event| match event.id().as_ref() {
+                        "settings" => {
+                            show_settings_window_inner(app);
                         }
-                    }
-                    "quit" => app.exit(0),
-                    _ => {}
-                });
+                        "pause" => {
+                            let state = app.state::<AppState>();
+                            let mut running = state.clipboard_watcher_running.lock().unwrap();
+                            *running = !*running;
+                            if *running {
+                                eprintln!("[Tray] Clipboard monitoring resumed");
+                            } else {
+                                eprintln!("[Tray] Clipboard monitoring paused");
+                            }
+                        }
+                        "quit" => app.exit(0),
+                        _ => {}
+                    });
 
-            #[cfg(target_os = "macos")]
-            {
-                tray_builder = tray_builder
-                    .icon(build_menubar_icon())
-                    .icon_as_template(true);
-            }
+                #[cfg(target_os = "macos")]
+                {
+                    tray_builder = tray_builder
+                        .icon(build_menubar_icon())
+                        .icon_as_template(true);
+                }
+
+                #[cfg(target_os = "windows")]
+                {
+                    tray_builder = tray_builder.icon(build_menubar_icon());
+                }
+
+                #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+                if let Some(default_icon) = app.default_window_icon().cloned() {
+                    tray_builder = tray_builder.icon(default_icon);
+                }
+
+                let tray = tray_builder.build(app)?;
+                let _ = tray.set_visible(true);
+                if let Ok(mut guard) = app.state::<MenuBarState>().tray_icon.lock() {
+                    *guard = Some(tray);
+                }
+
+                Ok(())
+            })();
 
             #[cfg(target_os = "windows")]
             {
-                tray_builder = tray_builder.icon(build_menubar_icon());
+                if let Err(error) = tray_init_result {
+                    eprintln!("[Copi] Tray initialization failed: {}", error);
+                    log_startup_line(&format!("tray init failed: {}", error));
+                } else {
+                    log_startup_line("tray initialized");
+                }
             }
 
-            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-            if let Some(default_icon) = app.default_window_icon().cloned() {
-                tray_builder = tray_builder.icon(default_icon);
+            #[cfg(not(target_os = "windows"))]
+            tray_init_result?;
+
+            let hotkey_result = register_initial_hotkey(app);
+
+            #[cfg(target_os = "windows")]
+            {
+                if let Err(error) = hotkey_result {
+                    eprintln!("[Copi] Hotkey initialization failed: {}", error);
+                    log_startup_line(&format!("hotkey init failed: {}", error));
+                } else {
+                    log_startup_line("hotkey registered");
+                }
             }
 
-            let tray = tray_builder.build(app)?;
-            let _ = tray.set_visible(true);
-            if let Ok(mut guard) = app.state::<MenuBarState>().tray_icon.lock() {
-                *guard = Some(tray);
-            }
-
-            register_initial_hotkey(app)?;
+            #[cfg(not(target_os = "windows"))]
+            hotkey_result?;
 
             if model_arc.is_some() {
                 start_runtime_services_once(&handle);
+                #[cfg(target_os = "windows")]
+                log_startup_line("runtime services started");
             } else {
                 show_setup_window_inner(&handle);
+                #[cfg(target_os = "windows")]
+                log_startup_line("setup window shown (model missing)");
             }
 
             eprintln!("[Copi] Ready. Press hotkey to open overlay.");
+            #[cfg(target_os = "windows")]
+            log_startup_line("setup completed successfully");
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -389,16 +537,39 @@ fn main() {
             collections::move_clip_to_collection,
             open_external_url,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .unwrap_or_else(|error| {
+            #[cfg(target_os = "windows")]
+            log_startup_line(&format!("build failed: {}", error));
+            panic!("error while building tauri application: {}", error);
+        })
+        .run(|_app_handle, event| {
+            #[cfg(target_os = "windows")]
+            match event {
+                tauri::RunEvent::Ready => log_startup_line("run event: ready"),
+                tauri::RunEvent::Exit => log_startup_line("run event: exit"),
+                tauri::RunEvent::ExitRequested { .. } => {
+                    log_startup_line("run event: exit requested")
+                }
+                _ => {}
+            }
+        });
 }
 
 fn is_setup_required(app: &tauri::AppHandle) -> bool {
-    app.state::<AppState>()
-        .model_setup_status
-        .lock()
-        .map(|status| status.setup_required)
-        .unwrap_or(false)
+    app.try_state::<AppState>()
+        .and_then(|state| {
+            state
+                .model_setup_status
+                .lock()
+                .ok()
+                .map(|status| status.setup_required)
+        })
+        .unwrap_or(true)
+}
+
+fn app_state_ready(app: &tauri::AppHandle) -> bool {
+    app.try_state::<AppState>().is_some()
 }
 
 #[cfg(target_os = "macos")]
@@ -506,6 +677,10 @@ pub(crate) fn start_runtime_services_once(app: &tauri::AppHandle) {
 }
 
 fn show_setup_window_inner(app: &tauri::AppHandle) {
+    if !app_state_ready(app) {
+        return;
+    }
+
     if let Some(window) = app.get_webview_window("overlay") {
         let _ = window.hide();
     }
@@ -519,6 +694,10 @@ fn show_setup_window_inner(app: &tauri::AppHandle) {
 }
 
 fn show_settings_window_inner(app: &tauri::AppHandle) {
+    if !app_state_ready(app) {
+        return;
+    }
+
     set_app_shell_visible(app, true);
     if let Some(window) = app.get_webview_window("settings") {
         let _ = window.unminimize();
@@ -563,6 +742,10 @@ pub(crate) fn cleanup_old_clips(app: &tauri::AppHandle) {
 // ─── Overlay Toggle (EcoPaste pattern: run_on_main_thread) ────────
 
 fn toggle_overlay(app: &tauri::AppHandle) {
+    if !app_state_ready(app) {
+        return;
+    }
+
     if is_setup_required(app) {
         show_setup_window_inner(app);
         return;
@@ -591,6 +774,10 @@ fn toggle_overlay(app: &tauri::AppHandle) {
 }
 
 fn show_overlay_inner(app: &tauri::AppHandle) {
+    if !app_state_ready(app) {
+        return;
+    }
+
     if is_setup_required(app) {
         show_setup_window_inner(app);
         return;
@@ -638,6 +825,10 @@ fn show_overlay_inner(app: &tauri::AppHandle) {
 }
 
 fn hide_overlay_inner(app: &tauri::AppHandle, paste: bool) {
+    if !app_state_ready(app) {
+        return;
+    }
+
     #[cfg(target_os = "macos")]
     {
         let app_clone = app.clone();

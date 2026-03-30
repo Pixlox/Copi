@@ -113,10 +113,15 @@ impl Default for PrivacyConfig {
 }
 
 fn config_path(app: &tauri::AppHandle) -> std::path::PathBuf {
-    app.path()
-        .app_config_dir()
-        .expect("Failed to get config dir")
-        .join("config.toml")
+    if let Ok(dir) = app.path().app_config_dir() {
+        return dir.join("config.toml");
+    }
+
+    if let Ok(dir) = app.path().app_local_data_dir() {
+        return dir.join("config.toml");
+    }
+
+    std::env::temp_dir().join("copi").join("config.toml")
 }
 
 #[tauri::command]
@@ -138,9 +143,10 @@ pub fn get_config_sync(app: tauri::AppHandle) -> Result<CopiConfig, String> {
 
     #[cfg(desktop)]
     {
-        use tauri_plugin_autostart::ManagerExt;
-        if let Ok(enabled) = app.autolaunch().is_enabled() {
-            config.general.launch_at_login = enabled;
+        if let Some(autolaunch) = app.try_state::<tauri_plugin_autostart::AutoLaunchManager>() {
+            if let Ok(enabled) = autolaunch.is_enabled() {
+                config.general.launch_at_login = enabled;
+            }
         }
     }
 
@@ -171,12 +177,13 @@ pub async fn set_config(app: tauri::AppHandle, config: CopiConfig) -> Result<(),
     if login_changed {
         #[cfg(desktop)]
         {
-            use tauri_plugin_autostart::ManagerExt;
-            let autolaunch = app.autolaunch();
-            if config.general.launch_at_login {
-                autolaunch.enable().map_err(|e| e.to_string())?;
-            } else {
-                autolaunch.disable().map_err(|e| e.to_string())?;
+            if let Some(autolaunch) = app.try_state::<tauri_plugin_autostart::AutoLaunchManager>()
+            {
+                if config.general.launch_at_login {
+                    autolaunch.enable().map_err(|e| e.to_string())?;
+                } else {
+                    autolaunch.disable().map_err(|e| e.to_string())?;
+                }
             }
         }
     }
@@ -216,7 +223,12 @@ fn save_config(app: &tauri::AppHandle, config: &CopiConfig) -> Result<(), String
 
 #[tauri::command]
 pub async fn get_db_size(app: tauri::AppHandle) -> Result<u64, String> {
-    let db_path = app.path().app_data_dir().unwrap().join("copi.db");
+    let db_path = app
+        .path()
+        .app_data_dir()
+        .or_else(|_| app.path().app_local_data_dir())
+        .unwrap_or_else(|_| std::env::temp_dir().join("copi"))
+        .join("copi.db");
     std::fs::metadata(&db_path).map(|m| m.len()).or(Ok(0))
 }
 

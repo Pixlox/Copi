@@ -73,11 +73,10 @@ pub async fn search_clips(
     filter: String,
     collection_id: Option<i64>,
 ) -> Result<Vec<ClipResult>, String> {
-    let token = app
-        .state::<AppState>()
-        .search_generation
-        .fetch_add(1, AtomicOrdering::Relaxed)
-        + 1;
+    let token = match app.try_state::<AppState>() {
+        Some(state) => state.search_generation.fetch_add(1, AtomicOrdering::Relaxed) + 1,
+        None => return Ok(Vec::new()),
+    };
 
     let fast_results = {
         let app_handle = app.clone();
@@ -104,7 +103,9 @@ pub async fn search_clips(
 #[tauri::command]
 pub async fn get_total_clip_count(app: tauri::AppHandle) -> Result<i64, String> {
     tokio::task::spawn_blocking(move || {
-        let state = app.state::<AppState>();
+        let state = app
+            .try_state::<AppState>()
+            .ok_or_else(|| "App state not ready yet".to_string())?;
         let conn = state.db_read_pool.get().map_err(|e| e.to_string())?;
         conn.query_row("SELECT COUNT(*) FROM clips", [], |row| row.get(0))
             .map_err(|e| e.to_string())
@@ -115,7 +116,9 @@ pub async fn get_total_clip_count(app: tauri::AppHandle) -> Result<i64, String> 
 
 #[tauri::command]
 pub async fn get_search_status(app: tauri::AppHandle) -> Result<SearchStatusPayload, String> {
-    let state = app.state::<AppState>();
+    let state = app
+        .try_state::<AppState>()
+        .ok_or_else(|| "App state not ready yet".to_string())?;
     let status = state.search_status.lock().map_err(|e| e.to_string())?;
     Ok(status.clone())
 }
@@ -270,11 +273,14 @@ fn schedule_semantic_update(
     collection_id: Option<i64>,
 ) {
     let has_model = app
-        .state::<AppState>()
-        .model
-        .read()
-        .ok()
-        .and_then(|guard| guard.as_ref().cloned())
+        .try_state::<AppState>()
+        .and_then(|state| {
+            state
+                .model
+                .read()
+                .ok()
+                .and_then(|guard| guard.as_ref().cloned())
+        })
         .is_some();
     if !has_model {
         return;

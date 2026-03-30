@@ -333,7 +333,9 @@ async fn download_required_models_inner(
 
 #[tauri::command]
 pub async fn get_model_setup_status(app: tauri::AppHandle) -> Result<ModelSetupStatus, String> {
-    let state = app.state::<crate::AppState>();
+    let state = app
+        .try_state::<crate::AppState>()
+        .ok_or_else(|| "App state not ready yet".to_string())?;
     let status = state.model_setup_status.lock().map_err(|e| e.to_string())?;
     Ok(status.clone())
 }
@@ -341,7 +343,9 @@ pub async fn get_model_setup_status(app: tauri::AppHandle) -> Result<ModelSetupS
 #[tauri::command]
 pub async fn download_required_models(app: tauri::AppHandle) -> Result<(), String> {
     {
-        let state = app.state::<crate::AppState>();
+        let state = app
+            .try_state::<crate::AppState>()
+            .ok_or_else(|| "App state not ready yet".to_string())?;
         let status = state.model_setup_status.lock().map_err(|e| e.to_string())?;
         if matches!(
             status.phase.as_str(),

@@ -1,10 +1,23 @@
 use rusqlite::{Connection, OptionalExtension, Result};
 use sqlite_vec::sqlite3_vec_init;
+use std::path::PathBuf;
 use tauri::Manager;
 
 pub struct DbConnections {
     pub read_pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
     pub write: Connection,
+}
+
+fn resolve_db_path(app: &tauri::AppHandle) -> PathBuf {
+    if let Ok(dir) = app.path().app_data_dir() {
+        return dir.join("copi.db");
+    }
+
+    if let Ok(dir) = app.path().app_local_data_dir() {
+        return dir.join("copi.db");
+    }
+
+    std::env::temp_dir().join("copi").join("copi.db")
 }
 
 pub fn init_db(app: &tauri::AppHandle) -> Result<DbConnections> {
@@ -14,14 +27,10 @@ pub fn init_db(app: &tauri::AppHandle) -> Result<DbConnections> {
         )));
     }
 
-    let db_path = app
-        .path()
-        .app_data_dir()
-        .expect("Failed to get app data dir")
-        .join("copi.db");
+    let db_path = resolve_db_path(app);
 
     if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent).ok();
+        let _ = std::fs::create_dir_all(parent);
     }
 
     // Writer connection — holds the WAL lock for writes
@@ -193,7 +202,11 @@ pub fn init_db(app: &tauri::AppHandle) -> Result<DbConnections> {
         eprintln!("[DB] FTS5 index rebuilt and search schema version refreshed");
     }
 
-    eprintln!("[DB] Database ready (pool={}, WAL mode)", 4);
+    eprintln!(
+        "[DB] Database ready at {} (pool={}, WAL mode)",
+        db_path.to_string_lossy(),
+        4
+    );
 
     Ok(DbConnections { read_pool, write })
 }

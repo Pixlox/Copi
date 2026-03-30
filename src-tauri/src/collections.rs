@@ -18,7 +18,9 @@ pub fn create_collection(
     name: String,
     color: String,
 ) -> Result<i64, String> {
-    let state = app.state::<AppState>();
+    let state = app
+        .try_state::<AppState>()
+        .ok_or_else(|| "App state not ready yet".to_string())?;
     let conn = state.db_write.lock().map_err(|e| e.to_string())?;
     let now = chrono::Utc::now().timestamp();
     conn.execute(
@@ -35,7 +37,9 @@ pub fn create_collection(
 
 #[tauri::command]
 pub fn delete_collection(app: tauri::AppHandle, id: i64) -> Result<(), String> {
-    let state = app.state::<AppState>();
+    let state = app
+        .try_state::<AppState>()
+        .ok_or_else(|| "App state not ready yet".to_string())?;
     let conn = state.db_write.lock().map_err(|e| e.to_string())?;
 
     // Move clips to no collection
@@ -55,7 +59,9 @@ pub fn delete_collection(app: tauri::AppHandle, id: i64) -> Result<(), String> {
 
 #[tauri::command]
 pub fn rename_collection(app: tauri::AppHandle, id: i64, name: String) -> Result<(), String> {
-    let state = app.state::<AppState>();
+    let state = app
+        .try_state::<AppState>()
+        .ok_or_else(|| "App state not ready yet".to_string())?;
     let conn = state.db_write.lock().map_err(|e| e.to_string())?;
     conn.execute(
         "UPDATE collections SET name = ?1 WHERE id = ?2",
@@ -69,7 +75,9 @@ pub fn rename_collection(app: tauri::AppHandle, id: i64, name: String) -> Result
 
 #[tauri::command]
 pub fn list_collections(app: tauri::AppHandle) -> Result<Vec<CollectionInfo>, String> {
-    let state = app.state::<AppState>();
+    let state = app
+        .try_state::<AppState>()
+        .ok_or_else(|| "App state not ready yet".to_string())?;
     let conn = state.db_read_pool.get().map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
@@ -104,7 +112,9 @@ pub fn update_collection_color(
     id: i64,
     color: String,
 ) -> Result<(), String> {
-    let state = app.state::<AppState>();
+    let state = app
+        .try_state::<AppState>()
+        .ok_or_else(|| "App state not ready yet".to_string())?;
     let conn = state.db_write.lock().map_err(|e| e.to_string())?;
     conn.execute(
         "UPDATE collections SET color = ?1 WHERE id = ?2",
@@ -122,7 +132,9 @@ pub fn move_clip_to_collection(
     clip_id: i64,
     collection_id: Option<i64>,
 ) -> Result<(), String> {
-    let state = app.state::<AppState>();
+    let state = app
+        .try_state::<AppState>()
+        .ok_or_else(|| "App state not ready yet".to_string())?;
     let conn = state.db_write.lock().map_err(|e| e.to_string())?;
     conn.execute(
         "UPDATE clips SET collection_id = ?1 WHERE id = ?2",
