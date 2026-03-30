@@ -254,10 +254,17 @@ function ActionsSheet({
           onClose();
           return;
         default:
-          onActivate(actionIndex);
+          // Map through base action list so inserted URL-only actions
+          // (e.g. "open-url") do not shift pin/copy/delete indices.
+          {
+            const baseIndex = actions.findIndex((baseAction) => baseAction.id === action.id);
+            if (baseIndex >= 0) {
+              onActivate(baseIndex);
+            }
+          }
       }
     },
-    [allActions, clip.content, onActivate, onClose, onOpenUrl]
+    [actions, allActions, clip.content, onActivate, onClose, onOpenUrl]
   );
 
   useEffect(() => {

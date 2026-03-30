@@ -53,7 +53,7 @@ tauri-nspanel = { git = "https://github.com/ahkohd/tauri-nspanel", branch = "v2.
 cidre = { version = "0.9.0", default-features = false, features = ["cf", "cg", "cv", "cm", "ns", "objc", "vn", "blocks", "macos_13_0"] }
 # Relax-sign-encoding prevents PAC crash on macOS 26 Tahoe
 objc2 = { version = "0.6.1", features = ["relax-sign-encoding"] }
-objc2-app-kit = { version = "0.3.2", features = ["NSBitmapImageRep", "NSImage", "NSRunningApplication", "NSWorkspace"] }
+objc2-app-kit = { version = "0.3.2", features = ["NSBitmapImageRep", "NSImage", "NSPasteboard", "NSPasteboardItem", "NSRunningApplication", "NSWorkspace"] }
 objc2-foundation = { version = "0.3.2", features = ["NSData", "NSDictionary", "NSGeometry", "NSString", "NSURL", "objc2-core-foundation"] }
 core-graphics = "0.25"
 
@@ -72,7 +72,6 @@ windows = { version = "0.61", features = [
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
-
 
 
 

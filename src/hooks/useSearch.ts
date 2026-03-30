@@ -186,14 +186,16 @@ export function useSearch() {
   }, [deferredQuery, activeFilter, collectionId, fetchResults]);
 
   useEffect(() => {
-    const refreshFromMutation = (includeCollections: boolean) => {
-      const shouldRefreshResults = queryRef.current.trim().length === 0;
+    const refreshFromMutation = (includeCollections: boolean, forceRefreshResults: boolean = false) => {
+      // For new clips, only refresh if no query (avoids disrupting search results)
+      // For mutations (delete/update), always refresh to reflect changes
+      const shouldRefreshResults = forceRefreshResults || queryRef.current.trim().length === 0;
       scheduleRefresh(includeCollections, shouldRefreshResults);
     };
 
-    const unlistenNew = listen("new-clip", () => refreshFromMutation(false));
-    const unlistenChanged = listen("clips-changed", () => refreshFromMutation(false));
-    const unlistenCollections = listen("collections-changed", () => refreshFromMutation(true));
+    const unlistenNew = listen("new-clip", () => refreshFromMutation(false, false));
+    const unlistenChanged = listen("clips-changed", () => refreshFromMutation(false, true)); // Always refresh on delete/update
+    const unlistenCollections = listen("collections-changed", () => refreshFromMutation(true, true));
 
     return () => {
       if (refreshTimerRef.current) {

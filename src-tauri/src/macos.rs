@@ -427,6 +427,101 @@ pub(crate) fn get_pasteboard_change_count() -> i64 {
     pb.changeCount() as i64
 }
 
+/// Get the app that owns the current clipboard content via NSPasteboard.
+/// This is more accurate than frontmost app detection since it reads
+/// the actual owner of the pasteboard content.
+#[cfg(target_os = "macos")]
+pub(crate) fn get_clipboard_source_app() -> Option<FrontmostApp> {
+    use objc2_app_kit::{NSPasteboard, NSWorkspace};
+    use objc2_foundation::NSString;
+
+    let pb = NSPasteboard::generalPasteboard();
+
+    // Different apps/OS versions expose different metadata keys.
+    const SOURCE_KEYS: [&str; 4] = [
+        "com.apple.pasteboard.source",
+        "com.apple.pasteboard.source-bundle",
+        "org.nspasteboard.source",
+        "org.nspasteboard.source-bundle",
+    ];
+
+    let items = pb.pasteboardItems()?;
+    if items.is_empty() {
+        return None;
+    }
+
+    let item = items.objectAtIndex(0);
+
+    for key in SOURCE_KEYS {
+        let key_type = NSString::from_str(key);
+        let bundle_id = item
+            .stringForType(&key_type)
+            .or_else(|| pb.stringForType(&key_type))
+            .map(|v| v.to_string())
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty() && v != "com.copi.app");
+
+        if let Some(bundle_id) = bundle_id {
+            return app_info_from_bundle_id(&NSWorkspace::sharedWorkspace(), &bundle_id);
+        }
+    }
+
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn app_info_from_bundle_id(
+    workspace: &objc2_app_kit::NSWorkspace,
+    bundle_id: &str,
+) -> Option<FrontmostApp> {
+    use objc2_foundation::NSString;
+
+    let bundle_ns = NSString::from_str(bundle_id);
+    let path = workspace
+        .URLForApplicationWithBundleIdentifier(&bundle_ns)
+        .and_then(|url| url.path())
+        .map(|path| path.to_string())
+        .unwrap_or_default();
+
+    let name = std::path::Path::new(&path)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| bundle_id_to_app_name(bundle_id));
+
+    let info = FrontmostApp {
+        name: name.trim().to_string(),
+        bundle_id: bundle_id.trim().to_string(),
+        path: path.trim().to_string(),
+    };
+
+    (!info.is_empty()).then_some(info)
+}
+
+#[cfg(target_os = "macos")]
+fn bundle_id_to_app_name(bundle_id: &str) -> String {
+    // Extract readable name from bundle ID
+    // e.g., "com.apple.mail" -> "Mail", "com.discord" -> "Discord"
+    bundle_id
+        .rsplit('.')
+        .next()
+        .map(|s| {
+            // Capitalize first letter
+            let mut chars = s.chars();
+            match chars.next() {
+                Some(c) => c.to_uppercase().chain(chars).collect(),
+                None => String::new(),
+            }
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn get_clipboard_source_app() -> Option<FrontmostApp> {
+    None
+}
+
 #[cfg(target_os = "windows")]
 pub(crate) fn get_pasteboard_change_count() -> i64 {
     use windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber;

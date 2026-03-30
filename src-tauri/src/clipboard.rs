@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager};
 
 use crate::{
-    macos::{get_app_icon_png, get_frontmost_app_info, FrontmostApp},
+    macos::{get_app_icon_png, get_clipboard_source_app, get_frontmost_app_info, FrontmostApp},
     AppState,
 };
 
@@ -54,14 +54,23 @@ pub async fn watch_clipboard(app: &tauri::AppHandle) {
             last_change_count = Some(current_change_count);
         }
 
+        // ── Source App Detection ──────────────────────────────────
+        // Priority: 1) Pasteboard source (most accurate - from clipboard metadata)
+        //           2) Current frontmost app (if not Copi)
+        //           3) Last known non-Copi app (fallback)
+        let pasteboard_source = get_clipboard_source_app();
         let current_frontmost = get_frontmost_app_info();
         if let Some(frontmost) = current_frontmost.clone() {
             if !frontmost.is_copi() && !frontmost.is_empty() {
                 last_non_copi_app = Some(frontmost);
             }
         }
-        let source_app = current_frontmost
+        let source_app = pasteboard_source
             .filter(|app| !app.is_copi() && !app.is_empty())
+            .or_else(|| {
+                current_frontmost
+                    .filter(|app| !app.is_copi() && !app.is_empty())
+            })
             .or_else(|| last_non_copi_app.clone())
             .unwrap_or_default();
 
