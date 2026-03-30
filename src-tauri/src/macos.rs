@@ -258,7 +258,7 @@ pub(crate) fn get_app_icon_png(_app_info: &FrontmostApp) -> Option<Vec<u8>> {
             BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
         };
         use windows_sys::Win32::UI::Shell::{
-            SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_SMALLICON,
+            SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON,
         };
         use windows_sys::Win32::UI::WindowsAndMessaging::{DestroyIcon, DrawIconEx, DI_NORMAL};
 
@@ -289,7 +289,7 @@ pub(crate) fn get_app_icon_png(_app_info: &FrontmostApp) -> Option<Vec<u8>> {
                     0,
                     &mut file_info,
                     size_of::<SHFILEINFOW>() as u32,
-                    SHGFI_ICON | SHGFI_SMALLICON,
+                    SHGFI_ICON | SHGFI_LARGEICON,
                 )
             };
             if ok == 0 || file_info.hIcon.is_null() {
@@ -335,6 +335,14 @@ pub(crate) fn get_app_icon_png(_app_info: &FrontmostApp) -> Option<Vec<u8>> {
             }
 
             let prev = unsafe { SelectObject(dc, dib as _) };
+
+            // Initialize bitmap to fully transparent before drawing
+            let pixel_count = (width * height) as usize;
+            unsafe {
+                let pixels = std::slice::from_raw_parts_mut(bits_ptr as *mut u32, pixel_count);
+                pixels.fill(0);
+            }
+
             let drawn =
                 unsafe { DrawIconEx(dc, 0, 0, icon, width, height, 0, null_mut(), DI_NORMAL) };
 
