@@ -66,7 +66,17 @@ jobs:
           projectPath: .
           tagName: ${{ github.ref_name }}
           releaseName: "Copi ${{ github.ref_name }}"
-          releaseBody: "Automated build for Copi. Install bundles are attached below."
+          releaseBody: |
+            Automated build for Copi. Install bundles are attached below.
+
+            **NOTE:**
+            macOS users must remove the quarantine flag from Copi before using it, or macOS will say that it is damaged.
+
+            To do this, simply run this in your terminal:
+
+            `xattr -rd com.apple.quarantine /path/to/copi.app`
+
+            Then, right-click -> open it.
           releaseDraft: true
           prerelease: false
           generateReleaseNotes: true

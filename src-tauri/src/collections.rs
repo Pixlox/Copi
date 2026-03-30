@@ -99,6 +99,24 @@ pub fn list_collections(app: tauri::AppHandle) -> Result<Vec<CollectionInfo>, St
 }
 
 #[tauri::command]
+pub fn update_collection_color(
+    app: tauri::AppHandle,
+    id: i64,
+    color: String,
+) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let conn = state.db_write.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE collections SET color = ?1 WHERE id = ?2",
+        rusqlite::params![color, id],
+    )
+    .map_err(|e| e.to_string())?;
+    drop(conn);
+    let _ = app.emit("collections-changed", ());
+    Ok(())
+}
+
+#[tauri::command]
 pub fn move_clip_to_collection(
     app: tauri::AppHandle,
     clip_id: i64,

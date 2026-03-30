@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import {
   Keyboard,
   Palette,
@@ -14,6 +15,8 @@ import {
   Trash2,
   RefreshCw,
   FolderOpen,
+  Pencil,
+  Check,
 } from "lucide-react";
 import { useThemeContext } from "../contexts/ThemeContext";
 import Picker from "../components/Picker";
@@ -66,6 +69,11 @@ const RETENTION_OPTIONS = [
   { label: "90 days", value: "90" },
   { label: "1 year", value: "365" },
   { label: "Forever", value: "0" },
+];
+
+const COLLECTION_COLORS = [
+  "#0A84FF", "#34C759", "#FF9500", "#FF3B30",
+  "#AF52DE", "#FF2D55", "#5AC8FA", "#FFD60A",
 ];
 
 function getHotkeyPresets() {
@@ -164,8 +172,8 @@ function SettingRow({
   );
 }
 
-function SettingCard({ children }: { children: React.ReactNode }) {
-  return <div className="settings-card">{children}</div>;
+function SettingCard({ children, className }: { children: React.ReactNode; className?: string }) {
+  return <div className={`settings-card ${className || ""}`}>{children}</div>;
 }
 
 function SettingDivider() {
@@ -414,34 +422,232 @@ function DataSection({
 function CollectionsSection({
   collections,
   onDelete,
+  onRename,
+  onCreate,
+  onUpdateColor,
 }: {
   collections: CollectionInfo[];
   onDelete: (id: number) => void;
+  onRename: (id: number, name: string) => void;
+  onCreate: (name: string, color: string) => void;
+  onUpdateColor: (id: number, color: string) => void;
 }) {
-  if (collections.length === 0) {
-    return (
-      <SettingCard>
-        <SettingRow label="No collections yet" description="Create collections from the overlay sidebar" />
-      </SettingCard>
-    );
-  }
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const [editValue, setEditValue] = useState("");
+  const [colorPickerId, setColorPickerId] = useState<number | null>(null);
+  const [newName, setNewName] = useState("");
+  const [isCreating, setIsCreating] = useState(false);
+  const editInputRef = useRef<HTMLInputElement>(null);
+  const newInputRef = useRef<HTMLInputElement>(null);
+  const colorPickerRef = useRef<HTMLDivElement>(null);
+
+  // Focus input when entering edit mode
+  useEffect(() => {
+    if (editingId !== null && editInputRef.current) {
+      editInputRef.current.focus();
+      editInputRef.current.select();
+    }
+  }, [editingId]);
+
+  // Focus input when creating new collection
+  useEffect(() => {
+    if (isCreating && newInputRef.current) {
+      newInputRef.current.focus();
+    }
+  }, [isCreating]);
+
+  // Close color picker when clicking outside
+  useEffect(() => {
+    if (colorPickerId === null) return;
+    
+    const handleClickOutside = (e: MouseEvent) => {
+      if (colorPickerRef.current && !colorPickerRef.current.contains(e.target as Node)) {
+        setColorPickerId(null);
+      }
+    };
+    
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, [colorPickerId]);
+
+  const startEditing = (col: CollectionInfo) => {
+    setEditingId(col.id);
+    setEditValue(col.name);
+    setColorPickerId(null);
+  };
+
+  const saveEdit = () => {
+    if (editingId !== null && editValue.trim()) {
+      onRename(editingId, editValue.trim());
+    }
+    setEditingId(null);
+    setEditValue("");
+  };
+
+  const cancelEdit = () => {
+    setEditingId(null);
+    setEditValue("");
+  };
+
+  const handleCreate = () => {
+    if (!newName.trim()) return;
+    const color = COLLECTION_COLORS[collections.length % COLLECTION_COLORS.length];
+    onCreate(newName.trim(), color);
+    setNewName("");
+    setIsCreating(false);
+  };
+
+  const handleColorSelect = (id: number, color: string) => {
+    onUpdateColor(id, color);
+    setColorPickerId(null);
+  };
 
   return (
-    <SettingCard>
-      {collections.map((col, i) => (
-        <div key={col.id}>
-          {i > 0 && <SettingDivider />}
-          <SettingRow label={col.name} description={`${col.clip_count} clip${col.clip_count !== 1 ? "s" : ""}`}>
-            <div className="settings-collection-actions">
-              <div className="settings-collection-color" style={{ background: col.color }} />
-              <button onClick={() => onDelete(col.id)} className="settings-collection-delete">
-                <Trash2 size={12} />
-              </button>
+    <>
+      <SettingCard className={colorPickerId !== null ? "settings-card--picker-open" : ""}>
+        {collections.length === 0 && !isCreating ? (
+          <div className="settings-row">
+            <div className="settings-row-info">
+              <span className="settings-row-label" style={{ color: "var(--text-tertiary)" }}>
+                No collections yet
+              </span>
             </div>
-          </SettingRow>
+          </div>
+        ) : (
+          collections.map((col, i) => (
+            <div key={col.id}>
+              {i > 0 && <SettingDivider />}
+              <div className="settings-row settings-collection-row">
+                {/* Color picker */}
+                <div className="settings-color-picker-container" ref={colorPickerId === col.id ? colorPickerRef : undefined}>
+                  <button
+                    className="settings-collection-color-btn"
+                    style={{ background: col.color }}
+                    onClick={() => setColorPickerId(colorPickerId === col.id ? null : col.id)}
+                    title="Change color"
+                  />
+                  {colorPickerId === col.id && (
+                    <div className="settings-color-picker-popover">
+                      {COLLECTION_COLORS.map((color) => (
+                        <button
+                          key={color}
+                          className={`settings-color-option ${color === col.color ? "selected" : ""}`}
+                          style={{ background: color }}
+                          onClick={() => handleColorSelect(col.id, color)}
+                        />
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* Name (editable) */}
+                <div className="settings-collection-info">
+                  {editingId === col.id ? (
+                    <input
+                      ref={editInputRef}
+                      type="text"
+                      className="settings-collection-edit-input"
+                      value={editValue}
+                      onChange={(e) => setEditValue(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") saveEdit();
+                        if (e.key === "Escape") cancelEdit();
+                      }}
+                      onBlur={saveEdit}
+                    />
+                  ) : (
+                    <span
+                      className="settings-collection-name"
+                      onDoubleClick={() => startEditing(col)}
+                      title="Double-click to rename"
+                    >
+                      {col.name}
+                    </span>
+                  )}
+                  <span className="settings-collection-count">
+                    {col.clip_count} clip{col.clip_count !== 1 ? "s" : ""}
+                  </span>
+                </div>
+
+                {/* Actions */}
+                <div className="settings-collection-actions">
+                  {editingId !== col.id && (
+                    <button
+                      onClick={() => startEditing(col)}
+                      className="settings-collection-action-btn"
+                      title="Rename"
+                    >
+                      <Pencil size={12} />
+                    </button>
+                  )}
+                  <button
+                    onClick={() => onDelete(col.id)}
+                    className="settings-collection-action-btn settings-collection-action-btn--danger"
+                    title="Delete"
+                  >
+                    <Trash2 size={12} />
+                  </button>
+                </div>
+              </div>
+            </div>
+          ))
+        )}
+
+        {/* Create new collection row */}
+        {collections.length > 0 && <SettingDivider />}
+        <div className="settings-collection-create-row">
+          {isCreating ? (
+            <>
+              <div
+                className="settings-collection-color-btn"
+                style={{ background: COLLECTION_COLORS[collections.length % COLLECTION_COLORS.length] }}
+              />
+              <input
+                ref={newInputRef}
+                type="text"
+                className="settings-collection-new-input"
+                placeholder="Collection name..."
+                value={newName}
+                onChange={(e) => setNewName(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") handleCreate();
+                  if (e.key === "Escape") {
+                    setIsCreating(false);
+                    setNewName("");
+                  }
+                }}
+                onBlur={() => {
+                  if (!newName.trim()) {
+                    setIsCreating(false);
+                  }
+                }}
+              />
+              <button
+                className="settings-collection-action-btn settings-collection-action-btn--confirm"
+                onClick={handleCreate}
+                disabled={!newName.trim()}
+              >
+                <Check size={14} />
+              </button>
+              <button
+                className="settings-collection-action-btn"
+                onClick={() => {
+                  setIsCreating(false);
+                  setNewName("");
+                }}
+              >
+                <X size={14} />
+              </button>
+            </>
+          ) : (
+            <button className="settings-collection-add-btn" onClick={() => setIsCreating(true)}>
+              <Plus size={14} />
+              <span>New Collection</span>
+            </button>
+          )}
         </div>
-      ))}
-    </SettingCard>
+      </SettingCard>
+    </>
   );
 }
 
@@ -474,6 +680,16 @@ export default function Settings() {
     fetchCollections();
   }, [fetchCollections]);
 
+  // Listen to collections-changed event for real-time updates
+  useEffect(() => {
+    const unlisten = listen("collections-changed", () => {
+      fetchCollections();
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, [fetchCollections]);
+
   const saveConfig = useCallback(
     async (updated: CopiConfig) => {
       const previous = config;
@@ -497,6 +713,33 @@ export default function Settings() {
       fetchCollections();
     } catch (e) {
       console.error("Delete collection failed:", e);
+    }
+  };
+
+  const handleRenameCollection = async (id: number, name: string) => {
+    try {
+      await invoke("rename_collection", { id, name });
+      fetchCollections();
+    } catch (e) {
+      console.error("Rename collection failed:", e);
+    }
+  };
+
+  const handleCreateCollection = async (name: string, color: string) => {
+    try {
+      await invoke("create_collection", { name, color });
+      fetchCollections();
+    } catch (e) {
+      console.error("Create collection failed:", e);
+    }
+  };
+
+  const handleUpdateCollectionColor = async (id: number, color: string) => {
+    try {
+      await invoke("update_collection_color", { id, color });
+      fetchCollections();
+    } catch (e) {
+      console.error("Update collection color failed:", e);
     }
   };
 
@@ -573,7 +816,13 @@ export default function Settings() {
             />
           )}
           {activeSection === "collections" && (
-            <CollectionsSection collections={collections} onDelete={handleDeleteCollection} />
+            <CollectionsSection
+              collections={collections}
+              onDelete={handleDeleteCollection}
+              onRename={handleRenameCollection}
+              onCreate={handleCreateCollection}
+              onUpdateColor={handleUpdateCollectionColor}
+            />
           )}
         </div>
 

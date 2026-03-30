@@ -333,7 +333,12 @@ fn main() {
                     .icon_as_template(true);
             }
 
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(target_os = "windows")]
+            {
+                tray_builder = tray_builder.icon(build_menubar_icon());
+            }
+
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             if let Some(default_icon) = app.default_window_icon().cloned() {
                 tray_builder = tray_builder.icon(default_icon);
             }
@@ -379,6 +384,7 @@ fn main() {
             collections::create_collection,
             collections::delete_collection,
             collections::rename_collection,
+            collections::update_collection_color,
             collections::list_collections,
             collections::move_clip_to_collection,
             open_external_url,
@@ -763,6 +769,7 @@ fn register_initial_hotkey(app: &mut tauri::App) -> Result<(), Box<dyn std::erro
 fn build_menubar_icon() -> tauri::image::Image<'static> {
     // Tauri tray icons accept raster data here, so we rasterize the same
     // two-card glyph used by icons/copi-menubar.svg.
+    // macOS uses template icons (white with alpha) that adapt to light/dark mode.
     let width = 44usize;
     let height = 44usize;
     let mut rgba = vec![0u8; width * height * 4];
@@ -773,7 +780,23 @@ fn build_menubar_icon() -> tauri::image::Image<'static> {
     tauri::image::Image::new_owned(rgba, width as u32, height as u32)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_os = "windows")]
+fn build_menubar_icon() -> tauri::image::Image<'static> {
+    // Windows tray icons need to be larger and fully opaque with a visible color.
+    // We draw the same two-card glyph but with white cards on transparent background.
+    let width = 32usize;
+    let height = 32usize;
+    let mut rgba = vec![0u8; width * height * 4];
+
+    // Scale factors for 32x32 canvas (original was 44x44)
+    let scale = 32.0 / 44.0;
+    draw_rounded_rect(&mut rgba, width, height, 16.0 * scale, 12.0 * scale, 22.0 * scale, 26.0 * scale, 5.0 * scale, 0.5);
+    draw_rounded_rect(&mut rgba, width, height, 6.0 * scale, 6.0 * scale, 22.0 * scale, 26.0 * scale, 5.0 * scale, 1.0);
+
+    tauri::image::Image::new_owned(rgba, width as u32, height as u32)
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn draw_rounded_rect(
     rgba: &mut [u8],
     canvas_width: usize,
@@ -813,7 +836,7 @@ fn draw_rounded_rect(
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn rounded_rect_coverage(
     px: f32,
     py: f32,

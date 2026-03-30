@@ -1465,3 +1465,225 @@ input::placeholder {
   margin-bottom: 8px;
   padding-left: 2px;
 }
+
+/* ═══ Collections Section (Enhanced) ═══════════════════════════════ */
+
+.settings-collection-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  min-height: 48px;
+}
+
+.settings-collection-row:hover .settings-collection-action-btn {
+  opacity: 1;
+}
+
+.settings-color-picker-container {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.settings-collection-color-btn {
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  border: none;
+  cursor: pointer;
+  transition: transform 150ms ease, box-shadow 150ms ease;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.1);
+}
+
+.settings-collection-color-btn:hover {
+  transform: scale(1.08);
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.15), 0 2px 8px rgba(0, 0, 0, 0.15);
+}
+
+.settings-color-picker-popover {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+  padding: 10px;
+  background: var(--settings-card-bg);
+  border-radius: 10px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35),
+              0 2px 8px rgba(0, 0, 0, 0.2);
+  border: 0.5px solid var(--border-default);
+  z-index: 50;
+  animation: color-picker-enter 120ms ease-out;
+}
+
+@keyframes color-picker-enter {
+  from {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.settings-color-option {
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  border: none;
+  cursor: pointer;
+  transition: transform 100ms ease, box-shadow 100ms ease;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.1);
+}
+
+.settings-color-option:hover {
+  transform: scale(1.12);
+}
+
+.settings-color-option.selected {
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.15),
+              0 0 0 2px var(--settings-card-bg),
+              0 0 0 4px var(--accent-solid);
+}
+
+.settings-collection-info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.settings-collection-name {
+  font-size: 13px;
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: color 100ms ease;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.settings-collection-name:hover {
+  color: var(--accent-text);
+}
+
+.settings-collection-count {
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+.settings-collection-edit-input {
+  background: var(--settings-input-bg);
+  border: none;
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 13px;
+  color: var(--text-primary);
+  outline: none;
+  width: 100%;
+  max-width: 200px;
+}
+
+.settings-collection-edit-input:focus {
+  box-shadow: 0 0 0 2px var(--accent-solid);
+}
+
+.settings-collection-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.settings-collection-action-btn {
+  background: none;
+  border: none;
+  padding: 6px;
+  cursor: pointer;
+  color: var(--text-tertiary);
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 100ms ease;
+  opacity: 0;
+}
+
+.settings-collection-action-btn:hover {
+  background: var(--surface-hover);
+  color: var(--text-secondary);
+}
+
+.settings-collection-action-btn--danger:hover {
+  background: var(--danger-bg);
+  color: var(--danger-text);
+}
+
+.settings-collection-action-btn--confirm {
+  opacity: 1;
+}
+
+.settings-collection-action-btn--confirm:hover {
+  background: var(--success-bg);
+  color: var(--success-text);
+}
+
+.settings-collection-action-btn--confirm:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* Create collection row */
+.settings-collection-create-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  min-height: 48px;
+  border-top: 0.5px solid var(--border-subtle);
+}
+
+.settings-collection-new-input {
+  flex: 1;
+  background: var(--settings-input-bg);
+  border: none;
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 13px;
+  color: var(--text-primary);
+  outline: none;
+}
+
+.settings-collection-new-input:focus {
+  box-shadow: 0 0 0 2px var(--accent-solid);
+}
+
+.settings-collection-new-input::placeholder {
+  color: var(--text-placeholder);
+}
+
+.settings-collection-add-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  font-size: 13px;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  transition: all 100ms ease;
+}
+
+.settings-collection-add-btn:hover {
+  background: var(--surface-hover);
+  color: var(--text-secondary);
+}
+
+.settings-collection-add-btn svg {
+  flex-shrink: 0;
+}
