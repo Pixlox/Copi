@@ -65,6 +65,8 @@
   },
   "bundle": {
     "active": true,
+    "publisher": "Pixlox",
+    "copyright": "Copyright (c) Pixlox",
     "targets": "all",
     "createUpdaterArtifacts": true,
     "icon": [

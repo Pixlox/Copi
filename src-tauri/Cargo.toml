@@ -3,6 +3,8 @@ name = "copi"
 version = "0.2.4"
 edition = "2021"
 rust-version = "1.88"
+authors = ["Pixlox"]
+description = "Copi"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -70,7 +72,6 @@ windows = { version = "0.61", features = [
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
-
 
 
 
