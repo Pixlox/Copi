@@ -46,6 +46,7 @@ tauri-plugin-updater = "2"
 tauri-plugin-autostart = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-process = "2"
+tauri-plugin-single-instance = "2"
 
 # macOS: NSPanel for fullscreen overlay (EcoPaste pattern — v2.1 branch)
 [target."cfg(target_os = \"macos\")".dependencies]
@@ -72,7 +73,6 @@ windows = { version = "0.61", features = [
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
-
 
 
 

@@ -134,7 +134,13 @@ fn main() {
         }
     }));
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        handle_second_instance_launch(app);
+    }));
+
+    builder
         .on_window_event(|_window, event| match event {
             tauri::WindowEvent::CloseRequested { api, .. } => {
                 if matches!(_window.label(), "settings" | "setup") {
@@ -613,6 +619,35 @@ fn is_setup_required(app: &tauri::AppHandle) -> bool {
                 .map(|status| status.setup_required)
         })
         .unwrap_or(true)
+}
+
+fn handle_second_instance_launch(app: &tauri::AppHandle) {
+    #[cfg(target_os = "windows")]
+    log_startup_line("second launch blocked; focusing existing instance");
+
+    if !app_state_ready(app) {
+        if let Some(window) = app.get_webview_window("overlay") {
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+        return;
+    }
+
+    if is_setup_required(app) {
+        show_setup_window_inner(app);
+        return;
+    }
+
+    if app
+        .get_webview_window("settings")
+        .and_then(|window| window.is_visible().ok())
+        .unwrap_or(false)
+    {
+        show_settings_window_inner(app);
+        return;
+    }
+
+    show_overlay_inner(app);
 }
 
 #[cfg(target_os = "windows")]
