@@ -1,6 +1,7 @@
 use serde::Serialize;
 use tauri::{Emitter, Manager};
 
+use crate::sync::runtime;
 use crate::AppState;
 
 #[derive(Debug, Clone, Serialize)]
@@ -23,11 +24,19 @@ pub fn create_collection(
         .ok_or_else(|| "App state not ready yet".to_string())?;
     let conn = state.db_write.lock().map_err(|e| e.to_string())?;
     let now = chrono::Utc::now().timestamp();
+    let sync_id = uuid::Uuid::new_v4().to_string();
+    let sync_version = crate::sync::engine::SyncEngine::next_sync_version(&conn).unwrap_or(0);
+    let origin_device_id: Option<String> = conn
+        .query_row("SELECT device_id FROM device_info LIMIT 1", [], |row| {
+            row.get(0)
+        })
+        .ok();
     conn.execute(
-        "INSERT INTO collections (name, color, created_at) VALUES (?1, ?2, ?3)",
-        rusqlite::params![name, color, now],
+        "INSERT INTO collections (name, color, created_at, sync_id, sync_version, deleted, origin_device_id) VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
+        rusqlite::params![name, color, now, sync_id, sync_version, origin_device_id],
     )
     .map_err(|e| e.to_string())?;
+    runtime::queue_collection_sync_change(&app, sync_id.clone());
 
     let id = conn.last_insert_rowid();
     drop(conn);
@@ -42,15 +51,30 @@ pub fn delete_collection(app: tauri::AppHandle, id: i64) -> Result<(), String> {
         .ok_or_else(|| "App state not ready yet".to_string())?;
     let conn = state.db_write.lock().map_err(|e| e.to_string())?;
 
+    let sync_version = crate::sync::engine::SyncEngine::next_sync_version(&conn).unwrap_or(0);
+
     // Move clips to no collection
     conn.execute(
-        "UPDATE clips SET collection_id = NULL WHERE collection_id = ?",
-        [id],
+        "UPDATE clips SET collection_id = NULL, sync_version = ?1 WHERE collection_id = ?2 AND deleted = 0",
+        rusqlite::params![sync_version, id],
     )
     .map_err(|e| e.to_string())?;
 
-    conn.execute("DELETE FROM collections WHERE id = ?", [id])
+    let updated = conn
+        .execute(
+            "UPDATE collections SET deleted = 1, sync_version = ?1 WHERE id = ?2 AND deleted = 0",
+            rusqlite::params![sync_version, id],
+        )
         .map_err(|e| e.to_string())?;
+    if updated > 0 {
+        if let Ok(sync_id) =
+            conn.query_row("SELECT sync_id FROM collections WHERE id = ?1", [id], |r| {
+                r.get::<_, String>(0)
+            })
+        {
+            runtime::queue_collection_sync_change(&app, sync_id);
+        }
+    }
 
     drop(conn);
     let _ = app.emit("collections-changed", ());
@@ -63,11 +87,22 @@ pub fn rename_collection(app: tauri::AppHandle, id: i64, name: String) -> Result
         .try_state::<AppState>()
         .ok_or_else(|| "App state not ready yet".to_string())?;
     let conn = state.db_write.lock().map_err(|e| e.to_string())?;
-    conn.execute(
-        "UPDATE collections SET name = ?1 WHERE id = ?2",
-        rusqlite::params![name, id],
-    )
-    .map_err(|e| e.to_string())?;
+    let sync_version = crate::sync::engine::SyncEngine::next_sync_version(&conn).unwrap_or(0);
+    let updated = conn
+        .execute(
+            "UPDATE collections SET name = ?1, sync_version = ?2 WHERE id = ?3 AND deleted = 0",
+            rusqlite::params![name, sync_version, id],
+        )
+        .map_err(|e| e.to_string())?;
+    if updated > 0 {
+        if let Ok(sync_id) =
+            conn.query_row("SELECT sync_id FROM collections WHERE id = ?1", [id], |r| {
+                r.get::<_, String>(0)
+            })
+        {
+            runtime::queue_collection_sync_change(&app, sync_id);
+        }
+    }
     drop(conn);
     let _ = app.emit("collections-changed", ());
     Ok(())
@@ -82,8 +117,8 @@ pub fn list_collections(app: tauri::AppHandle) -> Result<Vec<CollectionInfo>, St
     let mut stmt = conn
         .prepare(
             "SELECT c.id, c.name, COALESCE(c.color, '#0A84FF'), c.created_at,
-                    (SELECT COUNT(*) FROM clips WHERE collection_id = c.id) as clip_count
-             FROM collections c ORDER BY c.name",
+                    (SELECT COUNT(*) FROM clips WHERE collection_id = c.id AND deleted = 0) as clip_count
+             FROM collections c WHERE c.deleted = 0 ORDER BY c.name",
         )
         .map_err(|e| e.to_string())?;
 
@@ -116,11 +151,22 @@ pub fn update_collection_color(
         .try_state::<AppState>()
         .ok_or_else(|| "App state not ready yet".to_string())?;
     let conn = state.db_write.lock().map_err(|e| e.to_string())?;
-    conn.execute(
-        "UPDATE collections SET color = ?1 WHERE id = ?2",
-        rusqlite::params![color, id],
-    )
-    .map_err(|e| e.to_string())?;
+    let sync_version = crate::sync::engine::SyncEngine::next_sync_version(&conn).unwrap_or(0);
+    let updated = conn
+        .execute(
+            "UPDATE collections SET color = ?1, sync_version = ?2 WHERE id = ?3 AND deleted = 0",
+            rusqlite::params![color, sync_version, id],
+        )
+        .map_err(|e| e.to_string())?;
+    if updated > 0 {
+        if let Ok(sync_id) =
+            conn.query_row("SELECT sync_id FROM collections WHERE id = ?1", [id], |r| {
+                r.get::<_, String>(0)
+            })
+        {
+            runtime::queue_collection_sync_change(&app, sync_id);
+        }
+    }
     drop(conn);
     let _ = app.emit("collections-changed", ());
     Ok(())
@@ -136,11 +182,22 @@ pub fn move_clip_to_collection(
         .try_state::<AppState>()
         .ok_or_else(|| "App state not ready yet".to_string())?;
     let conn = state.db_write.lock().map_err(|e| e.to_string())?;
-    conn.execute(
-        "UPDATE clips SET collection_id = ?1 WHERE id = ?2",
-        rusqlite::params![collection_id, clip_id],
-    )
-    .map_err(|e| e.to_string())?;
+    let sync_version = crate::sync::engine::SyncEngine::next_sync_version(&conn).unwrap_or(0);
+    let updated = conn
+        .execute(
+            "UPDATE clips SET collection_id = ?1, sync_version = ?2 WHERE id = ?3 AND deleted = 0",
+            rusqlite::params![collection_id, sync_version, clip_id],
+        )
+        .map_err(|e| e.to_string())?;
+    if updated > 0 {
+        if let Ok(sync_id) =
+            conn.query_row("SELECT sync_id FROM clips WHERE id = ?1", [clip_id], |r| {
+                r.get::<_, String>(0)
+            })
+        {
+            runtime::queue_clip_sync_change(&app, sync_id);
+        }
+    }
     drop(conn);
     let _ = app.emit("clips-changed", ());
     let _ = app.emit("collections-changed", ());

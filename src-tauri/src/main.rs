@@ -19,6 +19,7 @@ mod privacy;
 mod query_parser;
 mod search;
 mod settings;
+mod sync;
 
 #[cfg(target_os = "windows")]
 fn startup_log_path() -> std::path::PathBuf {
@@ -131,6 +132,12 @@ fn main() {
             log_startup_line(&format!("panic at {}: {}", location, payload));
             let backtrace = std::backtrace::Backtrace::force_capture();
             log_startup_line(&format!("backtrace: {}", backtrace));
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            eprintln!("[Panic] {}", info);
+            eprintln!("[Panic] backtrace: {}", std::backtrace::Backtrace::force_capture());
         }
     }));
 
@@ -342,6 +349,10 @@ fn main() {
             app.manage(MenuBarState {
                 tray_icon: Mutex::new(None),
             });
+
+            if let Err(error) = sync::initialize_sync_if_enabled(&handle) {
+                eprintln!("[Sync] Initialization skipped: {}", error);
+            }
 
             let shortcut_plugin_result = handle.plugin(
                 tauri_plugin_global_shortcut::Builder::new()
@@ -582,6 +593,13 @@ fn main() {
             settings::set_config,
             settings::get_db_size,
             settings::clear_all_history,
+            sync::sync_get_status,
+            sync::sync_list_paired_devices,
+            sync::sync_unpair_device,
+            sync::sync_pair_device_manual,
+            sync::sync_list_discovered_devices,
+            sync::sync_start_pairing,
+            sync::sync_pair_with_code,
             collections::create_collection,
             collections::delete_collection,
             collections::rename_collection,
@@ -596,9 +614,9 @@ fn main() {
             log_startup_line(&format!("build failed: {}", error));
             panic!("error while building tauri application: {}", error);
         })
-        .run(|_app_handle, event| {
+        .run(|_app_handle, _event| {
             #[cfg(target_os = "windows")]
-            match event {
+            match _event {
                 tauri::RunEvent::Ready => log_startup_line("run event: ready"),
                 tauri::RunEvent::Exit => log_startup_line("run event: exit"),
                 tauri::RunEvent::ExitRequested { .. } => {
@@ -823,18 +841,30 @@ pub(crate) fn cleanup_old_clips(app: &tauri::AppHandle) {
         return;
     };
     let Ok(_) = conn.execute(
-        "DELETE FROM clip_embeddings WHERE rowid IN (SELECT id FROM clips WHERE created_at < ?1 AND pinned = 0)",
+        "DELETE FROM clip_embeddings WHERE rowid IN (SELECT id FROM clips WHERE created_at < ?1 AND pinned = 0 AND deleted = 0)",
         [cutoff],
     ) else {
         return;
     };
+    let sync_version = sync::engine::SyncEngine::next_sync_version(&conn).unwrap_or(0);
     let Ok(count) = conn.execute(
-        "DELETE FROM clips WHERE created_at < ?1 AND pinned = 0",
-        [cutoff],
+        "UPDATE clips SET deleted = 1, sync_version = ?1 WHERE created_at < ?2 AND pinned = 0 AND deleted = 0",
+        rusqlite::params![sync_version, cutoff],
     ) else {
         return;
     };
     if count > 0 {
+        if let Ok(mut stmt) = conn.prepare("SELECT sync_id FROM clips WHERE deleted = 1 AND sync_version = ?1") {
+            let ids: Vec<String> = stmt
+                .query_map([sync_version], |r| r.get(0))
+                .ok()
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default();
+            drop(stmt);
+            for id in ids {
+                sync::runtime::queue_clip_sync_change(app, id);
+            }
+        }
         eprintln!("[Cleanup] Removed {} old clips", count);
     }
 }

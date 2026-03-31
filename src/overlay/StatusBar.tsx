@@ -1,5 +1,8 @@
 import type { SearchStatus } from "../hooks/useSearch";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { formatShortcut, formatSymbolShortcut, isMacPlatform } from "../utils/platform";
+import { useEffect, useState } from "react";
 
 interface StatusBarProps {
   totalCount: number;
@@ -71,6 +74,37 @@ function StatusBar({
   canOpenActions,
   onToggleActions,
 }: StatusBarProps) {
+  const [syncConnected, setSyncConnected] = useState<number>(0);
+  const [syncEnabled, setSyncEnabled] = useState<boolean>(false);
+
+  useEffect(() => {
+    let alive = true;
+    const refresh = async () => {
+      try {
+        const s = await invoke<{ enabled: boolean; connectedCount: number }>("sync_get_status");
+        if (!alive) return;
+        setSyncEnabled(Boolean(s.enabled));
+        setSyncConnected(Number(s.connectedCount ?? 0));
+      } catch {
+        if (!alive) return;
+        setSyncEnabled(false);
+        setSyncConnected(0);
+      }
+    };
+
+    void refresh();
+    const timer = setInterval(() => void refresh(), 3000);
+    const unlisten = listen("sync:discovered-updated", () => {
+      void refresh();
+    });
+
+    return () => {
+      alive = false;
+      clearInterval(timer);
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
   const filters = detectFilters(query);
   const statusLabel = formatSearchStatus(searchStatus);
   const primaryLabel = defaultEnterAction === "copy" ? "copy" : "paste";
@@ -88,6 +122,9 @@ function StatusBar({
         <span>{formatCount(totalCount)} clips</span>
         {statusLabel && (
           <span className="temporal-badge">{statusLabel}</span>
+        )}
+        {syncEnabled && (
+          <span className="temporal-badge">Sync {syncConnected > 0 ? `online (${syncConnected})` : "idle"}</span>
         )}
         {filters.map((f) => (
           <span key={f} className="temporal-badge">{f}</span>

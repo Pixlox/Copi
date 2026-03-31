@@ -7,6 +7,8 @@ use tauri::{Emitter, Manager};
 
 use crate::{
     macos::{get_app_icon_png, get_clipboard_source_app, get_frontmost_app_info, FrontmostApp},
+    sync::engine::SyncEngine,
+    sync::runtime,
     AppState,
 };
 
@@ -242,7 +244,7 @@ pub async fn backfill_language_tags(app: &tauri::AppHandle) {
                               ELSE content
                             END AS language_source
                      FROM clips
-                     WHERE language IS NULL OR TRIM(language) = ''
+                     WHERE deleted = 0 AND (language IS NULL OR TRIM(language) = '')
                      ORDER BY created_at DESC
                      LIMIT 250",
                 )
@@ -274,7 +276,7 @@ pub async fn backfill_language_tags(app: &tauri::AppHandle) {
             for (clip_id, language) in updates {
                 if conn
                     .execute(
-                        "UPDATE clips SET language = ?1 WHERE id = ?2 AND (language IS NULL OR TRIM(language) = '')",
+                        "UPDATE clips SET language = ?1 WHERE id = ?2 AND deleted = 0 AND (language IS NULL OR TRIM(language) = '')",
                         rusqlite::params![language, clip_id],
                     )
                     .ok()
@@ -315,7 +317,7 @@ pub async fn copy_to_clipboard(app: tauri::AppHandle, clip_id: i64) -> Result<()
             .get()
             .map_err(|e| e.to_string())?;
         conn.query_row(
-            "SELECT content_type, COALESCE(content, ''), COALESCE(image_data, X''), COALESCE(image_width, 0), COALESCE(image_height, 0) FROM clips WHERE id = ?",
+            "SELECT content_type, COALESCE(content, ''), COALESCE(image_data, X''), COALESCE(image_width, 0), COALESCE(image_height, 0) FROM clips WHERE id = ? AND deleted = 0",
             [clip_id],
             |row| Ok((
                 row.get::<_, String>(0)?,
@@ -366,7 +368,7 @@ pub async fn copy_to_clipboard(app: tauri::AppHandle, clip_id: i64) -> Result<()
         let _ = tokio::task::spawn_blocking(move || {
             if let Ok(conn) = app_clone.state::<AppState>().db_write.lock() {
                 let _ = conn.execute(
-                    "UPDATE clips SET copy_count = COALESCE(copy_count, 0) + 1 WHERE id = ?",
+                    "UPDATE clips SET copy_count = COALESCE(copy_count, 0) + 1 WHERE id = ? AND deleted = 0",
                     [clip_id],
                 );
             }
@@ -402,7 +404,7 @@ pub async fn get_clip_icons_batch(
 
     let placeholders = clip_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let query = format!(
-        "SELECT id, image_thumbnail, source_app_icon FROM clips WHERE id IN ({})",
+        "SELECT id, image_thumbnail, source_app_icon FROM clips WHERE deleted = 0 AND id IN ({})",
         placeholders
     );
 
@@ -891,10 +893,15 @@ fn insert_clip(
 
     let icon = fetch_app_icon(&state, source_app);
     let conn = state.db_write.lock().unwrap();
+    let sync_id = uuid::Uuid::new_v4().to_string();
+    let sync_version = SyncEngine::next_sync_version(&conn).unwrap_or(0);
+    let origin_device_id: Option<String> = conn
+        .query_row("SELECT device_id FROM device_info LIMIT 1", [], |row| row.get(0))
+        .ok();
 
     let result = conn.execute(
-        "INSERT INTO clips (content, content_hash, content_type, source_app, source_app_icon, content_highlighted, language, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "INSERT INTO clips (content, content_hash, content_type, source_app, source_app_icon, content_highlighted, language, created_at, sync_id, sync_version, deleted, origin_device_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11)
          ON CONFLICT(content_hash) DO UPDATE SET
             source_app = CASE
                 WHEN excluded.source_app <> '' THEN excluded.source_app
@@ -905,14 +912,30 @@ fn insert_clip(
                 ELSE clips.source_app_icon
             END,
             content_highlighted = COALESCE(excluded.content_highlighted, clips.content_highlighted),
-            created_at = excluded.created_at",
-        rusqlite::params![capped, hash, content_type, source_app.name, icon, highlighted, language, now],
+            created_at = excluded.created_at,
+            sync_id = COALESCE(clips.sync_id, excluded.sync_id),
+            sync_version = excluded.sync_version,
+            deleted = 0,
+            origin_device_id = COALESCE(clips.origin_device_id, excluded.origin_device_id)",
+        rusqlite::params![
+            capped,
+            hash,
+            content_type,
+            source_app.name,
+            icon,
+            highlighted,
+            language,
+            now,
+            sync_id,
+            sync_version,
+            origin_device_id
+        ],
     );
 
     if result.is_ok() {
         let clip_id: Option<i64> = conn
             .query_row(
-                "SELECT id FROM clips WHERE content_hash = ?",
+                "SELECT id FROM clips WHERE content_hash = ? AND deleted = 0",
                 [hash],
                 |row| row.get(0),
             )
@@ -920,6 +943,7 @@ fn insert_clip(
         drop(conn);
         if let Some(clip_id) = clip_id {
             enqueue_embedding(&state, clip_id, "insert_clip");
+            runtime::queue_clip_sync_change(app, sync_id);
         }
         let _ = app.emit("new-clip", ());
     }
@@ -950,9 +974,14 @@ fn insert_image_clip(
     let icon = fetch_app_icon(&state, source_app);
 
     let conn = state.db_write.lock().unwrap();
+    let sync_id = uuid::Uuid::new_v4().to_string();
+    let sync_version = SyncEngine::next_sync_version(&conn).unwrap_or(0);
+    let origin_device_id: Option<String> = conn
+        .query_row("SELECT device_id FROM device_info LIMIT 1", [], |row| row.get(0))
+        .ok();
     let result = conn.execute(
-        "INSERT INTO clips (content, content_hash, content_type, source_app, source_app_icon, ocr_text, language, image_data, image_thumbnail, image_width, image_height, created_at)
-         VALUES ('[Image]', ?1, 'image', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        "INSERT INTO clips (content, content_hash, content_type, source_app, source_app_icon, ocr_text, language, image_data, image_thumbnail, image_width, image_height, created_at, sync_id, sync_version, deleted, origin_device_id)
+         VALUES ('[Image]', ?1, 'image', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0, ?13)
          ON CONFLICT(content_hash) DO UPDATE SET
             source_app = CASE
                 WHEN excluded.source_app <> '' THEN excluded.source_app
@@ -977,14 +1006,32 @@ fn insert_image_clip(
                 WHEN excluded.image_height > 0 THEN excluded.image_height
                 ELSE clips.image_height
             END,
-            created_at = excluded.created_at",
-        rusqlite::params![hash, source_app.name, icon, ocr_text, language, store_bytes, thumb, width, height, now],
+            created_at = excluded.created_at,
+            sync_id = COALESCE(clips.sync_id, excluded.sync_id),
+            sync_version = excluded.sync_version,
+            deleted = 0,
+            origin_device_id = COALESCE(clips.origin_device_id, excluded.origin_device_id)",
+        rusqlite::params![
+            hash,
+            source_app.name,
+            icon,
+            ocr_text,
+            language,
+            store_bytes,
+            thumb,
+            width,
+            height,
+            now,
+            sync_id,
+            sync_version,
+            origin_device_id
+        ],
     );
 
     if result.is_ok() {
         let clip_id: Option<i64> = conn
             .query_row(
-                "SELECT id FROM clips WHERE content_hash = ?",
+                "SELECT id FROM clips WHERE content_hash = ? AND deleted = 0",
                 [hash],
                 |row| row.get(0),
             )
@@ -993,6 +1040,7 @@ fn insert_image_clip(
         if let (Some(clip_id), true) = (clip_id, ocr_text.is_some()) {
             enqueue_embedding(&state, clip_id, "insert_image_clip");
         }
+        runtime::queue_clip_sync_change(app, sync_id);
         let _ = app.emit("new-clip", ());
     }
 }

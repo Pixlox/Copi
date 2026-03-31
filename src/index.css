@@ -2015,6 +2015,135 @@ input::placeholder {
   filter: brightness(1.1);
 }
 
+/* Sync section */
+.settings-sync-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  padding: 10px 14px;
+}
+
+.settings-sync-metric {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--surface-secondary);
+  border: 0.5px solid var(--border-subtle);
+}
+
+.settings-sync-metric span {
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+.settings-sync-metric strong {
+  font-size: 13px;
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.settings-sync-device-pill {
+  margin: 0 14px 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: var(--accent-bg);
+  color: var(--accent-text);
+  font-size: 12px;
+  border: 0.5px solid var(--accent-border);
+}
+
+.settings-sync-list {
+  padding: 6px 10px 10px;
+}
+
+.settings-sync-device-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 4px;
+}
+
+.settings-sync-device-row:not(:last-child) {
+  border-bottom: 0.5px solid var(--border-subtle);
+}
+
+.settings-sync-device-name {
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+.settings-sync-device-meta {
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+.settings-sync-pair-form {
+  padding: 10px 14px;
+  display: grid;
+  gap: 8px;
+}
+
+.settings-sync-code-box {
+  padding: 12px 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.settings-sync-code-value {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 22px;
+  line-height: 1;
+  letter-spacing: 0.12em;
+  color: var(--text-primary);
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--surface-secondary);
+  border: 0.5px solid var(--border-subtle);
+}
+
+.settings-sync-code-exp {
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+.settings-sync-join-row {
+  padding: 10px 14px 0;
+}
+
+.settings-sync-input {
+  width: 100%;
+  background: var(--settings-input-bg);
+  border: none;
+  border-radius: 6px;
+  padding: 7px 10px;
+  font-size: 12px;
+  color: var(--text-primary);
+  outline: none;
+}
+
+.settings-sync-input:focus {
+  box-shadow: 0 0 0 2px var(--accent-solid);
+}
+
+.settings-sync-error {
+  font-size: 11px;
+  color: var(--danger-text);
+}
+
+@media (max-width: 760px) {
+  .settings-sync-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
 /* ═══ Collection Row Actions ═══════════════════════════════════════ */
 
 .settings-collection-actions {

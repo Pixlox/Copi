@@ -6,6 +6,7 @@ import {
   Keyboard,
   Palette,
   Shield,
+  Wifi,
   HardDrive,
   Sun,
   Moon,
@@ -17,6 +18,7 @@ import {
   FolderOpen,
   Pencil,
   Check,
+  Laptop,
 } from "lucide-react";
 import { useThemeContext } from "../contexts/ThemeContext";
 import Picker from "../components/Picker";
@@ -43,6 +45,46 @@ interface CopiConfig {
   privacy: {
     excluded_apps: string[];
   };
+  sync: {
+    enabled: boolean;
+    device_name: string | null;
+    auto_connect: boolean;
+    sync_embeddings: boolean;
+  };
+}
+
+interface SyncStatus {
+  enabled: boolean;
+  device: {
+    deviceId: string;
+    deviceName: string;
+    platform: string;
+  } | null;
+  pairedCount: number;
+  connectedCount: number;
+  queueDepth: number;
+}
+
+interface SyncPairedDevice {
+  deviceId: string;
+  deviceName: string;
+  platform: string;
+  pairedAt: number;
+  lastSeen: number | null;
+  lastSyncVersion: number;
+}
+
+interface SyncDiscoveredDevice {
+  deviceId: string;
+  deviceName: string;
+  platform: string;
+  isPaired: boolean;
+  isConnected: boolean;
+}
+
+interface SyncPairingCode {
+  code: string;
+  expiresAt: number;
 }
 
 interface CollectionInfo {
@@ -53,12 +95,13 @@ interface CollectionInfo {
   created_at: number;
 }
 
-type Section = "general" | "appearance" | "privacy" | "data" | "collections";
+type Section = "general" | "appearance" | "privacy" | "sync" | "data" | "collections";
 
 const SECTIONS: { id: Section; label: string; icon: typeof Keyboard }[] = [
   { id: "general", label: "General", icon: Keyboard },
   { id: "appearance", label: "Appearance", icon: Palette },
   { id: "privacy", label: "Privacy", icon: Shield },
+  { id: "sync", label: "Sync", icon: Wifi },
   { id: "data", label: "Data", icon: HardDrive },
   { id: "collections", label: "Collections", icon: FolderOpen },
 ];
@@ -421,6 +464,296 @@ function DataSection({
   );
 }
 
+function SyncSection({
+  config,
+  saveConfig,
+  status,
+  pairedDevices,
+  discoveredDevices,
+  pairingCode,
+  onRefresh,
+  onUnpair,
+  onManualPair,
+  onStartPairing,
+  onPairWithCode,
+}: {
+  config: CopiConfig;
+  saveConfig: (c: CopiConfig) => void;
+  status: SyncStatus | null;
+  pairedDevices: SyncPairedDevice[];
+  discoveredDevices: SyncDiscoveredDevice[];
+  pairingCode: SyncPairingCode | null;
+  onRefresh: () => void;
+  onUnpair: (deviceId: string) => void;
+  onManualPair: (payload: {
+    deviceId: string;
+    deviceName: string;
+    platform: string;
+    publicKeyBase64: string;
+  }) => Promise<void>;
+  onStartPairing: () => Promise<void>;
+  onPairWithCode: (deviceId: string, code: string) => Promise<void>;
+}) {
+  const [showManualPair, setShowManualPair] = useState(false);
+  const [pairing, setPairing] = useState(false);
+  const [manual, setManual] = useState({
+    deviceId: "",
+    deviceName: "",
+    platform: "macos",
+    publicKeyBase64: "",
+  });
+  const [manualError, setManualError] = useState<string | null>(null);
+  const [joinCode, setJoinCode] = useState("");
+  const [pairingBusyId, setPairingBusyId] = useState<string | null>(null);
+
+  return (
+    <>
+      <SettingCard>
+        <SettingRow
+          label="Enable LAN Sync"
+          description="Sync clips and collections with other Copi devices on your local network"
+        >
+          <Toggle
+            checked={config.sync.enabled}
+            onChange={(v) => saveConfig({ ...config, sync: { ...config.sync, enabled: v } })}
+          />
+        </SettingRow>
+        <SettingDivider />
+        <SettingRow label="Device Name" description="How this device appears to other paired devices">
+          <input
+            className="settings-sync-input"
+            value={config.sync.device_name ?? ""}
+            onChange={(e) =>
+              saveConfig({
+                ...config,
+                sync: {
+                  ...config.sync,
+                  device_name: e.target.value.trim() ? e.target.value : null,
+                },
+              })
+            }
+            placeholder="Auto-detected"
+          />
+        </SettingRow>
+      </SettingCard>
+
+      <SettingCard>
+        <SettingRow label="Auto-connect" description="Reconnect to paired devices when they become available">
+          <Toggle
+            checked={config.sync.auto_connect}
+            onChange={(v) => saveConfig({ ...config, sync: { ...config.sync, auto_connect: v } })}
+          />
+        </SettingRow>
+        <SettingDivider />
+        <SettingRow label="Sync Embeddings" description="Transfer semantic vectors between devices to avoid reprocessing">
+          <Toggle
+            checked={config.sync.sync_embeddings}
+            onChange={(v) => saveConfig({ ...config, sync: { ...config.sync, sync_embeddings: v } })}
+          />
+        </SettingRow>
+      </SettingCard>
+
+      <SettingCard>
+        <SettingRow label="Status" description="Current LAN sync service status">
+          <button className="settings-btn" onClick={onRefresh}>
+            <RefreshCw size={12} /> Refresh
+          </button>
+        </SettingRow>
+        <SettingDivider />
+        <div className="settings-sync-metrics">
+          <div className="settings-sync-metric">
+            <span>Mode</span>
+            <strong>{status?.enabled ? "Enabled" : "Disabled"}</strong>
+          </div>
+          <div className="settings-sync-metric">
+            <span>Connected</span>
+            <strong>{status?.connectedCount ?? 0}</strong>
+          </div>
+          <div className="settings-sync-metric">
+            <span>Paired</span>
+            <strong>{status?.pairedCount ?? pairedDevices.length}</strong>
+          </div>
+          <div className="settings-sync-metric">
+            <span>Queue</span>
+            <strong>{status?.queueDepth ?? 0}</strong>
+          </div>
+        </div>
+        {status?.device && (
+          <div className="settings-sync-device-pill">
+            <Laptop size={12} />
+            <span>
+              {status.device.deviceName} ({status.device.platform})
+            </span>
+          </div>
+        )}
+      </SettingCard>
+
+      <SettingCard>
+        <SettingRow label="Pairing Code" description="Generate a 4-digit code on this device and enter it on another device">
+          <button className="settings-btn primary" onClick={() => void onStartPairing()}>
+            <Wifi size={12} /> Generate
+          </button>
+        </SettingRow>
+        <SettingDivider />
+        <div className="settings-sync-code-box">
+          <span className="settings-sync-code-value">{pairingCode?.code ?? "----"}</span>
+          <span className="settings-sync-code-exp">
+            {pairingCode ? `Expires in ${Math.max(0, pairingCode.expiresAt - Math.floor(Date.now() / 1000))}s` : "No active code"}
+          </span>
+        </div>
+      </SettingCard>
+
+      <SettingCard>
+        <SettingRow label="Discovered Devices" description="Devices found on your local network">
+          <button className="settings-btn" onClick={onRefresh}>
+            <RefreshCw size={12} /> Refresh
+          </button>
+        </SettingRow>
+        <SettingDivider />
+        <div className="settings-sync-join-row">
+          <input
+            className="settings-sync-input"
+            placeholder="Enter 4-digit code"
+            value={joinCode}
+            onChange={(e) => setJoinCode(e.target.value.replace(/[^0-9]/g, "").slice(0, 4))}
+          />
+        </div>
+        <div className="settings-sync-list">
+          {discoveredDevices.length === 0 && (
+            <div className="settings-row">
+              <div className="settings-row-info">
+                <span className="settings-row-label" style={{ color: "var(--text-tertiary)" }}>
+                  No devices discovered yet
+                </span>
+              </div>
+            </div>
+          )}
+          {discoveredDevices.map((device) => (
+            <div key={device.deviceId} className="settings-sync-device-row">
+              <div>
+                <div className="settings-sync-device-name">{device.deviceName}</div>
+                <div className="settings-sync-device-meta">
+                  {device.platform} • {device.isConnected ? "online" : "idle"}
+                </div>
+              </div>
+              <button
+                className="settings-btn primary"
+                disabled={device.isPaired || joinCode.length !== 4 || pairingBusyId === device.deviceId}
+                onClick={async () => {
+                  setPairingBusyId(device.deviceId);
+                  try {
+                    await onPairWithCode(device.deviceId, joinCode);
+                    setJoinCode("");
+                  } catch (e) {
+                    console.error("Pair by code failed", e);
+                  } finally {
+                    setPairingBusyId(null);
+                  }
+                }}
+              >
+                {device.isPaired ? "Paired" : pairingBusyId === device.deviceId ? "Pairing..." : "Pair"}
+              </button>
+            </div>
+          ))}
+        </div>
+      </SettingCard>
+
+      <SettingCard>
+        <SettingRow label="Paired Devices" description="Devices allowed to sync with this machine">
+          <button className="settings-btn" onClick={() => setShowManualPair((v) => !v)}>
+            <Plus size={12} /> {showManualPair ? "Close" : "Manual Pair"}
+          </button>
+        </SettingRow>
+        {showManualPair && (
+          <>
+            <SettingDivider />
+            <div className="settings-sync-pair-form">
+              <input
+                className="settings-sync-input"
+                placeholder="Device ID"
+                value={manual.deviceId}
+                onChange={(e) => setManual((p) => ({ ...p, deviceId: e.target.value }))}
+              />
+              <input
+                className="settings-sync-input"
+                placeholder="Device Name"
+                value={manual.deviceName}
+                onChange={(e) => setManual((p) => ({ ...p, deviceName: e.target.value }))}
+              />
+              <select
+                className="settings-sync-input"
+                value={manual.platform}
+                onChange={(e) => setManual((p) => ({ ...p, platform: e.target.value }))}
+              >
+                <option value="macos">macOS</option>
+                <option value="windows">Windows</option>
+                <option value="linux">Linux</option>
+              </select>
+              <input
+                className="settings-sync-input"
+                placeholder="Public Key (base64)"
+                value={manual.publicKeyBase64}
+                onChange={(e) => setManual((p) => ({ ...p, publicKeyBase64: e.target.value }))}
+              />
+              {manualError && <span className="settings-sync-error">{manualError}</span>}
+              <button
+                className="settings-btn primary"
+                disabled={pairing}
+                onClick={async () => {
+                  setPairing(true);
+                  setManualError(null);
+                  try {
+                    await onManualPair(manual);
+                    setManual({ deviceId: "", deviceName: "", platform: "macos", publicKeyBase64: "" });
+                    setShowManualPair(false);
+                  } catch (e) {
+                    setManualError(
+                      typeof e === "string"
+                        ? e
+                        : e instanceof Error
+                        ? e.message
+                        : "Pairing failed"
+                    );
+                  } finally {
+                    setPairing(false);
+                  }
+                }}
+              >
+                {pairing ? "Pairing..." : "Pair Device"}
+              </button>
+            </div>
+          </>
+        )}
+        <SettingDivider />
+        <div className="settings-sync-list">
+          {pairedDevices.length === 0 && (
+            <div className="settings-row">
+              <div className="settings-row-info">
+                <span className="settings-row-label" style={{ color: "var(--text-tertiary)" }}>
+                  No paired devices yet
+                </span>
+              </div>
+            </div>
+          )}
+          {pairedDevices.map((device) => (
+            <div key={device.deviceId} className="settings-sync-device-row">
+              <div>
+                <div className="settings-sync-device-name">{device.deviceName}</div>
+                <div className="settings-sync-device-meta">
+                  {device.platform} • last sync #{device.lastSyncVersion}
+                </div>
+              </div>
+              <button className="settings-btn danger" onClick={() => onUnpair(device.deviceId)}>
+                Unpair
+              </button>
+            </div>
+          ))}
+        </div>
+      </SettingCard>
+    </>
+  );
+}
+
 function CollectionsSection({
   collections,
   onDelete,
@@ -664,6 +997,10 @@ export default function Settings() {
   const [clipCount, setClipCount] = useState(0);
   const [appVersion, setAppVersion] = useState<string | null>(null);
   const [collections, setCollections] = useState<CollectionInfo[]>([]);
+  const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null);
+  const [pairedDevices, setPairedDevices] = useState<SyncPairedDevice[]>([]);
+  const [discoveredDevices, setDiscoveredDevices] = useState<SyncDiscoveredDevice[]>([]);
+  const [pairingCode, setPairingCode] = useState<SyncPairingCode | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
   const [clearError, setClearError] = useState<string | null>(null);
   const [clearing, setClearing] = useState(false);
@@ -673,6 +1010,16 @@ export default function Settings() {
 
   const fetchCollections = useCallback(() => {
     invoke<CollectionInfo[]>("list_collections").then(setCollections).catch(() => {});
+  }, []);
+
+  const fetchSync = useCallback(() => {
+    invoke<SyncStatus>("sync_get_status").then(setSyncStatus).catch(() => {});
+    invoke<SyncPairedDevice[]>("sync_list_paired_devices")
+      .then(setPairedDevices)
+      .catch(() => {});
+    invoke<SyncDiscoveredDevice[]>("sync_list_discovered_devices")
+      .then(setDiscoveredDevices)
+      .catch(() => {});
   }, []);
 
   const refreshStats = useCallback(async () => {
@@ -706,7 +1053,8 @@ export default function Settings() {
     void refreshStats();
     getVersion().then(setAppVersion).catch(() => {});
     fetchCollections();
-  }, [fetchCollections, refreshStats]);
+    fetchSync();
+  }, [fetchCollections, fetchSync, refreshStats]);
 
   // Listen to collections-changed event for real-time updates
   useEffect(() => {
@@ -728,6 +1076,7 @@ export default function Settings() {
     const unlistenShown = listen("settings:shown", () => {
       scheduleStatsRefresh(0);
       fetchCollections();
+      fetchSync();
     });
 
     return () => {
@@ -738,7 +1087,7 @@ export default function Settings() {
       unlistenChanged.then((fn) => fn());
       unlistenShown.then((fn) => fn());
     };
-  }, [fetchCollections, scheduleStatsRefresh]);
+  }, [fetchCollections, fetchSync, scheduleStatsRefresh]);
 
   const saveConfig = useCallback(
     async (updated: CopiConfig) => {
@@ -792,6 +1141,62 @@ export default function Settings() {
       console.error("Update collection color failed:", e);
     }
   };
+
+  const handleUnpairDevice = async (deviceId: string) => {
+    try {
+      await invoke("sync_unpair_device", { deviceId });
+      fetchSync();
+    } catch (e) {
+      console.error("Unpair device failed:", e);
+    }
+  };
+
+  const handleManualPair = async (payload: {
+    deviceId: string;
+    deviceName: string;
+    platform: string;
+    publicKeyBase64: string;
+  }) => {
+    await invoke("sync_pair_device_manual", payload);
+    fetchSync();
+  };
+
+  const handleStartPairing = async () => {
+    const result = await invoke<SyncPairingCode>("sync_start_pairing");
+    setPairingCode(result);
+    fetchSync();
+  };
+
+  const handlePairWithCode = async (deviceId: string, code: string) => {
+    await invoke("sync_pair_with_code", { deviceId, code });
+    fetchSync();
+  };
+
+  useEffect(() => {
+    const unlistenFound = listen<SyncDiscoveredDevice>("sync:discovered-updated", (event) => {
+      setDiscoveredDevices((prev) => {
+        const next = prev.filter((d) => d.deviceId !== event.payload.deviceId);
+        next.push(event.payload);
+        return next.sort((a, b) => a.deviceName.localeCompare(b.deviceName));
+      });
+    });
+    const unlistenLost = listen<string>("sync:discovered-lost", (event) => {
+      setDiscoveredDevices((prev) => prev.filter((d) => d.deviceId !== event.payload));
+    });
+    const unlistenOffer = listen<SyncPairingCode>("sync:pairing-offer", (event) => {
+      setPairingCode(event.payload);
+    });
+    const unlistenCfg = listen("sync:config-updated", () => {
+      fetchSync();
+    });
+
+    return () => {
+      unlistenFound.then((fn) => fn());
+      unlistenLost.then((fn) => fn());
+      unlistenOffer.then((fn) => fn());
+      unlistenCfg.then((fn) => fn());
+    };
+  }, [fetchSync]);
 
   const handleClearHistory = async () => {
     setClearing(true);
@@ -856,6 +1261,21 @@ export default function Settings() {
           {activeSection === "general" && <GeneralSection config={config} saveConfig={saveConfig} />}
           {activeSection === "appearance" && <AppearanceSection config={config} saveConfig={saveConfig} />}
           {activeSection === "privacy" && <PrivacySection config={config} saveConfig={saveConfig} />}
+          {activeSection === "sync" && (
+            <SyncSection
+              config={config}
+              saveConfig={saveConfig}
+              status={syncStatus}
+              pairedDevices={pairedDevices}
+              discoveredDevices={discoveredDevices}
+              pairingCode={pairingCode}
+              onRefresh={fetchSync}
+              onUnpair={handleUnpairDevice}
+              onManualPair={handleManualPair}
+              onStartPairing={handleStartPairing}
+              onPairWithCode={handlePairWithCode}
+            />
+          )}
           {activeSection === "data" && (
             <DataSection
               dbSize={dbSize}

@@ -1,12 +1,15 @@
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager};
 
+use crate::sync::runtime;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CopiConfig {
     pub general: GeneralConfig,
     pub appearance: AppearanceConfig,
     pub privacy: PrivacyConfig,
+    pub sync: SyncConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,6 +36,39 @@ pub struct PrivacyConfig {
     pub excluded_apps: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SyncConfig {
+    /// Whether LAN sync is enabled
+    pub enabled: bool,
+    /// This device's display name (auto-detected if not set)
+    pub device_name: Option<String>,
+    /// Auto-connect to paired devices when they come online
+    pub auto_connect: bool,
+    /// Sync embeddings along with clips (increases bandwidth but avoids regeneration)
+    pub sync_embeddings: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncConfigPayload {
+    pub enabled: bool,
+    pub device_name: Option<String>,
+    pub auto_connect: bool,
+    pub sync_embeddings: bool,
+}
+
+impl From<SyncConfig> for SyncConfigPayload {
+    fn from(value: SyncConfig) -> Self {
+        Self {
+            enabled: value.enabled,
+            device_name: value.device_name,
+            auto_connect: value.auto_connect,
+            sync_embeddings: value.sync_embeddings,
+        }
+    }
+}
+
 impl Default for CopiConfig {
     fn default() -> Self {
         Self {
@@ -51,6 +87,7 @@ impl Default for CopiConfig {
             privacy: PrivacyConfig {
                 excluded_apps: default_excluded_apps(),
             },
+            sync: SyncConfig::default(),
         }
     }
 }
@@ -109,6 +146,17 @@ impl Default for AppearanceConfig {
 impl Default for PrivacyConfig {
     fn default() -> Self {
         CopiConfig::default().privacy
+    }
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            device_name: None,
+            auto_connect: true,
+            sync_embeddings: true,
+        }
     }
 }
 
@@ -189,6 +237,8 @@ pub async fn set_config(app: tauri::AppHandle, config: CopiConfig) -> Result<(),
     }
 
     save_config(&app, &config)?;
+    let _ = app.emit("sync:config-updated", SyncConfigPayload::from(config.sync.clone()));
+    crate::sync::apply_config_change(&app, existing.as_ref(), &config);
 
     if existing
         .as_ref()
@@ -249,7 +299,11 @@ pub async fn clear_all_history(app: tauri::AppHandle) -> Result<(), String> {
     let state = app.state::<crate::AppState>();
     let mut conn = state.db_write.lock().map_err(|e| e.to_string())?;
     let tx = conn.transaction().map_err(|e| e.to_string())?;
-    tx.execute("DELETE FROM clips", [])
+    let sync_version = crate::sync::engine::SyncEngine::next_sync_version(&tx).unwrap_or(0);
+    tx.execute(
+        "UPDATE clips SET deleted = 1, sync_version = ?1 WHERE deleted = 0",
+        rusqlite::params![sync_version],
+    )
         .map_err(|e| e.to_string())?;
     tx.execute("DROP TABLE IF EXISTS clip_embeddings", [])
         .map_err(|e| e.to_string())?;
@@ -261,7 +315,23 @@ pub async fn clear_all_history(app: tauri::AppHandle) -> Result<(), String> {
     tx.execute_batch("INSERT INTO clips_fts(clips_fts) VALUES('rebuild');")
         .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
+
+    let state = app.state::<crate::AppState>();
+    let conn = state.db_write.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare("SELECT sync_id FROM clips WHERE deleted = 1")
+        .map_err(|e| e.to_string())?;
+    let ids: Vec<String> = stmt
+        .query_map([], |row| row.get(0))
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+    drop(stmt);
     drop(conn);
+
+    for id in ids {
+        runtime::queue_clip_sync_change(&app, id);
+    }
     let _ = app.emit("clips-changed", ());
     let _ = app.emit("collections-changed", ());
     Ok(())
