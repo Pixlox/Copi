@@ -13,8 +13,8 @@ use tokio::sync::Mutex;
 
 use super::{SyncError, SyncResult};
 
-/// Timeout for establishing a TCP connection to a peer
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Timeout for the entire connect flow (TCP connect + Noise handshake)
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Noise protocol pattern for mutual authentication
 /// XX pattern: Both parties authenticate each other
@@ -35,15 +35,33 @@ pub struct SecureTransport {
 }
 
 impl SecureTransport {
-    /// Connect to a remote peer and establish encrypted channel (initiator)
+    /// Connect to a remote peer and establish encrypted channel (initiator).
+    /// Applies a single timeout to the entire flow (TCP connect + Noise handshake)
+    /// so nothing can hang indefinitely.
     pub async fn connect(
         addr: SocketAddr,
         our_private_key: &[u8; 32],
         expected_public_key: Option<&[u8]>,
     ) -> SyncResult<Self> {
-        let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
+        // Clone data we need to move into the timeout future
+        let key = *our_private_key;
+        let expected = expected_public_key.map(|k| k.to_vec());
+
+        tokio::time::timeout(CONNECT_TIMEOUT, async move {
+            Self::connect_inner(addr, &key, expected.as_deref()).await
+        })
+        .await
+        .map_err(|_| SyncError::ConnectionFailed(format!("Connection to {} timed out", addr)))?
+    }
+
+    /// Inner connect logic (TCP + Noise handshake) — no timeout wrapper.
+    async fn connect_inner(
+        addr: SocketAddr,
+        our_private_key: &[u8; 32],
+        expected_public_key: Option<&[u8]>,
+    ) -> SyncResult<Self> {
+        let stream = TcpStream::connect(addr)
             .await
-            .map_err(|_| SyncError::ConnectionFailed(format!("Connection to {} timed out", addr)))?
             .map_err(|e| SyncError::ConnectionFailed(e.to_string()))?;
 
         let (noise, remote_public_key, stream) =
