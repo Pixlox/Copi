@@ -35,35 +35,27 @@ fn now_ts() -> i64 {
         .unwrap_or(0)
 }
 
-/// Select the best IP address from a list of addresses.
-/// Prefers routable IPv4 addresses, then IPv6 global addresses, then any available.
-fn select_best_address(addresses: &[IpAddr]) -> Option<IpAddr> {
-    // Priority 1: Routable IPv4 (not loopback, not link-local)
-    if let Some(ip) = addresses.iter().find(|ip| {
-        if let IpAddr::V4(v4) = ip {
-            !v4.is_loopback() && !v4.is_link_local() && !v4.is_unspecified()
-        } else {
-            false
+/// Sort addresses by connection preference: routable IPv4 first, then global
+/// IPv6, then anything else. Returns a Vec so callers can try each in order.
+fn sort_addresses_by_preference(addresses: &[IpAddr]) -> Vec<IpAddr> {
+    let mut sorted: Vec<IpAddr> = addresses.to_vec();
+    sorted.sort_by_key(|ip| match ip {
+        // Priority 0: Routable IPv4
+        IpAddr::V4(v4) if !v4.is_loopback() && !v4.is_link_local() && !v4.is_unspecified() => 0,
+        // Priority 1: Global IPv6 (not link-local fe80::/10)
+        IpAddr::V6(v6)
+            if !v6.is_loopback()
+                && !v6.is_unspecified()
+                && (v6.segments()[0] & 0xffc0) != 0xfe80 =>
+        {
+            1
         }
-    }) {
-        return Some(*ip);
-    }
-
-    // Priority 2: Global IPv6 (not link-local, not loopback)
-    if let Some(ip) = addresses.iter().find(|ip| {
-        if let IpAddr::V6(v6) = ip {
-            !v6.is_loopback() && !v6.is_unspecified() 
-                // Check it's not link-local (fe80::/10)
-                && (v6.segments()[0] & 0xffc0) != 0xfe80
-        } else {
-            false
-        }
-    }) {
-        return Some(*ip);
-    }
-
-    // Fallback: any address
-    addresses.first().copied()
+        // Priority 2: everything else
+        _ => 2,
+    });
+    // Drop completely unusable (loopback/unspecified) addresses
+    sorted.retain(|ip| !ip.is_loopback() && !ip.is_unspecified());
+    sorted
 }
 
 fn app_state(app: &tauri::AppHandle) -> Result<tauri::State<'_, crate::AppState>, String> {
@@ -163,7 +155,7 @@ async fn flush_pending_for_device(runtime: Arc<SyncRuntime>, device_id: String) 
     let mut local_priv = [0_u8; 32];
     local_priv.copy_from_slice(local_identity.private_key.as_bytes());
 
-    let resolved_addr = {
+    let candidate_addrs = {
         let discovery_guard = runtime.service.discovery.read().await;
         let Some(ds) = discovery_guard.as_ref() else {
             return;
@@ -171,24 +163,34 @@ async fn flush_pending_for_device(runtime: Arc<SyncRuntime>, device_id: String) 
         let Some(dev) = ds.get_device(&device_id) else {
             return;
         };
-        let Some(ip) = select_best_address(&dev.addresses) else {
-            return;
-        };
-        SocketAddr::new(ip, dev.port)
-    };
-
-    let transport = match super::transport::SecureTransport::connect(
-        resolved_addr,
-        &local_priv,
-        Some(&peer_public_key),
-    )
-    .await
-    {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("[Sync] Connect failed {}: {}", device_id, e);
+        let addrs = sort_addresses_by_preference(&dev.addresses);
+        if addrs.is_empty() {
             return;
         }
+        addrs.into_iter().map(|ip| SocketAddr::new(ip, dev.port)).collect::<Vec<_>>()
+    };
+
+    let mut transport = None;
+    for addr in &candidate_addrs {
+        match super::transport::SecureTransport::connect(
+            *addr,
+            &local_priv,
+            Some(&peer_public_key),
+        )
+        .await
+        {
+            Ok(t) => {
+                transport = Some(t);
+                break;
+            }
+            Err(e) => {
+                eprintln!("[Sync] Connect to {} failed for {}: {}", addr, device_id, e);
+            }
+        }
+    }
+    let Some(transport) = transport else {
+        eprintln!("[Sync] All addresses exhausted for {}", device_id);
+        return;
     };
 
     let push = super::protocol::SyncMessage::PushOperations(super::protocol::PushOperations {
@@ -865,8 +867,10 @@ pub async fn pair_with_code(
             .get_device(&device_id)
             .ok_or_else(|| "Device not discovered".to_string())?
     };
-    let ip = select_best_address(&discovered.addresses)
-        .ok_or_else(|| "No address for selected device".to_string())?;
+    let candidate_addrs = sort_addresses_by_preference(&discovered.addresses);
+    if candidate_addrs.is_empty() {
+        return Err("No usable address for selected device".to_string());
+    }
 
     let (local_identity, local_id) = {
         let identity = load_or_generate_identity(&app, None)?;
@@ -876,13 +880,28 @@ pub async fn pair_with_code(
 
     let mut private_key = [0u8; 32];
     private_key.copy_from_slice(local_identity.private_key.as_bytes());
-    let transport = super::transport::SecureTransport::connect(
-        SocketAddr::new(ip, discovered.port),
-        &private_key,
-        None,
-    )
-    .await
-    .map_err(|e| e.to_string())?;
+
+    let mut transport = None;
+    let mut last_err = String::new();
+    for addr in &candidate_addrs {
+        match super::transport::SecureTransport::connect(
+            SocketAddr::new(*addr, discovered.port),
+            &private_key,
+            None,
+        )
+        .await
+        {
+            Ok(t) => {
+                transport = Some(t);
+                break;
+            }
+            Err(e) => {
+                last_err = e.to_string();
+                eprintln!("[Sync] Pairing connect to {} failed: {}", addr, last_err);
+            }
+        }
+    }
+    let transport = transport.ok_or_else(|| format!("All addresses failed: {}", last_err))?;
 
     let local_pub = base64::engine::general_purpose::STANDARD.encode(local_identity.public_key.as_bytes());
     let payload = serde_json::json!({

@@ -4,13 +4,17 @@
 //! Uses the Noise_XX_25519_ChaChaPoly_BLAKE2s pattern for mutual authentication.
 
 use snow::{Builder, TransportState};
-use std::net::SocketAddr;
+use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
 use super::{SyncError, SyncResult};
+
+/// Timeout for establishing a TCP connection to a peer
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Noise protocol pattern for mutual authentication
 /// XX pattern: Both parties authenticate each other
@@ -37,8 +41,9 @@ impl SecureTransport {
         our_private_key: &[u8; 32],
         expected_public_key: Option<&[u8]>,
     ) -> SyncResult<Self> {
-        let stream = TcpStream::connect(addr)
+        let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
             .await
+            .map_err(|_| SyncError::ConnectionFailed(format!("Connection to {} timed out", addr)))?
             .map_err(|e| SyncError::ConnectionFailed(e.to_string()))?;
 
         let (noise, remote_public_key, stream) =
@@ -266,10 +271,22 @@ pub struct SecureListener {
 }
 
 impl SecureListener {
-    /// Create a new listener on the specified port
+    /// Create a new listener on the specified port.
+    /// Attempts dual-stack binding ([::]) first — this accepts both IPv4 and
+    /// IPv6 connections on every major OS. Falls back to IPv4-only (0.0.0.0)
+    /// when dual-stack is unavailable.
     pub async fn bind(port: u16, our_private_key: [u8; 32]) -> SyncResult<Self> {
-        let listener = TcpListener::bind(("0.0.0.0", port)).await?;
-        eprintln!("[Sync] Listening on port {}", port);
+        let listener = match TcpListener::bind(SocketAddr::from((Ipv6Addr::UNSPECIFIED, port))).await {
+            Ok(l) => {
+                eprintln!("[Sync] Listening on port {} (dual-stack)", port);
+                l
+            }
+            Err(_) => {
+                let l = TcpListener::bind(("0.0.0.0", port)).await?;
+                eprintln!("[Sync] Listening on port {} (IPv4 only)", port);
+                l
+            }
+        };
         Ok(Self {
             listener,
             our_private_key,

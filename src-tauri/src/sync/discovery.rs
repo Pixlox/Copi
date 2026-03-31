@@ -6,8 +6,10 @@
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
+use std::time::Duration;
 use tokio::sync::broadcast;
 
 use super::device::{DeviceInfo, Platform};
@@ -18,6 +20,12 @@ const SERVICE_TYPE: &str = "_copi._tcp.local.";
 
 /// Default port for sync connections
 pub const DEFAULT_SYNC_PORT: u16 = 47524; // "COPI" on phone keypad (2674) + offset
+
+/// Maximum retries for mDNS browse on disconnect before giving up
+const BROWSE_MAX_RETRIES: u32 = 3;
+
+/// Delay between browse retry attempts
+const BROWSE_RETRY_DELAY: Duration = Duration::from_secs(2);
 
 /// Discovered device on the network
 #[derive(Debug, Clone)]
@@ -36,6 +44,7 @@ pub struct DiscoveryService {
     discovered: Arc<RwLock<HashMap<String, DiscoveredDevice>>>,
     event_tx: broadcast::Sender<DiscoveryEvent>,
     service_name: String,
+    stopped: AtomicBool,
 }
 
 /// Events from the discovery service
@@ -64,6 +73,7 @@ impl DiscoveryService {
             discovered: Arc::new(RwLock::new(HashMap::new())),
             event_tx,
             service_name,
+            stopped: AtomicBool::new(false),
         })
     }
 
@@ -124,13 +134,11 @@ impl DiscoveryService {
         Ok(())
     }
 
-    /// Browse for other Copi services on the network
+    /// Browse for other Copi services on the network.
+    /// The browse thread automatically retries on disconnect (up to
+    /// BROWSE_MAX_RETRIES) to handle transient network interface changes.
     fn browse(&self) -> SyncResult<()> {
-        let receiver = self
-            .daemon
-            .browse(SERVICE_TYPE)
-            .map_err(|e| SyncError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-
+        let daemon = self.daemon.clone();
         let discovered = self.discovered.clone();
         let event_tx = self.event_tx.clone();
         let our_device_id = self.our_device_id.clone();
@@ -138,18 +146,60 @@ impl DiscoveryService {
         // Use std::thread for the blocking mDNS receiver (crossbeam channel)
         thread::Builder::new()
             .name("mdns-browse".to_string())
-            .spawn(move || loop {
-                match receiver.recv() {
-                    Ok(event) => {
-                        Self::handle_discovery_event(event, &discovered, &event_tx, &our_device_id);
+            .spawn(move || {
+                let mut retries = 0u32;
+
+                loop {
+                    let receiver = match daemon.browse(SERVICE_TYPE) {
+                        Ok(r) => {
+                            // Successful browse resets the retry counter
+                            retries = 0;
+                            r
+                        }
+                        Err(e) => {
+                            eprintln!("[Sync] mDNS browse start failed: {:?}", e);
+                            retries += 1;
+                            if retries > BROWSE_MAX_RETRIES {
+                                eprintln!("[Sync] mDNS browse retries exhausted, giving up");
+                                break;
+                            }
+                            thread::sleep(BROWSE_RETRY_DELAY);
+                            continue;
+                        }
+                    };
+
+                    // Process events until the channel disconnects
+                    loop {
+                        match receiver.recv() {
+                            Ok(event) => {
+                                Self::handle_discovery_event(
+                                    event,
+                                    &discovered,
+                                    &event_tx,
+                                    &our_device_id,
+                                );
+                            }
+                            Err(_) => {
+                                // Channel disconnected (network interface change, daemon restart)
+                                break;
+                            }
+                        }
                     }
-                    Err(e) => {
-                        eprintln!("[Sync] mDNS browse error: {:?}", e);
+
+                    retries += 1;
+                    if retries > BROWSE_MAX_RETRIES {
+                        eprintln!("[Sync] mDNS browse disconnected {} times, giving up", retries);
                         break;
                     }
+
+                    eprintln!(
+                        "[Sync] mDNS browse disconnected, retrying ({}/{})",
+                        retries, BROWSE_MAX_RETRIES
+                    );
+                    thread::sleep(BROWSE_RETRY_DELAY);
                 }
             })
-            .map_err(|e| SyncError::IoError(e))?;
+            .map_err(SyncError::IoError)?;
 
         Ok(())
     }
@@ -245,8 +295,13 @@ impl DiscoveryService {
         self.discovered.read().ok()?.get(device_id).cloned()
     }
 
-    /// Stop the discovery service
+    /// Stop the discovery service (idempotent — safe to call multiple times)
     pub fn stop(&self) -> SyncResult<()> {
+        if self.stopped.swap(true, Ordering::SeqCst) {
+            // Already stopped
+            return Ok(());
+        }
+
         // Unregister our service
         let _ = self.daemon.unregister(&self.service_name);
         // Stop browsing
