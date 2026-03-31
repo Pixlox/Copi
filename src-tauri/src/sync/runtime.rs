@@ -472,18 +472,38 @@ async fn listener_loop(runtime: Arc<SyncRuntime>, private_key: [u8; 32], generat
             break;
         }
 
-        match tokio::time::timeout(Duration::from_secs(1), listener.accept()).await {
-            Ok(Ok(transport)) => {
+        // Timeout only covers the TCP accept (waiting for new connections).
+        // The Noise handshake runs in a spawned task with its own timeout.
+        match tokio::time::timeout(Duration::from_secs(2), listener.accept_tcp()).await {
+            Ok(Ok((stream, addr))) => {
+                eprintln!("[Sync] Incoming TCP connection from {}", addr);
                 let rt = runtime.clone();
+                let key = listener.private_key();
                 tauri::async_runtime::spawn(async move {
-                    handle_incoming_connection(rt, transport).await;
+                    // Give the Noise handshake a generous timeout (separate from accept polling)
+                    match tokio::time::timeout(
+                        Duration::from_secs(10),
+                        super::transport::SecureTransport::accept(stream, &key),
+                    )
+                    .await
+                    {
+                        Ok(Ok(transport)) => {
+                            handle_incoming_connection(rt, transport).await;
+                        }
+                        Ok(Err(e)) => {
+                            eprintln!("[Sync] Handshake with {} failed: {}", addr, e);
+                        }
+                        Err(_) => {
+                            eprintln!("[Sync] Handshake with {} timed out", addr);
+                        }
+                    }
                 });
             }
             Ok(Err(e)) => {
-                eprintln!("[Sync] Accept failed: {}", e);
+                eprintln!("[Sync] TCP accept failed: {}", e);
                 tokio::time::sleep(Duration::from_millis(300)).await;
             }
-            Err(_) => {}
+            Err(_) => {} // timeout — loop back to check shutdown flag
         }
     }
 }

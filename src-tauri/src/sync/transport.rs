@@ -14,7 +14,7 @@ use tokio::sync::Mutex;
 use super::{SyncError, SyncResult};
 
 /// Timeout for establishing a TCP connection to a peer
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Noise protocol pattern for mutual authentication
 /// XX pattern: Both parties authenticate each other
@@ -293,9 +293,16 @@ impl SecureListener {
         })
     }
 
-    /// Accept an incoming connection
-    pub async fn accept(&self) -> SyncResult<SecureTransport> {
-        let (stream, _addr) = self.listener.accept().await?;
-        SecureTransport::accept(stream, &self.our_private_key).await
+    /// Accept a raw TCP connection (no Noise handshake yet).
+    /// Returns the stream and peer address so the caller can spawn
+    /// the handshake in a separate task with its own timeout.
+    pub async fn accept_tcp(&self) -> SyncResult<(TcpStream, std::net::SocketAddr)> {
+        let (stream, addr) = self.listener.accept().await?;
+        Ok((stream, addr))
+    }
+
+    /// Get a copy of our private key (for spawning handshake tasks)
+    pub fn private_key(&self) -> [u8; 32] {
+        self.our_private_key
     }
 }
