@@ -802,6 +802,7 @@ fn show_settings_window_inner(app: &tauri::AppHandle) {
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
+        let _ = window.emit("settings:shown", ());
     }
     sync_app_shell_visibility(app);
 }

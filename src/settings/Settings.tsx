@@ -669,18 +669,44 @@ export default function Settings() {
   const [clearing, setClearing] = useState(false);
 
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const statsRefreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const fetchCollections = useCallback(() => {
     invoke<CollectionInfo[]>("list_collections").then(setCollections).catch(() => {});
   }, []);
 
+  const refreshStats = useCallback(async () => {
+    const [sizeResult, countResult] = await Promise.allSettled([
+      invoke<number>("get_db_size"),
+      invoke<number>("get_total_clip_count"),
+    ]);
+
+    if (sizeResult.status === "fulfilled") {
+      setDbSize(sizeResult.value);
+    }
+    if (countResult.status === "fulfilled") {
+      setClipCount(countResult.value);
+    }
+  }, []);
+
+  const scheduleStatsRefresh = useCallback(
+    (delayMs: number = 90) => {
+      if (statsRefreshTimer.current) {
+        clearTimeout(statsRefreshTimer.current);
+      }
+      statsRefreshTimer.current = setTimeout(() => {
+        void refreshStats();
+      }, delayMs);
+    },
+    [refreshStats]
+  );
+
   useEffect(() => {
     invoke<CopiConfig>("get_config").then(setConfig).catch(console.error);
-    invoke<number>("get_db_size").then(setDbSize).catch(() => {});
-    invoke<number>("get_total_clip_count").then(setClipCount).catch(() => {});
+    void refreshStats();
     getVersion().then(setAppVersion).catch(() => {});
     fetchCollections();
-  }, [fetchCollections]);
+  }, [fetchCollections, refreshStats]);
 
   // Listen to collections-changed event for real-time updates
   useEffect(() => {
@@ -691,6 +717,28 @@ export default function Settings() {
       unlisten.then((fn) => fn());
     };
   }, [fetchCollections]);
+
+  useEffect(() => {
+    const unlistenNew = listen("new-clip", () => {
+      scheduleStatsRefresh();
+    });
+    const unlistenChanged = listen("clips-changed", () => {
+      scheduleStatsRefresh();
+    });
+    const unlistenShown = listen("settings:shown", () => {
+      scheduleStatsRefresh(0);
+      fetchCollections();
+    });
+
+    return () => {
+      if (statsRefreshTimer.current) {
+        clearTimeout(statsRefreshTimer.current);
+      }
+      unlistenNew.then((fn) => fn());
+      unlistenChanged.then((fn) => fn());
+      unlistenShown.then((fn) => fn());
+    };
+  }, [fetchCollections, scheduleStatsRefresh]);
 
   const saveConfig = useCallback(
     async (updated: CopiConfig) => {
@@ -750,8 +798,7 @@ export default function Settings() {
     setClearError(null);
     try {
       await invoke("clear_all_history");
-      setClipCount(0);
-      setDbSize(0);
+      await refreshStats();
       setConfirmClear(false);
     } catch (e) {
       const msg = typeof e === "string" ? e : (e instanceof Error ? e.message : "Unknown error");
