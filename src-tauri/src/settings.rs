@@ -229,7 +229,19 @@ pub async fn get_db_size(app: tauri::AppHandle) -> Result<u64, String> {
         .or_else(|_| app.path().app_local_data_dir())
         .unwrap_or_else(|_| std::env::temp_dir().join("copi"))
         .join("copi.db");
-    std::fs::metadata(&db_path).map(|m| m.len()).or(Ok(0))
+
+    let mut total_size = 0u64;
+    for path in [
+        db_path.clone(),
+        db_path.with_extension("db-wal"),
+        db_path.with_extension("db-shm"),
+    ] {
+        if let Ok(metadata) = std::fs::metadata(path) {
+            total_size = total_size.saturating_add(metadata.len());
+        }
+    }
+
+    Ok(total_size)
 }
 
 #[tauri::command]
