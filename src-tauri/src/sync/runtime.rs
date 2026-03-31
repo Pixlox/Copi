@@ -10,7 +10,7 @@ use super::{
 use base64::Engine as _;
 use rusqlite::{params, OptionalExtension};
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -33,6 +33,37 @@ fn now_ts() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Select the best IP address from a list of addresses.
+/// Prefers routable IPv4 addresses, then IPv6 global addresses, then any available.
+fn select_best_address(addresses: &[IpAddr]) -> Option<IpAddr> {
+    // Priority 1: Routable IPv4 (not loopback, not link-local)
+    if let Some(ip) = addresses.iter().find(|ip| {
+        if let IpAddr::V4(v4) = ip {
+            !v4.is_loopback() && !v4.is_link_local() && !v4.is_unspecified()
+        } else {
+            false
+        }
+    }) {
+        return Some(*ip);
+    }
+
+    // Priority 2: Global IPv6 (not link-local, not loopback)
+    if let Some(ip) = addresses.iter().find(|ip| {
+        if let IpAddr::V6(v6) = ip {
+            !v6.is_loopback() && !v6.is_unspecified() 
+                // Check it's not link-local (fe80::/10)
+                && (v6.segments()[0] & 0xffc0) != 0xfe80
+        } else {
+            false
+        }
+    }) {
+        return Some(*ip);
+    }
+
+    // Fallback: any address
+    addresses.first().copied()
 }
 
 fn app_state(app: &tauri::AppHandle) -> Result<tauri::State<'_, crate::AppState>, String> {
@@ -140,7 +171,7 @@ async fn flush_pending_for_device(runtime: Arc<SyncRuntime>, device_id: String) 
         let Some(dev) = ds.get_device(&device_id).await else {
             return;
         };
-        let Some(ip) = dev.addresses.first().copied() else {
+        let Some(ip) = select_best_address(&dev.addresses) else {
             return;
         };
         SocketAddr::new(ip, dev.port)
@@ -455,12 +486,11 @@ async fn listener_loop(runtime: Arc<SyncRuntime>, private_key: [u8; 32], generat
     }
 }
 
-async fn discovery_event_loop(runtime: Arc<SyncRuntime>, generation: u64) {
-    let mut rx = match runtime.service.discovery.read().await.as_ref() {
-        Some(d) => d.subscribe(),
-        None => return,
-    };
-
+async fn discovery_event_loop(
+    runtime: Arc<SyncRuntime>,
+    generation: u64,
+    mut rx: broadcast::Receiver<DiscoveryEvent>,
+) {
     loop {
         if !runtime.started.load(Ordering::SeqCst)
             || runtime.generation.load(Ordering::SeqCst) != generation
@@ -591,6 +621,9 @@ fn start_runtime_inner(runtime: Arc<SyncRuntime>, enabled: bool) -> Result<(), S
         let info = identity.to_info();
         if let Ok(discovery) = DiscoveryService::new(&info) {
             if discovery.start(&info, DEFAULT_SYNC_PORT).is_ok() {
+                // Subscribe BEFORE storing to avoid race condition
+                let event_rx = discovery.subscribe();
+                
                 let rt = runtime.clone();
                 tauri::async_runtime::spawn(async move {
                     *rt.service.discovery.write().await = Some(discovery);
@@ -598,8 +631,7 @@ fn start_runtime_inner(runtime: Arc<SyncRuntime>, enabled: bool) -> Result<(), S
 
                 let rt = runtime.clone();
                 tauri::async_runtime::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                    discovery_event_loop(rt, generation).await;
+                    discovery_event_loop(rt, generation, event_rx).await;
                 });
             }
         }
@@ -834,10 +866,7 @@ pub async fn pair_with_code(
             .await
             .ok_or_else(|| "Device not discovered".to_string())?
     };
-    let ip = discovered
-        .addresses
-        .first()
-        .copied()
+    let ip = select_best_address(&discovered.addresses)
         .ok_or_else(|| "No address for selected device".to_string())?;
 
     let (local_identity, local_id) = {

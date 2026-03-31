@@ -505,6 +505,31 @@ function SyncSection({
   const [manualError, setManualError] = useState<string | null>(null);
   const [joinCode, setJoinCode] = useState("");
   const [pairingBusyId, setPairingBusyId] = useState<string | null>(null);
+  const [countdownTick, setCountdownTick] = useState(0);
+
+  // Tick every second while a pairing code is active to update the countdown
+  useEffect(() => {
+    if (!pairingCode) return;
+    
+    const now = Math.floor(Date.now() / 1000);
+    const remaining = pairingCode.expiresAt - now;
+    
+    // If already expired, don't start the timer
+    if (remaining <= 0) return;
+    
+    const interval = setInterval(() => {
+      setCountdownTick((t) => t + 1);
+    }, 1000);
+    
+    return () => clearInterval(interval);
+  }, [pairingCode]);
+
+  // Compute remaining time using the tick to force re-render
+  const codeRemainingSeconds = pairingCode
+    ? Math.max(0, pairingCode.expiresAt - Math.floor(Date.now() / 1000))
+    : 0;
+  // Use countdownTick to suppress the unused variable warning
+  void countdownTick;
 
   return (
     <>
@@ -598,7 +623,11 @@ function SyncSection({
         <div className="settings-sync-code-box">
           <span className="settings-sync-code-value">{pairingCode?.code ?? "----"}</span>
           <span className="settings-sync-code-exp">
-            {pairingCode ? `Expires in ${Math.max(0, pairingCode.expiresAt - Math.floor(Date.now() / 1000))}s` : "No active code"}
+            {pairingCode
+              ? codeRemainingSeconds > 0
+                ? `Expires in ${codeRemainingSeconds}s`
+                : "Code expired"
+              : "No active code"}
           </span>
         </div>
       </SettingCard>

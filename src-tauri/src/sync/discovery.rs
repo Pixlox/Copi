@@ -104,11 +104,12 @@ impl DiscoveryService {
             SERVICE_TYPE,
             &self.service_name,
             &format!("{}.local.", self.service_name),
-            (),
+            (), // Empty IPs, will be auto-filled by enable_addr_auto()
             port,
             &properties[..],
         )
-        .map_err(|e| SyncError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        .map_err(|e| SyncError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)))?
+        .enable_addr_auto(); // Auto-fill host IPs from network interfaces
 
         self.daemon
             .register(service)
