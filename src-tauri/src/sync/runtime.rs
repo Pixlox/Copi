@@ -104,6 +104,8 @@ fn parse_platform(value: &str) -> Platform {
 }
 
 async fn flush_pending_for_device(runtime: Arc<SyncRuntime>, device_id: String) {
+    eprintln!("[Sync] flush_pending_for_device: starting for {}", device_id);
+    
     let (ops, target_version, peer_public_key) = match with_write_conn(&runtime.app, |conn| {
         let peer: Option<(Vec<u8>, i64)> = conn
             .query_row(
@@ -114,8 +116,10 @@ async fn flush_pending_for_device(runtime: Arc<SyncRuntime>, device_id: String) 
             .optional()
             .map_err(|e| e.to_string())?;
         let Some((peer_public_key, last_sent_version)) = peer else {
+            eprintln!("[Sync] flush_pending_for_device: {} NOT in paired_devices table", device_id);
             return Ok((Vec::<SyncOperation>::new(), 0_i64, Vec::<u8>::new()));
         };
+        eprintln!("[Sync] flush_pending_for_device: {} last_sent_version={}", device_id, last_sent_version);
 
         let local_id: Option<String> = conn
             .query_row("SELECT device_id FROM device_info LIMIT 1", [], |r| r.get(0))
@@ -130,6 +134,7 @@ async fn flush_pending_for_device(runtime: Arc<SyncRuntime>, device_id: String) 
 
         let mut ops = SyncEngine::get_operations_since(conn, last_sent_version, &local_id, 500, sync_embeddings)
             .map_err(|e| e.to_string())?;
+        eprintln!("[Sync] flush_pending_for_device: {} found {} ops since version {}", device_id, ops.len(), last_sent_version);
         if ops.is_empty() {
             return Ok((Vec::<SyncOperation>::new(), 0_i64, peer_public_key));
         }
@@ -145,12 +150,18 @@ async fn flush_pending_for_device(runtime: Arc<SyncRuntime>, device_id: String) 
     };
 
     if ops.is_empty() {
+        eprintln!("[Sync] flush_pending_for_device: {} no pending ops, done", device_id);
         return;
     }
 
+    eprintln!("[Sync] flush_pending_for_device: {} sending {} ops, target_version={}", device_id, ops.len(), target_version);
+
     let local_identity = match load_or_generate_identity(&runtime.app, None) {
         Ok(i) => i,
-        Err(_) => return,
+        Err(e) => {
+            eprintln!("[Sync] flush_pending_for_device: {} failed to load identity: {}", device_id, e);
+            return;
+        }
     };
     let mut local_priv = [0_u8; 32];
     local_priv.copy_from_slice(local_identity.private_key.as_bytes());
@@ -158,15 +169,19 @@ async fn flush_pending_for_device(runtime: Arc<SyncRuntime>, device_id: String) 
     let candidate_addrs = {
         let discovery_guard = runtime.service.discovery.read().await;
         let Some(ds) = discovery_guard.as_ref() else {
+            eprintln!("[Sync] flush_pending_for_device: {} discovery service not available", device_id);
             return;
         };
         let Some(dev) = ds.get_device(&device_id) else {
+            eprintln!("[Sync] flush_pending_for_device: {} NOT found in mDNS discovery cache", device_id);
             return;
         };
         let addrs = sort_addresses_by_preference(&dev.addresses);
         if addrs.is_empty() {
+            eprintln!("[Sync] flush_pending_for_device: {} has no usable addresses", device_id);
             return;
         }
+        eprintln!("[Sync] flush_pending_for_device: {} trying {} addresses", device_id, addrs.len());
         addrs.into_iter().map(|ip| SocketAddr::new(ip, dev.port)).collect::<Vec<_>>()
     };
 
@@ -206,21 +221,37 @@ async fn flush_pending_for_device(runtime: Arc<SyncRuntime>, device_id: String) 
     };
 
     if transport.send(&bytes).await.is_err() {
+        eprintln!("[Sync] flush_pending_for_device: {} send failed", device_id);
         return;
     }
+    eprintln!("[Sync] flush_pending_for_device: {} sent {} bytes, awaiting ACK", device_id, bytes.len());
+    
     let resp = match transport.recv().await {
         Ok(b) => b,
-        Err(_) => return,
+        Err(e) => {
+            eprintln!("[Sync] flush_pending_for_device: {} recv failed: {}", device_id, e);
+            return;
+        }
     };
 
     let ack = match super::protocol::SyncMessage::from_bytes(&resp) {
         Ok(super::protocol::SyncMessage::Ack(ack)) => ack,
-        _ => return,
+        Ok(other) => {
+            eprintln!("[Sync] flush_pending_for_device: {} unexpected response type: {:?}", device_id, std::mem::discriminant(&other));
+            return;
+        }
+        Err(e) => {
+            eprintln!("[Sync] flush_pending_for_device: {} failed to parse response: {}", device_id, e);
+            return;
+        }
     };
 
     if !ack.success {
+        eprintln!("[Sync] flush_pending_for_device: {} ACK failed: {:?}", device_id, ack.error);
         return;
     }
+
+    eprintln!("[Sync] flush_pending_for_device: {} SUCCESS, new_version={:?}", device_id, ack.new_version);
 
     let new_version = ack.new_version.unwrap_or(target_version);
     let _ = with_write_conn(&runtime.app, |conn| {
@@ -239,24 +270,32 @@ async fn flush_pending_for_device(runtime: Arc<SyncRuntime>, device_id: String) 
 }
 
 async fn flush_loop(runtime: Arc<SyncRuntime>, generation: u64) {
+    eprintln!("[Sync] flush_loop: started (generation={})", generation);
     let mut interval = tokio::time::interval(Duration::from_secs(3));
+    let mut tick_count = 0_u64;
     loop {
         if !runtime.started.load(Ordering::SeqCst)
             || runtime.generation.load(Ordering::SeqCst) != generation
         {
+            eprintln!("[Sync] flush_loop: stopping (generation changed or stopped)");
             break;
         }
 
         interval.tick().await;
+        tick_count += 1;
 
         if !runtime.started.load(Ordering::SeqCst)
             || runtime.generation.load(Ordering::SeqCst) != generation
         {
+            eprintln!("[Sync] flush_loop: stopping (generation changed or stopped)");
             break;
         }
 
         let enabled = *runtime.service.enabled.read().await;
         if !enabled {
+            if tick_count % 10 == 1 {
+                eprintln!("[Sync] flush_loop: sync disabled, skipping tick");
+            }
             continue;
         }
 
@@ -265,10 +304,16 @@ async fn flush_loop(runtime: Arc<SyncRuntime>, generation: u64) {
             .map(|c| c.sync.auto_connect)
             .unwrap_or(true);
         if !auto_connect {
+            if tick_count % 10 == 1 {
+                eprintln!("[Sync] flush_loop: auto_connect disabled, skipping tick");
+            }
             continue;
         }
 
         let devices = list_paired_devices(runtime.app.clone()).await.unwrap_or_default();
+        if !devices.is_empty() {
+            eprintln!("[Sync] flush_loop: tick #{}, checking {} paired device(s)", tick_count, devices.len());
+        }
         for d in devices {
             flush_pending_for_device(runtime.clone(), d.device_id).await;
         }
@@ -276,7 +321,11 @@ async fn flush_loop(runtime: Arc<SyncRuntime>, generation: u64) {
 }
 
 async fn handle_incoming_connection(runtime: Arc<SyncRuntime>, transport: super::transport::SecureTransport) {
+    let remote_pk_hex = hex::encode(transport.remote_public_key());
+    eprintln!("[Sync] handle_incoming_connection: remote_pk={}", &remote_pk_hex[..16]);
+    
     if !*runtime.service.enabled.read().await {
+        eprintln!("[Sync] handle_incoming_connection: sync disabled, dropping connection");
         return;
     }
 
@@ -285,7 +334,7 @@ async fn handle_incoming_connection(runtime: Arc<SyncRuntime>, transport: super:
         let pair: Option<String> = conn
             .query_row(
                 "SELECT device_id FROM paired_devices WHERE public_key = ?1",
-                [remote_pk],
+                [&remote_pk],
                 |row| row.get(0),
             )
             .optional()
@@ -294,11 +343,17 @@ async fn handle_incoming_connection(runtime: Arc<SyncRuntime>, transport: super:
     })
     .ok()
     .flatten();
+    
+    eprintln!("[Sync] handle_incoming_connection: remote_device={:?}", remote_device);
 
     let payload = match transport.recv().await {
         Ok(v) => v,
-        Err(_) => return,
+        Err(e) => {
+            eprintln!("[Sync] handle_incoming_connection: recv failed: {}", e);
+            return;
+        }
     };
+    eprintln!("[Sync] handle_incoming_connection: received {} bytes", payload.len());
 
     // Pairing lane: plain JSON message over already encrypted channel
     if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&payload) {
@@ -399,18 +454,25 @@ async fn handle_incoming_connection(runtime: Arc<SyncRuntime>, transport: super:
     }
 
     let Some(remote_device_id) = remote_device else {
+        eprintln!("[Sync] handle_incoming_connection: unknown device (public key not in paired_devices), dropping");
         return;
     };
 
     let msg = match super::protocol::SyncMessage::from_bytes(&payload) {
         Ok(m) => m,
-        Err(_) => return,
+        Err(e) => {
+            eprintln!("[Sync] handle_incoming_connection: failed to parse SyncMessage: {}", e);
+            return;
+        }
     };
 
     let mut applied = 0usize;
     let mut highest_version = 0_i64;
 
     if let super::protocol::SyncMessage::PushOperations(batch) = msg {
+        eprintln!("[Sync] handle_incoming_connection: {} sent PushOperations with {} ops, target_version={}", 
+                  remote_device_id, batch.operations.len(), batch.target_version);
+        
         let _ = with_write_conn(&runtime.app, |conn| {
             let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
             for op in &batch.operations {
@@ -442,6 +504,8 @@ async fn handle_incoming_connection(runtime: Arc<SyncRuntime>, transport: super:
         if let Ok(bytes) = ack.to_bytes() {
             let _ = transport.send(&bytes).await;
         }
+        eprintln!("[Sync] handle_incoming_connection: {} applied {} ops, highest_version={}, sent ACK", 
+                  remote_device_id, applied, highest_version);
     }
 
     if applied > 0 {
