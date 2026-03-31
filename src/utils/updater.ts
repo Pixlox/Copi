@@ -35,11 +35,9 @@ export async function checkForUpdates(mode: UpdateCheckMode = "interactive"): Pr
 
     console.log(`[Updater] Update available: ${update.version}`);
 
-    const releaseNotes = update.body?.trim();
     const prompt = [
-      currentVersion ? `Current version: ${currentVersion}` : null,
-      `New version: ${update.version}`,
-      releaseNotes ? `\n${releaseNotes}` : null,
+      currentVersion ? `Current version: ${currentVersion}` : "Current version: Unknown",
+      `Latest version: ${update.version}`,
       "\nDownload and install now?",
     ]
       .filter(Boolean)
