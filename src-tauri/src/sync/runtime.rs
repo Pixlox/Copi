@@ -168,7 +168,7 @@ async fn flush_pending_for_device(runtime: Arc<SyncRuntime>, device_id: String) 
         let Some(ds) = discovery_guard.as_ref() else {
             return;
         };
-        let Some(dev) = ds.get_device(&device_id).await else {
+        let Some(dev) = ds.get_device(&device_id) else {
             return;
         };
         let Some(ip) = select_best_address(&dev.addresses) else {
@@ -863,7 +863,6 @@ pub async fn pair_with_code(
         };
         discovery
             .get_device(&device_id)
-            .await
             .ok_or_else(|| "Device not discovered".to_string())?
     };
     let ip = select_best_address(&discovered.addresses)

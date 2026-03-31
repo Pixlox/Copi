@@ -6,8 +6,9 @@
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
+use std::sync::{Arc, RwLock};
+use std::thread;
+use tokio::sync::broadcast;
 
 use super::device::{DeviceInfo, Platform};
 use super::{SyncError, SyncResult};
@@ -134,32 +135,27 @@ impl DiscoveryService {
         let event_tx = self.event_tx.clone();
         let our_device_id = self.our_device_id.clone();
 
-        // Spawn a task to handle discovery events
-        tokio::spawn(async move {
-            loop {
+        // Use std::thread for the blocking mDNS receiver (crossbeam channel)
+        thread::Builder::new()
+            .name("mdns-browse".to_string())
+            .spawn(move || loop {
                 match receiver.recv() {
                     Ok(event) => {
-                        Self::handle_discovery_event(
-                            event,
-                            &discovered,
-                            &event_tx,
-                            &our_device_id,
-                        )
-                        .await;
+                        Self::handle_discovery_event(event, &discovered, &event_tx, &our_device_id);
                     }
                     Err(e) => {
                         eprintln!("[Sync] mDNS browse error: {:?}", e);
                         break;
                     }
                 }
-            }
-        });
+            })
+            .map_err(|e| SyncError::IoError(e))?;
 
         Ok(())
     }
 
-    /// Handle an mDNS discovery event
-    async fn handle_discovery_event(
+    /// Handle an mDNS discovery event (runs on blocking thread)
+    fn handle_discovery_event(
         event: ServiceEvent,
         discovered: &Arc<RwLock<HashMap<String, DiscoveredDevice>>>,
         event_tx: &broadcast::Sender<DiscoveryEvent>,
@@ -197,17 +193,17 @@ impl DiscoveryService {
                     port,
                 };
 
-                let mut map = discovered.write().await;
-                let is_new = !map.contains_key(&device.device_id);
-                map.insert(device.device_id.clone(), device.clone());
+                let is_new = {
+                    let mut map = discovered.write().unwrap();
+                    let is_new = !map.contains_key(&device.device_id);
+                    map.insert(device.device_id.clone(), device.clone());
+                    is_new
+                };
 
                 let _ = if is_new {
                     eprintln!(
                         "[Sync] Discovered device: {} ({}) at {:?}:{}",
-                        device.device_name,
-                        device.platform,
-                        device.addresses,
-                        device.port
+                        device.device_name, device.platform, device.addresses, device.port
                     );
                     event_tx.send(DiscoveryEvent::DeviceFound(device))
                 } else {
@@ -218,14 +214,18 @@ impl DiscoveryService {
             ServiceEvent::ServiceRemoved(_service_type, fullname) => {
                 // Extract device ID from service name
                 // Service name format: "copi-{device_id_prefix}"
-                let mut map = discovered.write().await;
-                let device_id = map
-                    .iter()
-                    .find(|(_, d)| fullname.contains(&d.device_id[..8]))
-                    .map(|(id, _)| id.clone());
+                let device_id = {
+                    let map = discovered.read().unwrap();
+                    map.iter()
+                        .find(|(_, d)| fullname.contains(&d.device_id[..8]))
+                        .map(|(id, _)| id.clone())
+                };
 
                 if let Some(device_id) = device_id {
-                    map.remove(&device_id);
+                    {
+                        let mut map = discovered.write().unwrap();
+                        map.remove(&device_id);
+                    }
                     eprintln!("[Sync] Device lost: {}", device_id);
                     let _ = event_tx.send(DiscoveryEvent::DeviceLost(device_id));
                 }
@@ -240,9 +240,9 @@ impl DiscoveryService {
         self.event_tx.subscribe()
     }
 
-    /// Get a specific discovered device by ID
-    pub async fn get_device(&self, device_id: &str) -> Option<DiscoveredDevice> {
-        self.discovered.read().await.get(device_id).cloned()
+    /// Get a specific discovered device by ID (blocking)
+    pub fn get_device(&self, device_id: &str) -> Option<DiscoveredDevice> {
+        self.discovered.read().ok()?.get(device_id).cloned()
     }
 
     /// Stop the discovery service
