@@ -636,9 +636,11 @@ impl SyncEngine {
             // Convert embedding to bytes
             let embedding_bytes: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
 
-            // Insert or replace embedding
+            // vec0 virtual tables do NOT support INSERT OR REPLACE
+            // We must DELETE first, then INSERT
+            let _ = conn.execute("DELETE FROM clip_embeddings WHERE rowid = ?1", [id]);
             conn.execute(
-                "INSERT OR REPLACE INTO clip_embeddings (rowid, embedding) VALUES (?1, ?2)",
+                "INSERT INTO clip_embeddings (rowid, embedding) VALUES (?1, ?2)",
                 rusqlite::params![id, embedding_bytes],
             )?;
 
