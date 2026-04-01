@@ -252,7 +252,7 @@ async fn flush_pending_for_device(runtime: Arc<SyncRuntime>, device_id: String) 
         return;
     }
 
-    eprintln!("[Sync] flush_pending_for_device: {} SUCCESS, new_version={:?}", device_id, ack.new_version);
+    eprintln!("[Sync] flush_pending_for_device: {} Phase 1 SUCCESS, new_version={:?}", device_id, ack.new_version);
 
     let new_version = ack.new_version.unwrap_or(target_version);
     let _ = with_write_conn(&runtime.app, |conn| {
@@ -263,6 +263,71 @@ async fn flush_pending_for_device(runtime: Arc<SyncRuntime>, device_id: String) 
         .map_err(|e| e.to_string())?;
         Ok(())
     });
+
+    // Phase 2: Send images if receiver requested any
+    if !ack.needs_images.is_empty() {
+        eprintln!("[Sync] flush_pending_for_device: {} Phase 2 - sending {} images", device_id, ack.needs_images.len());
+        
+        // Get image data for requested clips
+        let images = match with_write_conn(&runtime.app, |conn| {
+            SyncEngine::get_image_data_for_clips(conn, &ack.needs_images)
+                .map_err(|e| e.to_string())
+        }) {
+            Ok(imgs) => imgs,
+            Err(e) => {
+                eprintln!("[Sync] flush_pending_for_device: {} failed to get images: {}", device_id, e);
+                vec![]
+            }
+        };
+
+        // Send images one at a time to avoid large payloads
+        for img in images {
+            let img_size = img.image_data.len();
+            eprintln!("[Sync] flush_pending_for_device: {} sending image for clip {} ({} bytes)", 
+                     device_id, img.sync_id, img_size);
+            
+            let msg = super::protocol::SyncMessage::PushImageData(img);
+            let bytes = match msg.to_bytes() {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("[Sync] flush_pending_for_device: {} failed to serialize image: {}", device_id, e);
+                    continue;
+                }
+            };
+
+            if let Err(e) = transport.send(&bytes).await {
+                eprintln!("[Sync] flush_pending_for_device: {} image send failed: {}", device_id, e);
+                break; // Stop sending more images on connection error
+            }
+
+            // Wait for ACK
+            match transport.recv().await {
+                Ok(resp) => {
+                    match super::protocol::SyncMessage::from_bytes(&resp) {
+                        Ok(super::protocol::SyncMessage::Ack(img_ack)) => {
+                            if img_ack.success {
+                                eprintln!("[Sync] flush_pending_for_device: {} image ACK received", device_id);
+                            } else {
+                                eprintln!("[Sync] flush_pending_for_device: {} image ACK failed: {:?}", device_id, img_ack.error);
+                            }
+                        }
+                        Ok(_) => {
+                            eprintln!("[Sync] flush_pending_for_device: {} unexpected response to image", device_id);
+                        }
+                        Err(e) => {
+                            eprintln!("[Sync] flush_pending_for_device: {} failed to parse image response: {}", device_id, e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[Sync] flush_pending_for_device: {} image recv failed: {}", device_id, e);
+                    break;
+                }
+            }
+        }
+        
+        eprintln!("[Sync] flush_pending_for_device: {} Phase 2 complete", device_id);
+    }
 
     let _ = runtime
         .service
@@ -469,6 +534,7 @@ async fn handle_incoming_connection(runtime: Arc<SyncRuntime>, transport: super:
 
     let mut applied = 0usize;
     let mut highest_version = 0_i64;
+    let mut needs_images: Vec<String> = Vec::new();
 
     if let super::protocol::SyncMessage::PushOperations(batch) = msg {
         eprintln!("[Sync] handle_incoming_connection: {} sent PushOperations with {} ops, target_version={}", 
@@ -477,6 +543,13 @@ async fn handle_incoming_connection(runtime: Arc<SyncRuntime>, transport: super:
         let _ = with_write_conn(&runtime.app, |conn| {
             let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
             for op in &batch.operations {
+                // Track clips that are images but didn't include image_data (need Phase 2)
+                if let super::protocol::SyncOperation::UpsertClip(clip_data) = op {
+                    if clip_data.content_type == "image" && clip_data.image_data.is_none() {
+                        needs_images.push(clip_data.sync_id.clone());
+                    }
+                }
+                
                 if SyncEngine::apply_operation(&tx, op, super::protocol::ConflictStrategy::LastWriteWins)
                     .map_err(|e| e.to_string())?
                 {
@@ -496,17 +569,89 @@ async fn handle_incoming_connection(runtime: Arc<SyncRuntime>, transport: super:
             Ok(())
         });
 
+        eprintln!("[Sync] handle_incoming_connection: {} applied {} ops, {} need images", 
+                  remote_device_id, applied, needs_images.len());
+
+        // Send ACK with list of clips that need image data
         let ack = super::protocol::SyncMessage::Ack(super::protocol::AckMessage {
             success: true,
             new_version: Some(highest_version),
             error: None,
             conflicts: Vec::new(),
+            needs_images: needs_images.clone(),
         });
         if let Ok(bytes) = ack.to_bytes() {
             let _ = transport.send(&bytes).await;
         }
-        eprintln!("[Sync] handle_incoming_connection: {} applied {} ops, highest_version={}, sent ACK", 
-                  remote_device_id, applied, highest_version);
+        eprintln!("[Sync] handle_incoming_connection: {} sent ACK, awaiting Phase 2 images", remote_device_id);
+        
+        // Phase 2: Receive image data if any were requested
+        if !needs_images.is_empty() {
+            let mut images_received = 0;
+            loop {
+                // Try to receive image data with timeout
+                match tokio::time::timeout(Duration::from_secs(30), transport.recv()).await {
+                    Ok(Ok(img_payload)) => {
+                        match super::protocol::SyncMessage::from_bytes(&img_payload) {
+                            Ok(super::protocol::SyncMessage::PushImageData(img_data)) => {
+                                eprintln!("[Sync] handle_incoming_connection: {} received image for clip {} ({} bytes)", 
+                                         remote_device_id, img_data.sync_id, img_data.image_data.len());
+                                
+                                // Apply image data
+                                let _ = with_write_conn(&runtime.app, |conn| {
+                                    SyncEngine::apply_image_data(conn, &img_data)
+                                        .map_err(|e| e.to_string())
+                                });
+                                
+                                images_received += 1;
+                                
+                                // Send ACK for image
+                                let img_ack = super::protocol::SyncMessage::Ack(super::protocol::AckMessage {
+                                    success: true,
+                                    new_version: None,
+                                    error: None,
+                                    conflicts: Vec::new(),
+                                    needs_images: Vec::new(),
+                                });
+                                if let Ok(bytes) = img_ack.to_bytes() {
+                                    let _ = transport.send(&bytes).await;
+                                }
+                                
+                                // Check if we've received all expected images
+                                if images_received >= needs_images.len() {
+                                    eprintln!("[Sync] handle_incoming_connection: {} received all {} images", 
+                                             remote_device_id, images_received);
+                                    break;
+                                }
+                            }
+                            Ok(super::protocol::SyncMessage::Disconnect) => {
+                                eprintln!("[Sync] handle_incoming_connection: {} sent Disconnect, ending Phase 2", remote_device_id);
+                                break;
+                            }
+                            Ok(other) => {
+                                eprintln!("[Sync] handle_incoming_connection: {} unexpected message type during Phase 2: {:?}", 
+                                         remote_device_id, std::mem::discriminant(&other));
+                                break;
+                            }
+                            Err(e) => {
+                                eprintln!("[Sync] handle_incoming_connection: {} failed to parse Phase 2 message: {}", remote_device_id, e);
+                                break;
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        eprintln!("[Sync] handle_incoming_connection: {} Phase 2 recv error: {}", remote_device_id, e);
+                        break;
+                    }
+                    Err(_) => {
+                        eprintln!("[Sync] handle_incoming_connection: {} Phase 2 timeout waiting for images", remote_device_id);
+                        break;
+                    }
+                }
+            }
+            eprintln!("[Sync] handle_incoming_connection: {} Phase 2 complete, received {}/{} images", 
+                     remote_device_id, images_received, needs_images.len());
+        }
     }
 
     if applied > 0 {

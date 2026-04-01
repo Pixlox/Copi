@@ -97,10 +97,10 @@ impl SyncEngine {
                     content_hash: row.get(3)?,
                     content_type: row.get(4)?,
                     source_app: row.get(5)?,
-                    source_app_icon: row.get(6)?,
+                    source_app_icon: None, // Exclude app icons from sync (too large)
                     content_highlighted: row.get(7)?,
                     ocr_text: row.get(8)?,
-                    image_data: row.get(9)?,
+                    image_data: None, // Exclude full images from sync - only sync thumbnails
                     image_thumbnail: row.get(10)?,
                     image_width: row.get(11)?,
                     image_height: row.get(12)?,
@@ -204,6 +204,76 @@ impl SyncEngine {
         operations.sort_by_key(|op| op.version());
 
         Ok(operations)
+    }
+
+    /// Get image data for specific clips (Phase 2 of sync)
+    /// Returns a list of (sync_id, image_data, source_app_icon)
+    pub fn get_image_data_for_clips(
+        conn: &Connection,
+        sync_ids: &[String],
+    ) -> SyncResult<Vec<super::protocol::ImageDataMessage>> {
+        if sync_ids.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let placeholders = sync_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let query = format!(
+            "SELECT sync_id, image_data, source_app_icon 
+             FROM clips 
+             WHERE sync_id IN ({}) AND image_data IS NOT NULL",
+            placeholders
+        );
+
+        let mut stmt = conn.prepare(&query)?;
+        let params: Vec<&dyn rusqlite::ToSql> =
+            sync_ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+
+        let results = stmt.query_map(params.as_slice(), |row| {
+            Ok(super::protocol::ImageDataMessage {
+                sync_id: row.get(0)?,
+                image_data: row.get(1)?,
+                source_app_icon: row.get(2)?,
+            })
+        })?;
+
+        let mut images = vec![];
+        for result in results {
+            if let Ok(img) = result {
+                images.push(img);
+            }
+        }
+
+        Ok(images)
+    }
+
+    /// Get clips that have image_data but haven't been synced to a device yet
+    /// Returns sync_ids of clips with images that need Phase 2 sync
+    #[allow(dead_code)]
+    pub fn get_clips_needing_image_sync(
+        conn: &Connection,
+        _device_id: &str,
+        since_version: i64,
+        limit: usize,
+    ) -> SyncResult<Vec<String>> {
+        // Get clips that:
+        // 1. Have image_data
+        // 2. Were created/modified since the version
+        // 3. Haven't had their image synced yet (tracked via a separate table or flag)
+        let mut stmt = conn.prepare(
+            "SELECT sync_id FROM clips 
+             WHERE sync_version > ?1 
+             AND image_data IS NOT NULL 
+             AND sync_id IS NOT NULL
+             ORDER BY sync_version ASC
+             LIMIT ?2",
+        )?;
+
+        let sync_ids: Vec<String> = stmt
+            .query_map(rusqlite::params![since_version, limit], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(sync_ids)
     }
 
     /// Apply a sync operation from a remote peer
@@ -370,6 +440,39 @@ impl SyncEngine {
         }
 
         Ok(true)
+    }
+
+    /// Apply image data to an existing clip (Phase 2 of sync)
+    pub fn apply_image_data(
+        conn: &Connection,
+        image_msg: &super::protocol::ImageDataMessage,
+    ) -> SyncResult<bool> {
+        // Check if clip exists
+        let exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM clips WHERE sync_id = ?1",
+                [&image_msg.sync_id],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+
+        if !exists {
+            // Clip doesn't exist yet, can't apply image
+            return Ok(false);
+        }
+
+        // Update clip with image data
+        let rows_affected = conn.execute(
+            "UPDATE clips SET image_data = ?1, source_app_icon = COALESCE(?2, source_app_icon) WHERE sync_id = ?3",
+            rusqlite::params![
+                image_msg.image_data,
+                image_msg.source_app_icon,
+                image_msg.sync_id,
+            ],
+        )?;
+
+        Ok(rows_affected > 0)
     }
 
     /// Apply delete clip operation

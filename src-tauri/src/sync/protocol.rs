@@ -20,11 +20,17 @@ pub enum SyncMessage {
     /// Response with sync state
     SyncState(SyncState),
 
-    /// Push operations to peer
+    /// Push operations to peer (Phase 1: metadata without full images)
     PushOperations(PushOperations),
 
     /// Acknowledge receipt of operations
     Ack(AckMessage),
+
+    /// Push full image data for a clip (Phase 2: images)
+    PushImageData(ImageDataMessage),
+
+    /// Request image data for clips (by sync_id)
+    RequestImages(RequestImagesMessage),
 
     /// Heartbeat to keep connection alive
     Heartbeat,
@@ -87,6 +93,27 @@ pub struct AckMessage {
     pub error: Option<String>,
     /// IDs of operations that conflicted (if any)
     pub conflicts: Vec<String>,
+    /// Clips that need image data (sync_ids) - used after Phase 1
+    #[serde(default)]
+    pub needs_images: Vec<String>,
+}
+
+/// Push full image data for a clip (Phase 2)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageDataMessage {
+    /// The clip's sync_id
+    pub sync_id: String,
+    /// Full image data (PNG/JPEG bytes)
+    pub image_data: Vec<u8>,
+    /// Optional: source app icon
+    pub source_app_icon: Option<Vec<u8>>,
+}
+
+/// Request image data for specific clips
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestImagesMessage {
+    /// List of clip sync_ids to request images for
+    pub sync_ids: Vec<String>,
 }
 
 /// Type of entity being synced
