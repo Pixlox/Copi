@@ -169,9 +169,10 @@ impl SyncEngine {
              LIMIT ?2",
         )?;
 
-        let collections = coll_stmt.query_map(
-            rusqlite::params![since_version, limit - operations.len()],
-            |row| {
+        // Use saturating_sub to prevent underflow if we already have >= limit operations
+        let remaining_limit = limit.saturating_sub(operations.len());
+        let collections =
+            coll_stmt.query_map(rusqlite::params![since_version, remaining_limit], |row| {
                 let deleted: i64 = row.get(5)?;
                 let sync_id: String = row.get(0)?;
                 let sync_version: i64 = row.get(1)?;
@@ -191,8 +192,7 @@ impl SyncEngine {
                         origin_device_id: row.get(6)?,
                     }))
                 }
-            },
-        )?;
+            })?;
 
         for coll in collections {
             if let Ok(op) = coll {
