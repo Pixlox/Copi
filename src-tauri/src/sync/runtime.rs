@@ -19,46 +19,112 @@ use tokio::sync::broadcast;
 use tokio::sync::RwLock;
 
 #[cfg(target_os = "windows")]
-fn ensure_windows_firewall_rule_for_port(port: u16) {
+fn encode_powershell_script(script: &str) -> String {
+    let mut bytes = Vec::with_capacity(script.len() * 2);
+    for unit in script.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+#[cfg(target_os = "windows")]
+fn run_powershell_script(script: &str) -> std::io::Result<std::process::Output> {
     use std::process::Command;
 
-    let rule_name = format!("Copi LAN Sync TCP {}", port);
-    let script = format!(
-        "$rule = Get-NetFirewallRule -DisplayName '{rule}' -ErrorAction SilentlyContinue; if (-not $rule) {{ New-NetFirewallRule -DisplayName '{rule}' -Direction Inbound -Action Allow -Protocol TCP -LocalPort {port} -Profile Private | Out-Null }}",
-        rule = rule_name,
-        port = port
-    );
-
-    match Command::new("powershell")
+    let encoded = encode_powershell_script(script);
+    Command::new("powershell")
         .args([
             "-NoProfile",
             "-NonInteractive",
             "-ExecutionPolicy",
             "Bypass",
-            "-Command",
-            &script,
+            "-EncodedCommand",
+            &encoded,
         ])
         .output()
-    {
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_windows_firewall_rule_for_copi() {
+    use std::process::Command;
+
+    static ELEVATION_ATTEMPTED: AtomicBool = AtomicBool::new(false);
+
+    let Ok(exe_path) = std::env::current_exe() else {
+        eprintln!("[Sync] Could not determine executable path for firewall setup");
+        return;
+    };
+    let exe_path = exe_path.to_string_lossy().replace('\'', "''");
+
+    let rule_name = "Copi";
+    let create_script = format!(
+        "$rule = Get-NetFirewallRule -DisplayName '{rule}' -ErrorAction SilentlyContinue; if (-not $rule) {{ New-NetFirewallRule -DisplayName '{rule}' -Direction Inbound -Action Allow -Protocol TCP -Program '{program}' -Profile Private,Public | Out-Null }}",
+        rule = rule_name,
+        program = exe_path
+    );
+
+    match run_powershell_script(&create_script) {
         Ok(out) if out.status.success() => {
-            eprintln!(
-                "[Sync] Windows firewall rule ensured for TCP {} ({})",
-                port, rule_name
-            );
+            eprintln!("[Sync] Windows firewall rule ensured ({})", rule_name);
+            return;
         }
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            eprintln!(
-                "[Sync] Failed to create Windows firewall rule for TCP {} ({}): {}",
-                port,
-                rule_name,
-                stderr.trim()
-            );
+            let denied = stderr.contains("Access is denied")
+                || stderr.contains("System Error 5")
+                || stderr.contains("PermissionDenied");
+
+            if denied {
+                if ELEVATION_ATTEMPTED.swap(true, Ordering::SeqCst) {
+                    eprintln!(
+                        "[Sync] Firewall rule missing and elevation already attempted this run"
+                    );
+                    return;
+                }
+
+                let elevate_script = format!(
+                    "$rule = Get-NetFirewallRule -DisplayName '{rule}' -ErrorAction SilentlyContinue; if (-not $rule) {{ New-NetFirewallRule -DisplayName '{rule}' -Direction Inbound -Action Allow -Protocol TCP -Program '{program}' -Profile Private,Public | Out-Null }}",
+                    rule = rule_name,
+                    program = exe_path
+                );
+                let elevate_encoded = encode_powershell_script(&elevate_script);
+                let elevate_cmd = format!(
+                    "Start-Process powershell -Verb RunAs -WindowStyle Hidden -ArgumentList '-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {}'",
+                    elevate_encoded
+                );
+
+                match Command::new("powershell")
+                    .args([
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-Command",
+                        &elevate_cmd,
+                    ])
+                    .status()
+                {
+                    Ok(_) => {
+                        eprintln!(
+                            "[Sync] Requested elevated Windows firewall setup (UAC prompt may be shown)"
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("[Sync] Failed to request elevated firewall setup: {}", e);
+                    }
+                }
+            } else {
+                eprintln!(
+                    "[Sync] Failed to ensure Windows firewall rule ({}): {}",
+                    rule_name,
+                    stderr.trim()
+                );
+            }
         }
         Err(e) => {
             eprintln!(
-                "[Sync] Failed to invoke PowerShell for firewall setup on TCP {}: {}",
-                port, e
+                "[Sync] Failed to invoke PowerShell for firewall setup: {}",
+                e
             );
         }
     }
@@ -1097,14 +1163,35 @@ fn start_runtime_inner(runtime: Arc<SyncRuntime>, enabled: bool) -> Result<(), S
         let rt = runtime.clone();
         let info_for_bootstrap = info.clone();
         tauri::async_runtime::spawn(async move {
-            let listener = match super::transport::SecureListener::bind(
-                DEFAULT_SYNC_PORT,
-                private_key,
-            )
-            .await
-            {
-                Ok(l) => l,
-                Err(primary_err) => {
+            let mut listener = None;
+            let mut primary_err = String::new();
+
+            for attempt in 1..=6 {
+                match super::transport::SecureListener::bind(DEFAULT_SYNC_PORT, private_key).await {
+                    Ok(l) => {
+                        listener = Some(l);
+                        break;
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        primary_err = msg.clone();
+
+                        if msg.contains("Address already in use") && attempt < 6 {
+                            eprintln!(
+                                "[Sync] Listener bind on default port {} busy (attempt {}/6), retrying...",
+                                DEFAULT_SYNC_PORT, attempt
+                            );
+                            tokio::time::sleep(Duration::from_millis(350)).await;
+                            continue;
+                        }
+                        break;
+                    }
+                }
+            }
+
+            let listener = match listener {
+                Some(l) => l,
+                None => {
                     eprintln!(
                         "[Sync] Listener bind on default port {} failed: {}. Retrying on ephemeral port.",
                         DEFAULT_SYNC_PORT, primary_err
@@ -1146,7 +1233,7 @@ fn start_runtime_inner(runtime: Arc<SyncRuntime>, enabled: bool) -> Result<(), S
             }
 
             #[cfg(target_os = "windows")]
-            ensure_windows_firewall_rule_for_port(listen_port);
+            ensure_windows_firewall_rule_for_copi();
 
             match DiscoveryService::new(&info_for_bootstrap) {
                 Ok(discovery) => {
