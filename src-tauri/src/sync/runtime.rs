@@ -540,7 +540,7 @@ async fn handle_incoming_connection(runtime: Arc<SyncRuntime>, transport: super:
         eprintln!("[Sync] handle_incoming_connection: {} sent PushOperations with {} ops, target_version={}", 
                   remote_device_id, batch.operations.len(), batch.target_version);
         
-        let _ = with_write_conn(&runtime.app, |conn| {
+        match with_write_conn(&runtime.app, |conn| {
             let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
             for op in &batch.operations {
                 // Track clips that are images but didn't include image_data (need Phase 2)
@@ -550,10 +550,18 @@ async fn handle_incoming_connection(runtime: Arc<SyncRuntime>, transport: super:
                     }
                 }
                 
-                if SyncEngine::apply_operation(&tx, op, super::protocol::ConflictStrategy::LastWriteWins)
-                    .map_err(|e| e.to_string())?
-                {
-                    applied += 1;
+                match SyncEngine::apply_operation(&tx, op, super::protocol::ConflictStrategy::LastWriteWins) {
+                    Ok(true) => {
+                        applied += 1;
+                    }
+                    Ok(false) => {
+                        eprintln!("[Sync] apply_operation returned false for op version={}, type={:?}", 
+                                  op.version(), op.operation_type_name());
+                    }
+                    Err(e) => {
+                        eprintln!("[Sync] apply_operation ERROR for op version={}: {}", op.version(), e);
+                        return Err(e.to_string());
+                    }
                 }
                 highest_version = highest_version.max(op.version());
             }
@@ -567,7 +575,14 @@ async fn handle_incoming_connection(runtime: Arc<SyncRuntime>, transport: super:
             )
             .map_err(|e| e.to_string())?;
             Ok(())
-        });
+        }) {
+            Ok(_) => {
+                eprintln!("[Sync] handle_incoming_connection: {} transaction committed successfully", remote_device_id);
+            }
+            Err(e) => {
+                eprintln!("[Sync] handle_incoming_connection: {} transaction FAILED: {}", remote_device_id, e);
+            }
+        }
 
         eprintln!("[Sync] handle_incoming_connection: {} applied {} ops, {} need images", 
                   remote_device_id, applied, needs_images.len());

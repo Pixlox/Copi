@@ -335,10 +335,15 @@ impl SyncEngine {
                     ConflictStrategy::LastWriteWins | ConflictStrategy::PreferRemote => {
                         // Remote is older or same, skip
                         if existing_version > data.sync_version {
+                            eprintln!("[Sync] apply_upsert_clip: SKIP sync_id={} - existing_version={} > incoming_version={}", 
+                                      data.sync_id, existing_version, data.sync_version);
                             return Ok(false);
                         }
+                        // existing_version == data.sync_version: fall through to update
                     }
                     ConflictStrategy::PreferLocal => {
+                        eprintln!("[Sync] apply_upsert_clip: SKIP sync_id={} - PreferLocal strategy, existing_version={}", 
+                                  data.sync_id, existing_version);
                         return Ok(false);
                     }
                     ConflictStrategy::KeepBoth => {
@@ -493,6 +498,8 @@ impl SyncEngine {
 
         if let Some(existing_version) = existing {
             if existing_version > version && conflict_strategy == ConflictStrategy::PreferLocal {
+                eprintln!("[Sync] apply_delete_clip: SKIP sync_id={} - PreferLocal and existing_version={} > version={}", 
+                          sync_id, existing_version, version);
                 return Ok(false);
             }
 
@@ -504,6 +511,10 @@ impl SyncEngine {
 
             Ok(true)
         } else {
+            eprintln!(
+                "[Sync] apply_delete_clip: SKIP sync_id={} - clip not found or already deleted",
+                sync_id
+            );
             Ok(false)
         }
     }
@@ -527,10 +538,13 @@ impl SyncEngine {
                 match conflict_strategy {
                     ConflictStrategy::LastWriteWins | ConflictStrategy::PreferRemote => {
                         if existing_version > data.sync_version {
+                            eprintln!("[Sync] apply_upsert_collection: SKIP sync_id={} - existing_version={} > incoming_version={}", 
+                                      data.sync_id, existing_version, data.sync_version);
                             return Ok(false);
                         }
                     }
                     ConflictStrategy::PreferLocal => {
+                        eprintln!("[Sync] apply_upsert_collection: SKIP sync_id={} - PreferLocal strategy", data.sync_id);
                         return Ok(false);
                     }
                     ConflictStrategy::KeepBoth => {}
@@ -577,6 +591,8 @@ impl SyncEngine {
 
         if let Some(existing_version) = existing {
             if existing_version > version && conflict_strategy == ConflictStrategy::PreferLocal {
+                eprintln!("[Sync] apply_delete_collection: SKIP sync_id={} - PreferLocal and existing_version={} > version={}", 
+                          sync_id, existing_version, version);
                 return Ok(false);
             }
 
@@ -595,6 +611,7 @@ impl SyncEngine {
 
             Ok(true)
         } else {
+            eprintln!("[Sync] apply_delete_collection: SKIP sync_id={} - collection not found or already deleted", sync_id);
             Ok(false)
         }
     }
@@ -627,6 +644,10 @@ impl SyncEngine {
 
             Ok(true)
         } else {
+            eprintln!(
+                "[Sync] apply_upsert_embedding: SKIP clip_sync_id={} - clip not found",
+                clip_sync_id
+            );
             Ok(false)
         }
     }
@@ -654,6 +675,12 @@ impl SyncEngine {
             rusqlite::params![collection_id, version, clip_sync_id],
         )?;
 
+        if updated == 0 {
+            eprintln!(
+                "[Sync] apply_move_clip: SKIP clip_sync_id={} - clip not found",
+                clip_sync_id
+            );
+        }
         Ok(updated > 0)
     }
 
@@ -669,6 +696,12 @@ impl SyncEngine {
             rusqlite::params![pinned as i64, version, sync_id],
         )?;
 
+        if updated == 0 {
+            eprintln!(
+                "[Sync] apply_set_pinned: SKIP sync_id={} - clip not found",
+                sync_id
+            );
+        }
         Ok(updated > 0)
     }
 }

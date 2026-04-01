@@ -176,6 +176,19 @@ impl SyncOperation {
             SyncOperation::SetClipPinned { version, .. } => *version,
         }
     }
+
+    /// Get a human-readable name for the operation type (for debugging)
+    pub fn operation_type_name(&self) -> &'static str {
+        match self {
+            SyncOperation::UpsertClip(_) => "UpsertClip",
+            SyncOperation::DeleteClip { .. } => "DeleteClip",
+            SyncOperation::UpsertCollection(_) => "UpsertCollection",
+            SyncOperation::DeleteCollection { .. } => "DeleteCollection",
+            SyncOperation::UpsertEmbedding { .. } => "UpsertEmbedding",
+            SyncOperation::MoveClipToCollection { .. } => "MoveClipToCollection",
+            SyncOperation::SetClipPinned { .. } => "SetClipPinned",
+        }
+    }
 }
 
 /// Full clip data for sync
