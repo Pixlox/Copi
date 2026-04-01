@@ -225,8 +225,7 @@ pub async fn set_config(app: tauri::AppHandle, config: CopiConfig) -> Result<(),
     if login_changed {
         #[cfg(desktop)]
         {
-            if let Some(autolaunch) = app.try_state::<tauri_plugin_autostart::AutoLaunchManager>()
-            {
+            if let Some(autolaunch) = app.try_state::<tauri_plugin_autostart::AutoLaunchManager>() {
                 if config.general.launch_at_login {
                     autolaunch.enable().map_err(|e| e.to_string())?;
                 } else {
@@ -237,7 +236,10 @@ pub async fn set_config(app: tauri::AppHandle, config: CopiConfig) -> Result<(),
     }
 
     save_config(&app, &config)?;
-    let _ = app.emit("sync:config-updated", SyncConfigPayload::from(config.sync.clone()));
+    let _ = app.emit(
+        "sync:config-updated",
+        SyncConfigPayload::from(config.sync.clone()),
+    );
     crate::sync::apply_config_change(&app, existing.as_ref(), &config);
 
     if existing
@@ -304,7 +306,7 @@ pub async fn clear_all_history(app: tauri::AppHandle) -> Result<(), String> {
         "UPDATE clips SET deleted = 1, sync_version = ?1 WHERE deleted = 0",
         rusqlite::params![sync_version],
     )
-        .map_err(|e| e.to_string())?;
+    .map_err(|e| e.to_string())?;
     tx.execute("DROP TABLE IF EXISTS clip_embeddings", [])
         .map_err(|e| e.to_string())?;
     tx.execute(

@@ -75,7 +75,12 @@ pub async fn search_clips(
     collection_id: Option<i64>,
 ) -> Result<Vec<ClipResult>, String> {
     let token = match app.try_state::<AppState>() {
-        Some(state) => state.search_generation.fetch_add(1, AtomicOrdering::Relaxed) + 1,
+        Some(state) => {
+            state
+                .search_generation
+                .fetch_add(1, AtomicOrdering::Relaxed)
+                + 1
+        }
         None => return Ok(Vec::new()),
     };
 
@@ -108,8 +113,10 @@ pub async fn get_total_clip_count(app: tauri::AppHandle) -> Result<i64, String> 
             .try_state::<AppState>()
             .ok_or_else(|| "App state not ready yet".to_string())?;
         let conn = state.db_read_pool.get().map_err(|e| e.to_string())?;
-        conn.query_row("SELECT COUNT(*) FROM clips WHERE deleted = 0", [], |row| row.get(0))
-            .map_err(|e| e.to_string())
+        conn.query_row("SELECT COUNT(*) FROM clips WHERE deleted = 0", [], |row| {
+            row.get(0)
+        })
+        .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -134,7 +141,11 @@ pub async fn toggle_pin(app: tauri::AppHandle, clip_id: i64) -> Result<(), Strin
     )
     .map_err(|e| e.to_string())?;
     if updated > 0 {
-        if let Ok(sync_id) = conn.query_row("SELECT sync_id FROM clips WHERE id = ?1", [clip_id], |r| r.get::<_, String>(0)) {
+        if let Ok(sync_id) =
+            conn.query_row("SELECT sync_id FROM clips WHERE id = ?1", [clip_id], |r| {
+                r.get::<_, String>(0)
+            })
+        {
             runtime::queue_clip_sync_change(&app, sync_id);
         }
     }
@@ -150,13 +161,18 @@ pub async fn delete_clip(app: tauri::AppHandle, clip_id: i64) -> Result<(), Stri
     let sync_version = crate::sync::engine::SyncEngine::next_sync_version(&conn).unwrap_or(0);
     conn.execute("DELETE FROM clip_embeddings WHERE rowid = ?", [clip_id])
         .ok();
-    let updated = conn.execute(
-        "UPDATE clips SET deleted = 1, sync_version = ?1 WHERE id = ?2 AND deleted = 0",
-        rusqlite::params![sync_version, clip_id],
-    )
+    let updated = conn
+        .execute(
+            "UPDATE clips SET deleted = 1, sync_version = ?1 WHERE id = ?2 AND deleted = 0",
+            rusqlite::params![sync_version, clip_id],
+        )
         .map_err(|e| e.to_string())?;
     if updated > 0 {
-        if let Ok(sync_id) = conn.query_row("SELECT sync_id FROM clips WHERE id = ?1", [clip_id], |r| r.get::<_, String>(0)) {
+        if let Ok(sync_id) =
+            conn.query_row("SELECT sync_id FROM clips WHERE id = ?1", [clip_id], |r| {
+                r.get::<_, String>(0)
+            })
+        {
             runtime::queue_clip_sync_change(&app, sync_id);
         }
     }
@@ -207,7 +223,11 @@ pub async fn update_clip_content(
     )
     .map_err(|e| e.to_string())?;
     if updated > 0 {
-        if let Ok(sync_id) = conn.query_row("SELECT sync_id FROM clips WHERE id = ?1", [clip_id], |r| r.get::<_, String>(0)) {
+        if let Ok(sync_id) =
+            conn.query_row("SELECT sync_id FROM clips WHERE id = ?1", [clip_id], |r| {
+                r.get::<_, String>(0)
+            })
+        {
             runtime::queue_clip_sync_change(&app, sync_id);
         }
     }
@@ -287,9 +307,11 @@ pub async fn get_image_preview(
 pub async fn get_clip_full_content(app: tauri::AppHandle, clip_id: i64) -> Result<String, String> {
     let state = app.state::<AppState>();
     let conn = state.db_read_pool.get().map_err(|e| e.to_string())?;
-    conn.query_row("SELECT content FROM clips WHERE id = ? AND deleted = 0", [clip_id], |row| {
-        row.get(0)
-    })
+    conn.query_row(
+        "SELECT content FROM clips WHERE id = ? AND deleted = 0",
+        [clip_id],
+        |row| row.get(0),
+    )
     .map_err(|e| e.to_string())
 }
 

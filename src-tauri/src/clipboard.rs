@@ -69,10 +69,7 @@ pub async fn watch_clipboard(app: &tauri::AppHandle) {
         }
         let source_app = pasteboard_source
             .filter(|app| !app.is_copi() && !app.is_empty())
-            .or_else(|| {
-                current_frontmost
-                    .filter(|app| !app.is_copi() && !app.is_empty())
-            })
+            .or_else(|| current_frontmost.filter(|app| !app.is_copi() && !app.is_empty()))
             .or_else(|| last_non_copi_app.clone())
             .unwrap_or_default();
 
@@ -896,7 +893,9 @@ fn insert_clip(
     let sync_id = uuid::Uuid::new_v4().to_string();
     let sync_version = SyncEngine::next_sync_version(&conn).unwrap_or(0);
     let origin_device_id: Option<String> = conn
-        .query_row("SELECT device_id FROM device_info LIMIT 1", [], |row| row.get(0))
+        .query_row("SELECT device_id FROM device_info LIMIT 1", [], |row| {
+            row.get(0)
+        })
         .ok();
 
     let result = conn.execute(
@@ -977,7 +976,9 @@ fn insert_image_clip(
     let sync_id = uuid::Uuid::new_v4().to_string();
     let sync_version = SyncEngine::next_sync_version(&conn).unwrap_or(0);
     let origin_device_id: Option<String> = conn
-        .query_row("SELECT device_id FROM device_info LIMIT 1", [], |row| row.get(0))
+        .query_row("SELECT device_id FROM device_info LIMIT 1", [], |row| {
+            row.get(0)
+        })
         .ok();
     let result = conn.execute(
         "INSERT INTO clips (content, content_hash, content_type, source_app, source_app_icon, ocr_text, language, image_data, image_thumbnail, image_width, image_height, created_at, sync_id, sync_version, deleted, origin_device_id)

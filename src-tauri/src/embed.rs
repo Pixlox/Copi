@@ -366,10 +366,16 @@ fn embed_single_clip(model: &EmbeddingModel, app: &tauri::AppHandle, clip_id: i6
         }
     };
     let sync_id: Option<String> = conn
-        .query_row("SELECT sync_id FROM clips WHERE id = ?1", [clip_id], |r| r.get(0))
+        .query_row("SELECT sync_id FROM clips WHERE id = ?1", [clip_id], |r| {
+            r.get(0)
+        })
         .ok();
     let sync_version: Option<i64> = conn
-        .query_row("SELECT sync_version FROM clips WHERE id = ?1", [clip_id], |r| r.get(0))
+        .query_row(
+            "SELECT sync_version FROM clips WHERE id = ?1",
+            [clip_id],
+            |r| r.get(0),
+        )
         .ok();
     let _ = conn.execute("DELETE FROM clip_embeddings WHERE rowid = ?", [clip_id]);
     match conn.execute(
@@ -378,7 +384,8 @@ fn embed_single_clip(model: &EmbeddingModel, app: &tauri::AppHandle, clip_id: i6
     ) {
         Ok(_) => {
             if let (Some(sync_id), Some(sync_version)) = (sync_id, sync_version) {
-                let _ = crate::sync::runtime::queue_embedding_sync_change(app, sync_id, sync_version);
+                let _ =
+                    crate::sync::runtime::queue_embedding_sync_change(app, sync_id, sync_version);
             }
             EmbedOutcome::Stored
         }

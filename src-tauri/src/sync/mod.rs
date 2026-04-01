@@ -70,9 +70,7 @@ pub enum SyncEvent {
         platform: Platform,
     },
     /// Device went offline
-    DeviceLost {
-        device_id: String,
-    },
+    DeviceLost { device_id: String },
     /// Pairing request received
     PairingRequest {
         device_id: String,
@@ -85,18 +83,11 @@ pub enum SyncEvent {
         device_name: String,
     },
     /// Pairing failed
-    PairingFailed {
-        device_id: String,
-        reason: String,
-    },
+    PairingFailed { device_id: String, reason: String },
     /// Connected to a paired device
-    Connected {
-        device_id: String,
-    },
+    Connected { device_id: String },
     /// Disconnected from a device
-    Disconnected {
-        device_id: String,
-    },
+    Disconnected { device_id: String },
     /// Sync operation completed
     SyncComplete {
         device_id: String,
@@ -235,9 +226,7 @@ pub async fn sync_list_discovered_devices(
 }
 
 #[tauri::command]
-pub async fn sync_start_pairing(
-    app: tauri::AppHandle,
-) -> Result<SyncPairingCodePayload, String> {
+pub async fn sync_start_pairing(app: tauri::AppHandle) -> Result<SyncPairingCodePayload, String> {
     runtime::start_pairing(app).await
 }
 

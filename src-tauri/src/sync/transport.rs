@@ -8,7 +8,7 @@ use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::Mutex;
 
 use super::{SyncError, SyncResult};
@@ -204,7 +204,7 @@ impl SecureTransport {
         let total_len = data.len() as u32;
         let header = total_len.to_be_bytes();
         self.send_chunk(&header).await?;
-        
+
         // Send data in chunks
         let mut offset = 0;
         while offset < data.len() {
@@ -213,17 +213,21 @@ impl SecureTransport {
             self.send_chunk(chunk).await?;
             offset = chunk_end;
         }
-        
+
         Ok(())
     }
-    
+
     /// Send a single chunk through the encrypted channel
     async fn send_chunk(&self, data: &[u8]) -> SyncResult<()> {
         if data.len() > MAX_NOISE_PAYLOAD {
-            eprintln!("[Sync Transport] Chunk too large: {} bytes (max={})", data.len(), MAX_NOISE_PAYLOAD);
+            eprintln!(
+                "[Sync Transport] Chunk too large: {} bytes (max={})",
+                data.len(),
+                MAX_NOISE_PAYLOAD
+            );
             return Err(SyncError::TransportError(format!(
-                "Chunk too large: {} bytes (max {})", 
-                data.len(), 
+                "Chunk too large: {} bytes (max {})",
+                data.len(),
                 MAX_NOISE_PAYLOAD
             )));
         }
@@ -231,18 +235,18 @@ impl SecureTransport {
         let mut noise = self.noise.lock().await;
         let mut buf = vec![0u8; MAX_BUFFER_SIZE];
 
-        let len = noise
-            .write_message(data, &mut buf)
-            .map_err(|e| {
-                eprintln!("[Sync Transport] Noise encrypt failed: {}", e);
-                SyncError::EncryptionError(e.to_string())
-            })?;
+        let len = noise.write_message(data, &mut buf).map_err(|e| {
+            eprintln!("[Sync Transport] Noise encrypt failed: {}", e);
+            SyncError::EncryptionError(e.to_string())
+        })?;
 
         let mut writer = self.writer.lock().await;
-        Self::send_raw_writer(&mut *writer, &buf[..len]).await.map_err(|e| {
-            eprintln!("[Sync Transport] Send raw failed: {}", e);
-            e
-        })
+        Self::send_raw_writer(&mut *writer, &buf[..len])
+            .await
+            .map_err(|e| {
+                eprintln!("[Sync Transport] Send raw failed: {}", e);
+                e
+            })
     }
 
     /// Receive a message from the encrypted channel.
@@ -254,27 +258,28 @@ impl SecureTransport {
             return Err(SyncError::TransportError("Invalid message header".into()));
         }
         let total_len = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
-        
+
         // Sanity check - don't accept messages larger than 10MB
         if total_len > 10 * 1024 * 1024 {
             return Err(SyncError::TransportError(format!(
-                "Message too large: {} bytes", total_len
+                "Message too large: {} bytes",
+                total_len
             )));
         }
-        
+
         // Receive chunks until we have the full message
         let mut result = Vec::with_capacity(total_len);
         while result.len() < total_len {
             let chunk = self.recv_chunk().await?;
             result.extend_from_slice(&chunk);
         }
-        
+
         // Trim to exact length (shouldn't be needed, but just in case)
         result.truncate(total_len);
-        
+
         Ok(result)
     }
-    
+
     /// Receive a single chunk from the encrypted channel
     async fn recv_chunk(&self) -> SyncResult<Vec<u8>> {
         let mut noise = self.noise.lock().await;
@@ -344,34 +349,99 @@ impl SecureTransport {
     pub fn remote_public_key(&self) -> &[u8] {
         &self.remote_public_key
     }
-
 }
 
 /// TCP listener for accepting encrypted connections
 pub struct SecureListener {
-    listener: TcpListener,
+    primary_listener: TcpListener,
+    secondary_listener: Option<TcpListener>,
     our_private_key: [u8; 32],
 }
 
 impl SecureListener {
     /// Create a new listener on the specified port.
-    /// Attempts dual-stack binding ([::]) first — this accepts both IPv4 and
-    /// IPv6 connections on every major OS. Falls back to IPv4-only (0.0.0.0)
-    /// when dual-stack is unavailable.
+    ///
+    /// Tries IPv6 first, then opportunistically adds an IPv4 listener on the
+    /// same port. If IPv6 binding fails entirely, falls back to IPv4-only.
+    ///
+    /// Why two listeners:
+    /// - some platforms expose dual-stack behavior from a single IPv6 socket
+    /// - others require separate IPv4 + IPv6 sockets
+    ///
+    /// We support both by always attempting the second bind and accepting from
+    /// whichever listener receives a connection first.
     pub async fn bind(port: u16, our_private_key: [u8; 32]) -> SyncResult<Self> {
-        let listener = match TcpListener::bind(SocketAddr::from((Ipv6Addr::UNSPECIFIED, port))).await {
-            Ok(l) => {
-                eprintln!("[Sync] Listening on port {} (dual-stack)", port);
-                l
+        let v6_socket = TcpSocket::new_v6();
+        if let Ok(v6_socket) = v6_socket {
+            let _ = v6_socket.set_reuseaddr(true);
+            if v6_socket
+                .bind(SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)))
+                .is_ok()
+            {
+                let primary_listener = v6_socket.listen(1024)?;
+                let bound_port = primary_listener.local_addr()?.port();
+
+                let secondary_listener = match TcpSocket::new_v4() {
+                    Ok(v4_socket) => {
+                        let _ = v4_socket.set_reuseaddr(true);
+                        match v4_socket.bind(SocketAddr::from(([0, 0, 0, 0], bound_port))) {
+                            Ok(_) => match v4_socket.listen(1024) {
+                                Ok(v4_listener) => {
+                                    eprintln!(
+                                        "[Sync] Listening on port {} (IPv6 + IPv4 listeners)",
+                                        bound_port
+                                    );
+                                    Some(v4_listener)
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "[Sync] IPv4 secondary listen failed on port {}: {}",
+                                        bound_port, e
+                                    );
+                                    eprintln!(
+                                        "[Sync] Listening on port {} (IPv6 primary)",
+                                        bound_port
+                                    );
+                                    None
+                                }
+                            },
+                            Err(e) => {
+                                eprintln!(
+                                    "[Sync] IPv4 secondary bind failed on port {}: {}",
+                                    bound_port, e
+                                );
+                                eprintln!("[Sync] Listening on port {} (IPv6 primary)", bound_port);
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[Sync] Failed to create IPv4 secondary socket: {}", e);
+                        eprintln!("[Sync] Listening on port {} (IPv6 primary)", bound_port);
+                        None
+                    }
+                };
+
+                return Ok(Self {
+                    primary_listener,
+                    secondary_listener,
+                    our_private_key,
+                });
             }
-            Err(_) => {
-                let l = TcpListener::bind(("0.0.0.0", port)).await?;
-                eprintln!("[Sync] Listening on port {} (IPv4 only)", port);
-                l
-            }
-        };
+        }
+
+        let v4_socket = TcpSocket::new_v4()?;
+        let _ = v4_socket.set_reuseaddr(true);
+        v4_socket.bind(SocketAddr::from(([0, 0, 0, 0], port)))?;
+        let primary_listener = v4_socket.listen(1024)?;
+        eprintln!(
+            "[Sync] Listening on port {} (IPv4 only)",
+            primary_listener.local_addr()?.port()
+        );
+
         Ok(Self {
-            listener,
+            primary_listener,
+            secondary_listener: None,
             our_private_key,
         })
     }
@@ -380,12 +450,62 @@ impl SecureListener {
     /// Returns the stream and peer address so the caller can spawn
     /// the handshake in a separate task with its own timeout.
     pub async fn accept_tcp(&self) -> SyncResult<(TcpStream, std::net::SocketAddr)> {
-        let (stream, addr) = self.listener.accept().await?;
-        Ok((stream, addr))
+        if let Some(secondary) = &self.secondary_listener {
+            tokio::select! {
+                res = self.primary_listener.accept() => {
+                    let (stream, addr) = res?;
+                    Ok((stream, addr))
+                }
+                res = secondary.accept() => {
+                    let (stream, addr) = res?;
+                    Ok((stream, addr))
+                }
+            }
+        } else {
+            let (stream, addr) = self.primary_listener.accept().await?;
+            Ok((stream, addr))
+        }
     }
 
     /// Get a copy of our private key (for spawning handshake tasks)
     pub fn private_key(&self) -> [u8; 32] {
         self.our_private_key
+    }
+
+    /// Get the bound local socket address.
+    pub fn local_addr(&self) -> SyncResult<std::net::SocketAddr> {
+        Ok(self.primary_listener.local_addr()?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SecureListener, SecureTransport};
+
+    #[tokio::test]
+    async fn secure_transport_roundtrip_succeeds() {
+        let server_key = [7u8; 32];
+        let client_key = [9u8; 32];
+
+        let listener = SecureListener::bind(0, server_key).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept_tcp().await.unwrap();
+            SecureTransport::accept(stream, &server_key).await.unwrap()
+        });
+
+        let client = SecureTransport::connect(addr, &client_key, None)
+            .await
+            .unwrap();
+        let server_transport = server.await.unwrap();
+
+        client.send(b"hello").await.unwrap();
+        let got = server_transport.recv().await.unwrap();
+        assert_eq!(got, b"hello");
+
+        server_transport.send(b"world").await.unwrap();
+        let got = client.recv().await.unwrap();
+        assert_eq!(got, b"world");
     }
 }

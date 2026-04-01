@@ -188,7 +188,10 @@ impl DiscoveryService {
 
                     retries += 1;
                     if retries > BROWSE_MAX_RETRIES {
-                        eprintln!("[Sync] mDNS browse disconnected {} times, giving up", retries);
+                        eprintln!(
+                            "[Sync] mDNS browse disconnected {} times, giving up",
+                            retries
+                        );
                         break;
                     }
 
