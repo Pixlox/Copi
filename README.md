@@ -144,16 +144,6 @@ npm install
 npm run tauri dev
 ```
 
-To build a release:
-
-```bash
-# Bump all version files at once (package.json, Cargo.toml, tauri.conf.json)
-npm run release:version -- 1.2.3
-
-# Build
-npm run tauri build
-```
-
 ---
 
 ## Status
