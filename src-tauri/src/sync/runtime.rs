@@ -132,7 +132,7 @@ async fn flush_pending_for_device(runtime: Arc<SyncRuntime>, device_id: String) 
             .map(|c| c.sync.sync_embeddings)
             .unwrap_or(true);
 
-        let mut ops = SyncEngine::get_operations_since(conn, last_sent_version, &local_id, 500, sync_embeddings)
+        let mut ops = SyncEngine::get_operations_since(conn, last_sent_version, &local_id, 50, sync_embeddings)
             .map_err(|e| e.to_string())?;
         eprintln!("[Sync] flush_pending_for_device: {} found {} ops since version {}", device_id, ops.len(), last_sent_version);
         if ops.is_empty() {
@@ -220,8 +220,9 @@ async fn flush_pending_for_device(runtime: Arc<SyncRuntime>, device_id: String) 
         }
     };
 
-    if transport.send(&bytes).await.is_err() {
-        eprintln!("[Sync] flush_pending_for_device: {} send failed", device_id);
+    eprintln!("[Sync] flush_pending_for_device: {} about to send {} bytes", device_id, bytes.len());
+    if let Err(e) = transport.send(&bytes).await {
+        eprintln!("[Sync] flush_pending_for_device: {} send failed: {} (payload={} bytes)", device_id, e, bytes.len());
         return;
     }
     eprintln!("[Sync] flush_pending_for_device: {} sent {} bytes, awaiting ACK", device_id, bytes.len());

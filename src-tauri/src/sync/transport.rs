@@ -20,8 +20,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// XX pattern: Both parties authenticate each other
 const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 
-/// Maximum message size (16 KB payload + noise overhead)
-const MAX_MESSAGE_SIZE: usize = 16 * 1024 + 64;
+/// Maximum payload size per Noise message (must stay under 65535 - 16 for auth tag)
+/// We use 60KB to leave room for Noise overhead
+const MAX_NOISE_PAYLOAD: usize = 60 * 1024;
+
+/// Maximum buffer size for encryption/decryption operations
+const MAX_BUFFER_SIZE: usize = 64 * 1024;
 
 /// Message framing: 2-byte length prefix (big-endian)
 const LENGTH_PREFIX_SIZE: usize = 2;
@@ -112,8 +116,8 @@ impl SecureTransport {
             .build_initiator()
             .map_err(|e| SyncError::EncryptionError(e.to_string()))?;
 
-        let mut buf = vec![0u8; MAX_MESSAGE_SIZE];
-        let mut read_buf = vec![0u8; MAX_MESSAGE_SIZE];
+        let mut buf = vec![0u8; MAX_BUFFER_SIZE];
+        let mut read_buf = vec![0u8; MAX_BUFFER_SIZE];
 
         // -> e
         let len = noise
@@ -158,8 +162,8 @@ impl SecureTransport {
             .build_responder()
             .map_err(|e| SyncError::EncryptionError(e.to_string()))?;
 
-        let mut buf = vec![0u8; MAX_MESSAGE_SIZE];
-        let mut read_buf = vec![0u8; MAX_MESSAGE_SIZE];
+        let mut buf = vec![0u8; MAX_BUFFER_SIZE];
+        let mut read_buf = vec![0u8; MAX_BUFFER_SIZE];
 
         // <- e
         let msg = Self::recv_raw(&mut stream, &mut read_buf).await?;
@@ -193,28 +197,89 @@ impl SecureTransport {
         Ok((noise, remote_public_key, stream))
     }
 
-    /// Send a message through the encrypted channel
+    /// Send a message through the encrypted channel.
+    /// Large messages are automatically chunked into multiple Noise frames.
     pub async fn send(&self, data: &[u8]) -> SyncResult<()> {
-        if data.len() > MAX_MESSAGE_SIZE - 64 {
-            return Err(SyncError::TransportError("Message too large".into()));
+        // First, send the total length as a 4-byte header (encrypted)
+        let total_len = data.len() as u32;
+        let header = total_len.to_be_bytes();
+        self.send_chunk(&header).await?;
+        
+        // Send data in chunks
+        let mut offset = 0;
+        while offset < data.len() {
+            let chunk_end = (offset + MAX_NOISE_PAYLOAD).min(data.len());
+            let chunk = &data[offset..chunk_end];
+            self.send_chunk(chunk).await?;
+            offset = chunk_end;
+        }
+        
+        Ok(())
+    }
+    
+    /// Send a single chunk through the encrypted channel
+    async fn send_chunk(&self, data: &[u8]) -> SyncResult<()> {
+        if data.len() > MAX_NOISE_PAYLOAD {
+            eprintln!("[Sync Transport] Chunk too large: {} bytes (max={})", data.len(), MAX_NOISE_PAYLOAD);
+            return Err(SyncError::TransportError(format!(
+                "Chunk too large: {} bytes (max {})", 
+                data.len(), 
+                MAX_NOISE_PAYLOAD
+            )));
         }
 
         let mut noise = self.noise.lock().await;
-        let mut buf = vec![0u8; MAX_MESSAGE_SIZE];
+        let mut buf = vec![0u8; MAX_BUFFER_SIZE];
 
         let len = noise
             .write_message(data, &mut buf)
-            .map_err(|e| SyncError::EncryptionError(e.to_string()))?;
+            .map_err(|e| {
+                eprintln!("[Sync Transport] Noise encrypt failed: {}", e);
+                SyncError::EncryptionError(e.to_string())
+            })?;
 
         let mut writer = self.writer.lock().await;
-        Self::send_raw_writer(&mut *writer, &buf[..len]).await
+        Self::send_raw_writer(&mut *writer, &buf[..len]).await.map_err(|e| {
+            eprintln!("[Sync Transport] Send raw failed: {}", e);
+            e
+        })
     }
 
-    /// Receive a message from the encrypted channel
+    /// Receive a message from the encrypted channel.
+    /// Automatically reassembles chunked messages.
     pub async fn recv(&self) -> SyncResult<Vec<u8>> {
+        // First, receive the header with total length
+        let header = self.recv_chunk().await?;
+        if header.len() != 4 {
+            return Err(SyncError::TransportError("Invalid message header".into()));
+        }
+        let total_len = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
+        
+        // Sanity check - don't accept messages larger than 10MB
+        if total_len > 10 * 1024 * 1024 {
+            return Err(SyncError::TransportError(format!(
+                "Message too large: {} bytes", total_len
+            )));
+        }
+        
+        // Receive chunks until we have the full message
+        let mut result = Vec::with_capacity(total_len);
+        while result.len() < total_len {
+            let chunk = self.recv_chunk().await?;
+            result.extend_from_slice(&chunk);
+        }
+        
+        // Trim to exact length (shouldn't be needed, but just in case)
+        result.truncate(total_len);
+        
+        Ok(result)
+    }
+    
+    /// Receive a single chunk from the encrypted channel
+    async fn recv_chunk(&self) -> SyncResult<Vec<u8>> {
         let mut noise = self.noise.lock().await;
-        let mut read_buf = vec![0u8; MAX_MESSAGE_SIZE];
-        let mut out_buf = vec![0u8; MAX_MESSAGE_SIZE];
+        let mut read_buf = vec![0u8; MAX_BUFFER_SIZE];
+        let mut out_buf = vec![0u8; MAX_BUFFER_SIZE];
 
         let mut reader = self.reader.lock().await;
         let msg = Self::recv_raw_reader(&mut *reader, &mut read_buf).await?;
