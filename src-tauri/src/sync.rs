@@ -305,6 +305,10 @@ pub fn start_sync(app: AppHandle) -> Arc<SyncState> {
     }
 
     let trusted_peers = get_trusted_peers(&app).unwrap_or_default();
+    eprintln!("[Sync] Loaded {} trusted peers", trusted_peers.len());
+    for peer in &trusted_peers {
+        eprintln!("[Sync]   - peer: {} ({})", peer.display_name, peer.device_id);
+    }
 
     let sync = Arc::new(SyncState {
         device_id,
@@ -1664,6 +1668,68 @@ pub async fn sync_list_discovered(app: AppHandle) -> Result<Vec<DiscoveredPeer>,
     }
     let values = sync.discovered.read().await.values().cloned().collect();
     Ok(values)
+}
+
+/// Debug command to manually add a trusted peer (for testing when mDNS doesn't work)
+#[tauri::command]
+pub async fn sync_add_peer_manual(
+    app: AppHandle,
+    device_id: String,
+    display_name: String,
+    addr: String,
+) -> Result<(), String> {
+    eprintln!("[Sync] Manual add peer: device_id={} name={} addr={}", device_id, display_name, addr);
+    save_trusted_peer(&app, &device_id, &display_name).map_err(|e| e.to_string())?;
+    
+    // Also store the address so we can connect
+    if let Some(sync) = app.state::<AppState>().sync.get() {
+        if let Ok(socket_addr) = parse_target_addr(&addr) {
+            sync.known_addrs.write().await.insert(device_id.clone(), socket_addr);
+            eprintln!("[Sync] Stored address for peer: {}", socket_addr);
+            
+            // Try to connect immediately
+            let app_clone = app.clone();
+            let sync_clone = sync.clone();
+            tauri::async_runtime::spawn(async move {
+                connect_to_peer(app_clone, sync_clone, device_id, socket_addr).await;
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Debug command to manually trigger connection to a peer by IP
+#[tauri::command]
+pub async fn sync_connect_to_ip(
+    app: AppHandle,
+    addr: String,
+) -> Result<(), String> {
+    eprintln!("[Sync] Manual connect to: {}", addr);
+    let state = app.state::<AppState>();
+    let sync = state
+        .sync
+        .get()
+        .cloned()
+        .ok_or_else(|| "sync not initialized".to_string())?;
+    if !sync.is_enabled() {
+        return Err("sync is disabled".to_string());
+    }
+    
+    let socket_addr = parse_target_addr(&addr).map_err(|e| e.to_string())?;
+    
+    // Connect and send a Hello to discover the peer's device_id
+    let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(socket_addr))
+        .await
+        .map_err(|_| "connect timeout".to_string())
+        .and_then(|r| r.map_err(|e| e.to_string()))?;
+    
+    // Let the session handle the rest
+    let app_clone = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = handle_connection(app_clone, sync, stream, true, None).await;
+    });
+    
+    Ok(())
 }
 
 pub fn next_sync_version(app: &AppHandle) -> i64 {
