@@ -476,13 +476,15 @@ async fn run_browser(
         std::thread::spawn(move || {
             eprintln!("[Sync] mDNS event thread started");
             while let Ok(event) = browse_rx.recv() {
-                eprintln!("[Sync] mDNS event received: {:?}", match &event {
-                    ServiceEvent::ServiceResolved(info) => format!("Resolved: {}", info.get_fullname()),
-                    ServiceEvent::ServiceRemoved(_, name) => format!("Removed: {}", name),
-                    ServiceEvent::ServiceFound(_, name) => format!("Found: {}", name),
-                    ServiceEvent::SearchStarted(_) => "SearchStarted".to_string(),
-                    ServiceEvent::SearchStopped(_) => "SearchStopped".to_string(),
-                });
+                match &event {
+                    ServiceEvent::ServiceResolved(info) => {
+                        eprintln!("[Sync] mDNS resolved service={}", info.get_fullname());
+                    }
+                    ServiceEvent::ServiceRemoved(_, name) => {
+                        eprintln!("[Sync] mDNS removed service={}", name);
+                    }
+                    _ => {}
+                }
                 if event_tx.send(event).is_err() {
                     eprintln!("[Sync] mDNS event channel closed");
                     break;
@@ -809,6 +811,11 @@ async fn run_session(
                 peer_id
             ));
         }
+    }
+
+    if sync.connected_peers().await.contains(&peer_id) {
+        eprintln!("[Sync] Duplicate session for peer={}, closing duplicate", peer_id);
+        return Ok(());
     }
 
     sync.register_peer(peer_id.clone(), writer.clone()).await;
