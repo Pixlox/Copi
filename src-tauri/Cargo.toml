@@ -42,16 +42,10 @@ syntect = "5"
 
 # LAN sync dependencies
 mdns-sd = "0.11"                    # mDNS service discovery (Bonjour/Avahi)
-snow = "0.9"                        # Noise Protocol Framework (encryption)
-x25519-dalek = { version = "2", features = ["static_secrets"] }  # Key exchange
-rand = "0.8"                        # Random generation
-uuid = { version = "1", features = ["v4", "serde"] }  # Sync IDs
-blake2 = "0.10"                     # BLAKE2 hashing for pairing verification
-digest = "0.10"                     # Digest traits for blake2
+uuid = { version = "1", features = ["v4"] }  # Sync IDs
 base64 = "0.22"                     # Base64 encoding for mDNS TXT records
-thiserror = "2"                     # Error handling
-hostname = "0.4"                    # Get device hostname
-if-addrs = "0.13"                   # Interface enumeration for scoped IPv6
+gethostname = "1.1"                 # Get device hostname
+anyhow = "1"
 
 # Desktop-only plugins
 [target."cfg(not(any(target_os = \"android\", target_os = \"ios\")))".dependencies]
@@ -86,7 +80,6 @@ windows = { version = "0.61", features = [
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
-
 
 
 

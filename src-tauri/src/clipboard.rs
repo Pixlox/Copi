@@ -940,9 +940,13 @@ fn insert_clip(
         drop(conn);
         if let Some(clip_id) = clip_id {
             enqueue_embedding(&state, clip_id, "insert_clip");
-            sync::on_local_clip_saved(app, &sync_id);
         }
         let _ = app.emit("new-clip", ());
+        let app_clone = app.clone();
+        let hash_str = hash.to_string();
+        tauri::async_runtime::spawn(async move {
+            crate::sync::on_local_clip_saved(&app_clone, &hash_str).await;
+        });
     }
 }
 
@@ -1039,8 +1043,12 @@ fn insert_image_clip(
         if let (Some(clip_id), true) = (clip_id, ocr_text.is_some()) {
             enqueue_embedding(&state, clip_id, "insert_image_clip");
         }
-        sync::on_local_clip_saved(app, &sync_id);
         let _ = app.emit("new-clip", ());
+        let app_clone = app.clone();
+        let hash_str = hash.to_string();
+        tauri::async_runtime::spawn(async move {
+            crate::sync::on_local_clip_saved(&app_clone, &hash_str).await;
+        });
     }
 }
 

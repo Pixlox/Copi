@@ -140,16 +140,23 @@ pub async fn toggle_pin(app: tauri::AppHandle, clip_id: i64) -> Result<(), Strin
         rusqlite::params![sync::next_sync_version(&app), clip_id],
     )
     .map_err(|e| e.to_string())?;
+    let mut sync_key: Option<String> = None;
     if updated > 0 {
         if let Ok(sync_id) =
             conn.query_row("SELECT sync_id FROM clips WHERE id = ?1", [clip_id], |r| {
                 r.get::<_, String>(0)
             })
         {
-            sync::on_local_clip_saved(&app, &sync_id);
+            sync_key = Some(sync_id);
         }
     }
     drop(conn);
+    if let Some(sync_key) = sync_key {
+        let app_clone = app.clone();
+        tauri::async_runtime::spawn(async move {
+            sync::on_local_clip_saved(&app_clone, &sync_key).await;
+        });
+    }
     let _ = app.emit("clips-changed", ());
     Ok(())
 }
@@ -167,16 +174,23 @@ pub async fn delete_clip(app: tauri::AppHandle, clip_id: i64) -> Result<(), Stri
             rusqlite::params![sync_version, clip_id],
         )
         .map_err(|e| e.to_string())?;
+    let mut sync_key: Option<String> = None;
     if updated > 0 {
         if let Ok(sync_id) =
             conn.query_row("SELECT sync_id FROM clips WHERE id = ?1", [clip_id], |r| {
                 r.get::<_, String>(0)
             })
         {
-            sync::on_local_clip_saved(&app, &sync_id);
+            sync_key = Some(sync_id);
         }
     }
     drop(conn);
+    if let Some(sync_key) = sync_key {
+        let app_clone = app.clone();
+        tauri::async_runtime::spawn(async move {
+            sync::on_local_clip_saved(&app_clone, &sync_key).await;
+        });
+    }
     let _ = app.emit("clips-changed", ());
     Ok(())
 }
@@ -222,16 +236,23 @@ pub async fn update_clip_content(
         ],
     )
     .map_err(|e| e.to_string())?;
+    let mut sync_key: Option<String> = None;
     if updated > 0 {
         if let Ok(sync_id) =
             conn.query_row("SELECT sync_id FROM clips WHERE id = ?1", [clip_id], |r| {
                 r.get::<_, String>(0)
             })
         {
-            sync::on_local_clip_saved(&app, &sync_id);
+            sync_key = Some(sync_id);
         }
     }
     drop(conn);
+    if let Some(sync_key) = sync_key {
+        let app_clone = app.clone();
+        tauri::async_runtime::spawn(async move {
+            sync::on_local_clip_saved(&app_clone, &sync_key).await;
+        });
+    }
     let tx = state.clip_tx.clone();
     tauri::async_runtime::spawn(async move {
         if let Err(e) = tx.send(clip_id).await {

@@ -4,7 +4,7 @@
 )]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::{Emitter, Manager};
@@ -90,6 +90,7 @@ pub struct AppState {
     pub runtime_started: AtomicBool,
     pub search_status: Mutex<search::SearchStatusPayload>,
     pub model_setup_status: Mutex<model_setup::ModelSetupStatus>,
+    pub sync: std::sync::OnceLock<Arc<crate::sync::SyncState>>,
 }
 
 pub struct MenuBarState {
@@ -353,14 +354,11 @@ fn main() {
                         setup_required: true,
                     }
                 }),
+                sync: std::sync::OnceLock::new(),
             });
             app.manage(MenuBarState {
                 tray_icon: Mutex::new(None),
             });
-
-            if let Err(error) = sync::initialize_sync_if_enabled(&handle) {
-                eprintln!("[Sync] Initialization skipped: {}", error);
-            }
 
             let shortcut_plugin_result = handle.plugin(
                 tauri_plugin_global_shortcut::Builder::new()
@@ -591,13 +589,11 @@ fn main() {
             settings::set_config,
             settings::get_db_size,
             settings::clear_all_history,
-            sync::engine::sync_get_status,
-            sync::engine::sync_list_paired_devices,
-            sync::engine::sync_unpair_device,
-            sync::engine::sync_pair_device_manual,
-            sync::engine::sync_list_discovered_devices,
-            sync::engine::sync_start_pairing,
-            sync::engine::sync_pair_with_code,
+            sync::sync_get_identity,
+            sync::sync_list_peers,
+            sync::sync_generate_pin,
+            sync::sync_pair_with,
+            sync::sync_remove_peer,
             collections::create_collection,
             collections::delete_collection,
             collections::rename_collection,
@@ -789,6 +785,9 @@ pub(crate) fn start_runtime_services_once(app: &tauri::AppHandle) {
             let _ = tokio::task::spawn_blocking(move || cleanup_old_clips(&cleanup_handle)).await;
         }
     });
+
+    let sync_state = crate::sync::start_sync(app.clone());
+    let _ = app.state::<AppState>().sync.set(sync_state);
 }
 
 fn show_setup_window_inner(app: &tauri::AppHandle) {

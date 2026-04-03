@@ -109,6 +109,17 @@ pub fn init_db(app: &tauri::AppHandle) -> Result<DbConnections> {
             value TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS sync_peers (
+            device_id TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL DEFAULT '',
+            last_seen INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS sync_cursors (
+            device_id TEXT PRIMARY KEY,
+            last_received_ts INTEGER NOT NULL DEFAULT 0
+        );
+
         -- Sync: Device identity (this device)
         CREATE TABLE IF NOT EXISTS device_info (
             device_id TEXT PRIMARY KEY,
@@ -278,6 +289,7 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         ("sync_version", "INTEGER DEFAULT 0"),
         ("deleted", "INTEGER DEFAULT 0"),
         ("origin_device_id", "TEXT"),
+        ("source_device", "TEXT NOT NULL DEFAULT ''"),
     ];
 
     for (col, col_type) in &needed {
@@ -333,6 +345,7 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_collections_deleted ON collections(deleted) WHERE deleted = 1;
         CREATE INDEX IF NOT EXISTS idx_sync_queue_created ON sync_queue(created_at);
         CREATE INDEX IF NOT EXISTS idx_paired_devices_last_seen ON paired_devices(last_seen);
+        CREATE INDEX IF NOT EXISTS idx_clips_source_device ON clips(source_device, created_at DESC);
         ",
     )?;
 

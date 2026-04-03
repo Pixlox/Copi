@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi"
+     xmlns:fire="http://schemas.microsoft.com/wix/FirewallExtension">
+  <Fragment>
+    <ComponentGroup Id="CopiSyncFirewall">
+      <Component Id="CmpCopiSyncFirewall" Guid="*">
+        <fire:FirewallException
+          Id="CopiSyncTcp51827"
+          Name="Copi LAN Sync TCP"
+          Protocol="tcp"
+          Port="51827"
+          Scope="localSubnet"
+          IgnoreFailure="yes" />
+        <fire:FirewallException
+          Id="CopiSyncUdp5353"
+          Name="Copi mDNS UDP"
+          Protocol="udp"
+          Port="5353"
+          Scope="localSubnet"
+          IgnoreFailure="yes" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+</Wix>

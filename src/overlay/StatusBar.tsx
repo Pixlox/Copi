@@ -81,10 +81,13 @@ function StatusBar({
     let alive = true;
     const refresh = async () => {
       try {
-        const s = await invoke<{ enabled: boolean; connectedCount: number }>("sync_get_status");
+        const [identity, peers] = await Promise.all([
+          invoke<{ device_id: string; device_name: string }>("sync_get_identity"),
+          invoke<Array<{ device_id: string; display_name: string; online: boolean }>>("sync_list_peers"),
+        ]);
         if (!alive) return;
-        setSyncEnabled(Boolean(s.enabled));
-        setSyncConnected(Number(s.connectedCount ?? 0));
+        setSyncEnabled(Boolean(identity?.device_id));
+        setSyncConnected(peers.filter((peer) => peer.online).length);
       } catch {
         if (!alive) return;
         setSyncEnabled(false);
@@ -94,14 +97,22 @@ function StatusBar({
 
     void refresh();
     const timer = setInterval(() => void refresh(), 3000);
-    const unlisten = listen("sync:discovered-updated", () => {
+    const unlistenPaired = listen("sync:paired", () => {
+      void refresh();
+    });
+    const unlistenConnected = listen("sync:connected", () => {
+      void refresh();
+    });
+    const unlistenDisconnected = listen("sync:disconnected", () => {
       void refresh();
     });
 
     return () => {
       alive = false;
       clearInterval(timer);
-      unlisten.then((fn) => fn());
+      unlistenPaired.then((fn) => fn());
+      unlistenConnected.then((fn) => fn());
+      unlistenDisconnected.then((fn) => fn());
     };
   }, []);
 
