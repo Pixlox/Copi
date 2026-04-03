@@ -311,7 +311,11 @@ pub fn start_sync(app: AppHandle) -> Arc<SyncState> {
     let enabled = crate::settings::get_config_sync(app.clone())
         .map(|cfg| cfg.sync.enabled)
         .unwrap_or(false);
-    if enabled {
+    let debug_force_enable = std::env::var("COPI_SYNC_DEBUG_FORCE_ENABLE")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if enabled || debug_force_enable {
         enable_runtime(app.clone(), sync.clone(), trusted_peers);
     }
 
@@ -321,6 +325,7 @@ pub fn start_sync(app: AppHandle) -> Arc<SyncState> {
 fn enable_runtime(app: AppHandle, sync: Arc<SyncState>, trusted_peers: Vec<TrustedPeer>) {
     sync.enabled.store(true, Ordering::SeqCst);
     let generation = sync.generation.fetch_add(1, Ordering::SeqCst) + 1;
+    eprintln!("[Sync] Runtime enabled (generation={})", generation);
 
     {
         let app_clone = app.clone();
@@ -345,6 +350,7 @@ async fn disable_runtime(sync: Arc<SyncState>) {
     sync.live.write().await.clear();
     sync.known_addrs.write().await.clear();
     sync.discovered.write().await.clear();
+    eprintln!("[Sync] Runtime disabled");
 }
 
 async fn run_server(app: AppHandle, sync: Arc<SyncState>, generation: u64) {
@@ -461,8 +467,13 @@ async fn run_browser(
                 }
 
                 let trusted = is_trusted_peer(&app, &peer_id).unwrap_or(false);
+                eprintln!(
+                    "[Sync] mDNS resolved peer={} addr={} trusted={}",
+                    peer_id, peer_addr, trusted
+                );
                 if trusted {
                     if !auto_connect_enabled(&app) {
+                        eprintln!("[Sync] Auto-connect disabled; not dialing {}", peer_id);
                         continue;
                     }
                     let is_connected = sync.connected_peers().await.contains(&peer_id);
@@ -494,6 +505,7 @@ async fn run_browser(
             ServiceEvent::ServiceRemoved(_, fullname) => {
                 let peer_id = extract_peer_id(&fullname);
                 if !peer_id.is_empty() {
+                    eprintln!("[Sync] mDNS removed peer={}", peer_id);
                     sync.known_addrs.write().await.remove(&peer_id);
                     sync.discovered.write().await.remove(&peer_id);
                 }
@@ -525,6 +537,7 @@ async fn reconnect_loop(
 
         let target_addr = sync.known_addrs.read().await.get(&peer_id).copied();
         if let Some(target_addr) = target_addr {
+            eprintln!("[Sync] Reconnect attempt peer={} addr={}", peer_id, target_addr);
             connect_to_peer(app.clone(), sync.clone(), peer_id.clone(), target_addr).await;
             tokio::time::sleep(RECONNECT_BACKOFF).await;
         } else {
@@ -537,6 +550,7 @@ async fn connect_to_peer(app: AppHandle, sync: Arc<SyncState>, peer_id: String, 
     if !sync.is_enabled() {
         return;
     }
+    eprintln!("[Sync] Dialing peer={} addr={}", peer_id, addr);
     let stream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(error)) => {
@@ -609,6 +623,7 @@ async fn run_session(
             pin,
         } => {
             if sync.verify_pin(&pin) {
+                eprintln!("[Sync] Pair request accepted from {} ({})", device_name, device_id);
                 save_trusted_peer(&app, &device_id, &device_name)?;
                 sync.clear_pin();
                 writer
@@ -626,6 +641,7 @@ async fn run_session(
                 );
                 return Ok(());
             } else {
+                eprintln!("[Sync] Pair request rejected from {} ({})", device_name, device_id);
                 writer
                     .send(&Msg::PairReject {
                         reason: "Invalid or expired PIN".to_string(),
@@ -640,6 +656,7 @@ async fn run_session(
             protocol_version,
             cursors,
         } => {
+            eprintln!("[Sync] Incoming hello from {} ({})", device_name, device_id);
             if protocol_version != PROTOCOL_VERSION {
                 return Err(anyhow!("protocol mismatch {}", protocol_version));
             }
@@ -663,6 +680,7 @@ async fn run_session(
             protocol_version,
             cursors,
         } => {
+            eprintln!("[Sync] Received hello_ack from {} ({})", device_name, device_id);
             if !initiator {
                 return Err(anyhow!("received hello_ack as non-initiator"));
             }
@@ -691,6 +709,7 @@ async fn run_session(
     }
 
     sync.register_peer(peer_id.clone(), writer.clone()).await;
+    eprintln!("[Sync] Session connected peer={} name={}", peer_id, peer_name);
     let _ = app.emit(
         "sync:connected",
         PairedEvent {
@@ -736,6 +755,7 @@ async fn run_session(
     };
 
     sync.unregister_peer(&peer_id).await;
+    eprintln!("[Sync] Session disconnected peer={} name={}", peer_id, peer_name);
     let _ = app.emit(
         "sync:disconnected",
         PairedEvent {
@@ -888,6 +908,7 @@ async fn receive_clips(
     }
 
     if inserted_any {
+        eprintln!("[Sync] Applied incoming clips and emitted new-clip");
         let _ = app.emit("new-clip", ());
     }
 
@@ -1544,6 +1565,8 @@ pub async fn on_local_clip_saved(app: &AppHandle, content_hash: &str) {
 
     if let Err(error) = sync.push_clip(wire_clip).await {
         eprintln!("[Sync] Failed to push local clip: {}", error);
+    } else {
+        eprintln!("[Sync] Pushed local clip hash={}", content_hash);
     }
 
     if is_image {
