@@ -354,11 +354,23 @@ async fn disable_runtime(sync: Arc<SyncState>) {
 }
 
 async fn run_server(app: AppHandle, sync: Arc<SyncState>, generation: u64) {
-    let listener = match TcpListener::bind(("0.0.0.0", SYNC_PORT)).await {
-        Ok(listener) => listener,
-        Err(error) => {
-            eprintln!("[Sync] Failed to bind TCP server on {}: {}", SYNC_PORT, error);
+    let listener = loop {
+        if !sync.is_enabled() || sync.current_generation() != generation {
             return;
+        }
+        match TcpListener::bind(("0.0.0.0", SYNC_PORT)).await {
+            Ok(listener) => break listener,
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                eprintln!(
+                    "[Sync] Port {} busy, retrying bind for generation {}",
+                    SYNC_PORT, generation
+                );
+                tokio::time::sleep(Duration::from_millis(400)).await;
+            }
+            Err(error) => {
+                eprintln!("[Sync] Failed to bind TCP server on {}: {}", SYNC_PORT, error);
+                return;
+            }
         }
     };
 
@@ -1255,7 +1267,7 @@ fn ensure_windows_firewall_rules(listen_port: u16) {
         .collect();
     let b64 = B64.encode(&utf16_bytes);
 
-    let _ = Command::new("powershell")
+    if let Ok(output) = Command::new("powershell")
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -1264,7 +1276,15 @@ fn ensure_windows_firewall_rules(listen_port: u16) {
             "-EncodedCommand",
             &b64,
         ])
-        .output();
+        .output()
+    {
+        if !output.status.success() {
+            eprintln!(
+                "[Sync] Firewall rule command failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
