@@ -519,25 +519,24 @@ async fn run_browser(
                     continue;
                 }
 
-                let ip = info
+                let best_ip = info
                     .get_addresses()
                     .iter()
                     .copied()
-                    .find(|addr| matches!(addr, IpAddr::V4(_)))
-                    .or_else(|| info.get_addresses().iter().copied().next());
+                    .max_by_key(|ip| addr_quality(*ip));
 
-                let Some(ip) = ip else {
+                let Some(ip) = best_ip else {
                     continue;
                 };
 
-                let peer_addr = SocketAddr::new(ip, info.get_port());
-                {
-                    sync.known_addrs
-                        .write()
-                        .await
-                        .insert(peer_id.clone(), peer_addr);
-                }
-                let _ = update_peer_address(&app, &peer_id, peer_addr);
+                let candidate_addr = SocketAddr::new(ip, info.get_port());
+                let peer_addr = {
+                    let mut known = sync.known_addrs.write().await;
+                    let existing = known.get(&peer_id).copied();
+                    let chosen = prefer_addr(existing, candidate_addr);
+                    known.insert(peer_id.clone(), chosen);
+                    chosen
+                };
 
                 let trusted = is_trusted_peer(&app, &peer_id).unwrap_or(false);
                 eprintln!(
@@ -545,6 +544,7 @@ async fn run_browser(
                     peer_id, peer_addr, trusted
                 );
                 if trusted {
+                    let _ = update_peer_address(&app, &peer_id, peer_addr);
                     if !auto_connect_enabled(&app) {
                         eprintln!("[Sync] Auto-connect disabled; not dialing {}", peer_id);
                         continue;
@@ -820,7 +820,10 @@ async fn run_session(
             eprintln!("[Sync] Failed to save peer address: {}", e);
         } else {
             // Also update in-memory known_addrs
-            sync.known_addrs.write().await.insert(peer_id.clone(), addr);
+            let mut known = sync.known_addrs.write().await;
+            let existing = known.get(&peer_id).copied();
+            let chosen = prefer_addr(existing, addr);
+            known.insert(peer_id.clone(), chosen);
         }
     }
 
@@ -1394,6 +1397,40 @@ fn auto_connect_enabled(app: &AppHandle) -> bool {
         .unwrap_or(true)
 }
 
+fn addr_quality(ip: IpAddr) -> u8 {
+    match ip {
+        IpAddr::V4(v4) => {
+            if v4.is_loopback() || v4.is_unspecified() {
+                0
+            } else {
+                3
+            }
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_unspecified() {
+                0
+            } else if v6.is_unicast_link_local() {
+                1
+            } else {
+                2
+            }
+        }
+    }
+}
+
+fn prefer_addr(existing: Option<SocketAddr>, candidate: SocketAddr) -> SocketAddr {
+    match existing {
+        Some(current) => {
+            if addr_quality(candidate.ip()) > addr_quality(current.ip()) {
+                candidate
+            } else {
+                current
+            }
+        }
+        None => candidate,
+    }
+}
+
 fn extract_peer_id(fullname: &str) -> String {
     let trimmed = fullname.trim_end_matches('.');
     let svc = SERVICE_TYPE.trim_end_matches('.');
@@ -1693,11 +1730,14 @@ pub async fn sync_pair_with(
             device_name,
         } => {
             save_trusted_peer(&app, &device_id, &device_name).map_err(|e| e.to_string())?;
-            let _ = update_peer_address(&app, &device_id, SocketAddr::new(addr.ip(), SYNC_PORT));
-            sync.known_addrs
-                .write()
-                .await
-                .insert(device_id.clone(), SocketAddr::new(addr.ip(), SYNC_PORT));
+            let peer_addr = SocketAddr::new(addr.ip(), SYNC_PORT);
+            let _ = update_peer_address(&app, &device_id, peer_addr);
+            {
+                let mut known = sync.known_addrs.write().await;
+                let existing = known.get(&device_id).copied();
+                let chosen = prefer_addr(existing, peer_addr);
+                known.insert(device_id.clone(), chosen);
+            }
             let _ = app.emit(
                 "sync:paired",
                 PairedEvent {
