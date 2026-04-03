@@ -335,6 +335,16 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    // Add last_addr column to sync_peers for cross-platform reconnection
+    let sync_peers_columns: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('sync_peers')")?
+        .query_map([], |row| row.get(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    if !sync_peers_columns.iter().any(|c| c == "last_addr") {
+        conn.execute("ALTER TABLE sync_peers ADD COLUMN last_addr TEXT", [])?;
+    }
+
     conn.execute_batch(
         "
         CREATE UNIQUE INDEX IF NOT EXISTS idx_clips_sync_id ON clips(sync_id) WHERE sync_id IS NOT NULL;

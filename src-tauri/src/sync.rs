@@ -304,10 +304,17 @@ pub fn start_sync(app: AppHandle) -> Arc<SyncState> {
         }
     }
 
-    let trusted_peers = get_trusted_peers(&app).unwrap_or_default();
-    eprintln!("[Sync] Loaded {} trusted peers", trusted_peers.len());
-    for peer in &trusted_peers {
-        eprintln!("[Sync]   - peer: {} ({})", peer.display_name, peer.device_id);
+    // Load trusted peers with their stored addresses
+    let peers_with_addrs = get_trusted_peers_with_addrs(&app).unwrap_or_default();
+    eprintln!("[Sync] Loaded {} trusted peers", peers_with_addrs.len());
+    let mut initial_addrs = HashMap::new();
+    let mut trusted_peers = Vec::new();
+    for (device_id, display_name, last_addr) in peers_with_addrs {
+        eprintln!("[Sync]   - peer: {} ({}) addr={:?}", display_name, device_id, last_addr);
+        if let Some(addr) = last_addr {
+            initial_addrs.insert(device_id.clone(), addr);
+        }
+        trusted_peers.push(TrustedPeer { device_id, display_name });
     }
 
     let sync = Arc::new(SyncState {
@@ -316,7 +323,7 @@ pub fn start_sync(app: AppHandle) -> Arc<SyncState> {
         enabled: AtomicBool::new(false),
         generation: AtomicU64::new(0),
         live: RwLock::new(HashMap::new()),
-        known_addrs: RwLock::new(HashMap::new()),
+        known_addrs: RwLock::new(initial_addrs),
         discovered: RwLock::new(HashMap::new()),
         pairing_pin: Mutex::new(None),
         _mdns: mdns,
@@ -643,6 +650,8 @@ async fn run_session(
     if !sync.is_enabled() {
         return Err(anyhow!("sync disabled"));
     }
+    // Get peer address before splitting the stream
+    let peer_addr = stream.peer_addr().ok();
     stream.set_nodelay(true).ok();
     let (read_half, write_half) = stream.into_split();
     let writer = PeerWriter(Arc::new(AsyncMutex::new(write_half)));
@@ -761,6 +770,17 @@ async fn run_session(
 
     sync.register_peer(peer_id.clone(), writer.clone()).await;
     eprintln!("[Sync] Session connected peer={} name={} (now registered)", peer_id, peer_name);
+
+    // Save the peer address for cross-platform reconnection (mDNS workaround)
+    if let Some(addr) = peer_addr {
+        if let Err(e) = update_peer_address(&app, &peer_id, addr) {
+            eprintln!("[Sync] Failed to save peer address: {}", e);
+        } else {
+            // Also update in-memory known_addrs
+            sync.known_addrs.write().await.insert(peer_id.clone(), addr);
+        }
+    }
+
     let _ = app.emit(
         "sync:connected",
         PairedEvent {
@@ -1123,6 +1143,47 @@ pub fn remove_trusted_peer(app: &AppHandle, device_id: &str) -> Result<()> {
     conn.execute("DELETE FROM sync_peers WHERE device_id = ?1", [device_id])?;
     conn.execute("DELETE FROM sync_cursors WHERE device_id = ?1", [device_id])?;
     Ok(())
+}
+
+/// Update the last known address for a peer (for reconnection when mDNS fails)
+pub fn update_peer_address(app: &AppHandle, device_id: &str, addr: SocketAddr) -> Result<()> {
+    let state = app.state::<AppState>();
+    let conn = state
+        .db_write
+        .lock()
+        .map_err(|e| anyhow!("lock poisoned: {}", e))?;
+    let addr_str = addr.to_string();
+    conn.execute(
+        "UPDATE sync_peers SET last_addr = ?1, last_seen = ?2 WHERE device_id = ?3",
+        rusqlite::params![addr_str, now_ts(), device_id],
+    )?;
+    eprintln!("[Sync] Updated peer address: device_id={} addr={}", device_id, addr_str);
+    Ok(())
+}
+
+/// Get trusted peers with their stored addresses (for cross-platform reconnection)
+pub fn get_trusted_peers_with_addrs(app: &AppHandle) -> Result<Vec<(String, String, Option<SocketAddr>)>> {
+    let state = app.state::<AppState>();
+    let conn = state.db_read_pool.get().context("db read pool")?;
+
+    let mut stmt = conn.prepare(
+        "SELECT device_id, display_name, last_addr FROM sync_peers",
+    )?;
+
+    let rows = stmt.query_map([], |row| {
+        let device_id: String = row.get(0)?;
+        let display_name: String = row.get(1)?;
+        let last_addr: Option<String> = row.get(2)?;
+        Ok((device_id, display_name, last_addr))
+    })?;
+
+    let mut peers = Vec::new();
+    for row in rows {
+        let (device_id, display_name, last_addr) = row?;
+        let addr = last_addr.and_then(|s| s.parse::<SocketAddr>().ok());
+        peers.push((device_id, display_name, addr));
+    }
+    Ok(peers)
 }
 
 pub fn update_sync_cursor(app: &AppHandle, device_id: &str, last_received_ts: i64) -> Result<()> {
@@ -1684,6 +1745,11 @@ pub async fn sync_add_peer_manual(
     // Also store the address so we can connect
     if let Some(sync) = app.state::<AppState>().sync.get() {
         if let Ok(socket_addr) = parse_target_addr(&addr) {
+            // Save to database for persistence
+            if let Err(e) = update_peer_address(&app, &device_id, socket_addr) {
+                eprintln!("[Sync] Failed to persist peer address: {}", e);
+            }
+            
             sync.known_addrs.write().await.insert(device_id.clone(), socket_addr);
             eprintln!("[Sync] Stored address for peer: {}", socket_addr);
             
