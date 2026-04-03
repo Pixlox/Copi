@@ -14,15 +14,15 @@ use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use snow::{Builder, TransportState};
 use std::collections::HashMap;
-use std::net::{Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tauri::{Emitter, Manager};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio::time::timeout;
-use tauri::{Emitter, Manager};
 
 use super::discovery::{DiscoveryEvent, DiscoveryService};
 use super::protocol::{Msg, WireClip, WireCollection, PROTOCOL_VERSION};
@@ -99,16 +99,31 @@ pub enum SyncEvent {
         device_name: String,
         platform: String,
     },
-    DeviceLost { device_id: String },
+    DeviceLost {
+        device_id: String,
+    },
     PairingComplete {
         device_id: String,
         device_name: String,
     },
-    PairingFailed { device_id: String, reason: String },
-    Connected { device_id: String },
-    Disconnected { device_id: String },
-    SyncComplete { device_id: String, items_synced: u32 },
-    SyncError { device_id: Option<String>, error: String },
+    PairingFailed {
+        device_id: String,
+        reason: String,
+    },
+    Connected {
+        device_id: String,
+    },
+    Disconnected {
+        device_id: String,
+    },
+    SyncComplete {
+        device_id: String,
+        items_synced: u32,
+    },
+    SyncError {
+        device_id: Option<String>,
+        error: String,
+    },
 }
 
 // ─── Noise Transport ──────────────────────────────────────────────────────
@@ -121,10 +136,7 @@ struct NoiseTransport {
 }
 
 impl NoiseTransport {
-    async fn connect(
-        addr: SocketAddr,
-        our_private_key: &[u8; 32],
-    ) -> Result<Self, String> {
+    async fn connect(addr: SocketAddr, our_private_key: &[u8; 32]) -> Result<Self, String> {
         let stream = TcpStream::connect(addr)
             .await
             .map_err(|e| format!("TCP connect failed: {}", e))?;
@@ -149,15 +161,21 @@ impl NoiseTransport {
         let mut read_buf = vec![0u8; MAX_BUFFER_SIZE];
 
         // -> e
-        let len = noise.write_message(&[], &mut buf).map_err(|e| e.to_string())?;
+        let len = noise
+            .write_message(&[], &mut buf)
+            .map_err(|e| e.to_string())?;
         Self::send_raw(&mut stream, &buf[..len]).await?;
 
         // <- e, ee, s, es
         let msg = Self::recv_raw(&mut stream, &mut read_buf).await?;
-        noise.read_message(msg, &mut buf).map_err(|e| e.to_string())?;
+        noise
+            .read_message(msg, &mut buf)
+            .map_err(|e| e.to_string())?;
 
         // -> s, se
-        let len = noise.write_message(&[], &mut buf).map_err(|e| e.to_string())?;
+        let len = noise
+            .write_message(&[], &mut buf)
+            .map_err(|e| e.to_string())?;
         Self::send_raw(&mut stream, &buf[..len]).await?;
 
         let remote_public_key = noise
@@ -191,15 +209,21 @@ impl NoiseTransport {
 
         // <- e
         let msg = Self::recv_raw(&mut stream, &mut read_buf).await?;
-        noise.read_message(msg, &mut buf).map_err(|e| e.to_string())?;
+        noise
+            .read_message(msg, &mut buf)
+            .map_err(|e| e.to_string())?;
 
         // -> e, ee, s, es
-        let len = noise.write_message(&[], &mut buf).map_err(|e| e.to_string())?;
+        let len = noise
+            .write_message(&[], &mut buf)
+            .map_err(|e| e.to_string())?;
         Self::send_raw(&mut stream, &buf[..len]).await?;
 
         // <- s, se
         let msg = Self::recv_raw(&mut stream, &mut read_buf).await?;
-        noise.read_message(msg, &mut buf).map_err(|e| e.to_string())?;
+        noise
+            .read_message(msg, &mut buf)
+            .map_err(|e| e.to_string())?;
 
         let remote_public_key = noise
             .get_remote_static()
@@ -244,7 +268,9 @@ impl NoiseTransport {
 
         let mut noise = self.noise.lock().await;
         let mut buf = vec![0u8; MAX_BUFFER_SIZE];
-        let len = noise.write_message(data, &mut buf).map_err(|e| e.to_string())?;
+        let len = noise
+            .write_message(data, &mut buf)
+            .map_err(|e| e.to_string())?;
 
         let mut writer = self.writer.lock().await;
         Self::send_raw_writer(&mut *writer, &buf[..len]).await
@@ -283,13 +309,18 @@ impl NoiseTransport {
         let mut reader = self.reader.lock().await;
         let msg = Self::recv_raw_reader(&mut *reader, &mut read_buf).await?;
 
-        let len = noise.read_message(msg, &mut out_buf).map_err(|e| e.to_string())?;
+        let len = noise
+            .read_message(msg, &mut out_buf)
+            .map_err(|e| e.to_string())?;
         Ok(out_buf[..len].to_vec())
     }
 
     async fn send_raw(stream: &mut TcpStream, data: &[u8]) -> Result<(), String> {
         let len = data.len() as u16;
-        stream.write_all(&len.to_be_bytes()).await.map_err(|e| e.to_string())?;
+        stream
+            .write_all(&len.to_be_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
         stream.write_all(data).await.map_err(|e| e.to_string())?;
         stream.flush().await.map_err(|e| e.to_string())?;
         Ok(())
@@ -297,7 +328,10 @@ impl NoiseTransport {
 
     async fn send_raw_writer(writer: &mut WriteHalf<TcpStream>, data: &[u8]) -> Result<(), String> {
         let len = data.len() as u16;
-        writer.write_all(&len.to_be_bytes()).await.map_err(|e| e.to_string())?;
+        writer
+            .write_all(&len.to_be_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
         writer.write_all(data).await.map_err(|e| e.to_string())?;
         writer.flush().await.map_err(|e| e.to_string())?;
         Ok(())
@@ -305,12 +339,18 @@ impl NoiseTransport {
 
     async fn recv_raw<'a>(stream: &mut TcpStream, buf: &'a mut [u8]) -> Result<&'a [u8], String> {
         let mut len_buf = [0u8; LENGTH_PREFIX_SIZE];
-        stream.read_exact(&mut len_buf).await.map_err(|e| e.to_string())?;
+        stream
+            .read_exact(&mut len_buf)
+            .await
+            .map_err(|e| e.to_string())?;
         let len = u16::from_be_bytes(len_buf) as usize;
         if len > buf.len() {
             return Err("Message too large".into());
         }
-        stream.read_exact(&mut buf[..len]).await.map_err(|e| e.to_string())?;
+        stream
+            .read_exact(&mut buf[..len])
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(&buf[..len])
     }
 
@@ -319,12 +359,18 @@ impl NoiseTransport {
         buf: &'a mut [u8],
     ) -> Result<&'a [u8], String> {
         let mut len_buf = [0u8; LENGTH_PREFIX_SIZE];
-        reader.read_exact(&mut len_buf).await.map_err(|e| e.to_string())?;
+        reader
+            .read_exact(&mut len_buf)
+            .await
+            .map_err(|e| e.to_string())?;
         let len = u16::from_be_bytes(len_buf) as usize;
         if len > buf.len() {
             return Err("Message too large".into());
         }
-        reader.read_exact(&mut buf[..len]).await.map_err(|e| e.to_string())?;
+        reader
+            .read_exact(&mut buf[..len])
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(&buf[..len])
     }
 
@@ -398,7 +444,10 @@ fn with_read_conn<T>(
     f(&conn)
 }
 
-fn load_device_identity(app: &tauri::AppHandle, device_name: Option<String>) -> Result<(String, String, String, [u8; 32], Vec<u8>), String> {
+fn load_device_identity(
+    app: &tauri::AppHandle,
+    device_name: Option<String>,
+) -> Result<(String, String, String, [u8; 32], Vec<u8>), String> {
     with_write_conn(app, |conn| {
         // Try to load existing
         let existing: Option<(String, String, String, Vec<u8>, Vec<u8>)> = conn
@@ -411,7 +460,9 @@ fn load_device_identity(app: &tauri::AppHandle, device_name: Option<String>) -> 
             .map_err(|e| e.to_string())?;
 
         if let Some((device_id, name, platform_str, priv_key, pub_key)) = existing {
-            let priv_arr: [u8; 32] = priv_key.try_into().map_err(|_| "Invalid key length".to_string())?;
+            let priv_arr: [u8; 32] = priv_key
+                .try_into()
+                .map_err(|_| "Invalid key length".to_string())?;
             return Ok((device_id, name, platform_str, priv_arr, pub_key));
         }
 
@@ -420,7 +471,10 @@ fn load_device_identity(app: &tauri::AppHandle, device_name: Option<String>) -> 
         let name = device_name.unwrap_or_else(|| {
             hostname::get()
                 .ok()
-                .and_then(|h| h.to_str().map(|s| s.strip_suffix(".local").unwrap_or(s).to_string()))
+                .and_then(|h| {
+                    h.to_str()
+                        .map(|s| s.strip_suffix(".local").unwrap_or(s).to_string())
+                })
                 .unwrap_or_else(|| "Unknown".to_string())
         });
 
@@ -444,8 +498,16 @@ fn load_device_identity(app: &tauri::AppHandle, device_name: Option<String>) -> 
             rusqlite::params![device_id, name, platform_str, priv_bytes, pub_bytes, created_at],
         ).map_err(|e| e.to_string())?;
 
-        let priv_arr: [u8; 32] = priv_bytes.try_into().map_err(|_| "Invalid key length".to_string())?;
-        Ok((device_id, name, platform_str.to_string(), priv_arr, pub_bytes))
+        let priv_arr: [u8; 32] = priv_bytes
+            .try_into()
+            .map_err(|_| "Invalid key length".to_string())?;
+        Ok((
+            device_id,
+            name,
+            platform_str.to_string(),
+            priv_arr,
+            pub_bytes,
+        ))
     })
 }
 
@@ -477,12 +539,13 @@ fn load_paired_devices(app: &tauri::AppHandle) -> Result<Vec<PairedDeviceInfo>, 
 
 fn is_paired(app: &tauri::AppHandle, device_id: &str) -> bool {
     with_read_conn(app, |conn| {
-        Ok(conn.query_row(
-            "SELECT 1 FROM paired_devices WHERE device_id = ?1",
-            [device_id],
-            |_| Ok(()),
-        )
-        .is_ok())
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM paired_devices WHERE device_id = ?1",
+                [device_id],
+                |_| Ok(()),
+            )
+            .is_ok())
     })
     .unwrap_or(false)
 }
@@ -505,16 +568,148 @@ fn save_paired_device(
 
 fn remove_paired_device(app: &tauri::AppHandle, device_id: &str) -> Result<(), String> {
     with_write_conn(app, |conn| {
-        conn.execute("DELETE FROM paired_devices WHERE device_id = ?1", [device_id])
-            .map_err(|e| e.to_string())?;
+        conn.execute(
+            "DELETE FROM paired_devices WHERE device_id = ?1",
+            [device_id],
+        )
+        .map_err(|e| e.to_string())?;
         Ok(())
     })
+}
+
+fn paired_device_id_by_public_key(
+    app: &tauri::AppHandle,
+    public_key: &[u8],
+) -> Result<Option<String>, String> {
+    with_read_conn(app, |conn| {
+        conn.query_row(
+            "SELECT device_id FROM paired_devices WHERE public_key = ?1",
+            [public_key],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())
+    })
+}
+
+fn paired_public_key_by_device_id(
+    app: &tauri::AppHandle,
+    device_id: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    with_read_conn(app, |conn| {
+        conn.query_row(
+            "SELECT public_key FROM paired_devices WHERE device_id = ?1",
+            [device_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())
+    })
+}
+
+fn discover_ipv6_scope_indices() -> Vec<u32> {
+    let mut scopes = Vec::new();
+    if let Ok(interfaces) = if_addrs::get_if_addrs() {
+        for interface in interfaces {
+            if interface.is_loopback() {
+                continue;
+            }
+            if !matches!(interface.ip(), IpAddr::V6(_)) {
+                continue;
+            }
+            let Some(index) = interface.index else {
+                continue;
+            };
+            if !scopes.contains(&index) {
+                scopes.push(index);
+            }
+        }
+    }
+    scopes
+}
+
+fn build_connect_addrs_with_scopes(
+    addresses: &[IpAddr],
+    port: u16,
+    scope_indices: &[u32],
+) -> Vec<SocketAddr> {
+    let mut ipv4 = Vec::new();
+    let mut ipv6_global = Vec::new();
+    let mut ipv6_link_local = Vec::new();
+
+    for ip in addresses {
+        match ip {
+            IpAddr::V4(v4) => {
+                if v4.is_loopback() || v4.is_unspecified() {
+                    continue;
+                }
+                ipv4.push(SocketAddr::new(IpAddr::V4(*v4), port));
+            }
+            IpAddr::V6(v6) => {
+                if v6.is_loopback() || v6.is_unspecified() {
+                    continue;
+                }
+                if v6.is_unicast_link_local() {
+                    if scope_indices.is_empty() {
+                        ipv6_link_local.push(SocketAddr::V6(SocketAddrV6::new(*v6, port, 0, 0)));
+                    } else {
+                        for scope in scope_indices {
+                            ipv6_link_local
+                                .push(SocketAddr::V6(SocketAddrV6::new(*v6, port, 0, *scope)));
+                        }
+                    }
+                } else {
+                    ipv6_global.push(SocketAddr::V6(SocketAddrV6::new(*v6, port, 0, 0)));
+                }
+            }
+        }
+    }
+
+    let mut ordered = Vec::new();
+    for addr in ipv4
+        .into_iter()
+        .chain(ipv6_global.into_iter())
+        .chain(ipv6_link_local.into_iter())
+    {
+        if !ordered.contains(&addr) {
+            ordered.push(addr);
+        }
+    }
+    ordered
+}
+
+fn build_connect_addrs(addresses: &[IpAddr], port: u16) -> Vec<SocketAddr> {
+    let scope_indices = discover_ipv6_scope_indices();
+    build_connect_addrs_with_scopes(addresses, port, &scope_indices)
+}
+
+fn validate_announced_public_key(
+    public_key_b64: &str,
+    remote_public_key: &[u8],
+) -> Result<Vec<u8>, String> {
+    let announced = B64
+        .decode(public_key_b64.trim())
+        .map_err(|e| format!("Invalid public key encoding: {}", e))?;
+    if announced.len() != 32 {
+        return Err(format!(
+            "Invalid public key length {} (expected 32)",
+            announced.len()
+        ));
+    }
+    if announced != remote_public_key {
+        return Err("Public key does not match secure transport identity".into());
+    }
+    Ok(announced)
 }
 
 fn get_sync_version(app: &tauri::AppHandle) -> Result<i64, String> {
     with_read_conn(app, |conn| {
         let v: Option<String> = conn
-            .query_row("SELECT value FROM settings WHERE key = 'sync_version'", [], |r| r.get(0))
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'sync_version'",
+                [],
+                |r| r.get(0),
+            )
             .optional()
             .map_err(|e| e.to_string())?;
         Ok(v.and_then(|v| v.parse().ok()).unwrap_or(0))
@@ -528,7 +723,8 @@ fn next_sync_version(app: &tauri::AppHandle) -> Result<i64, String> {
         conn.execute(
             "INSERT OR REPLACE INTO settings (key, value) VALUES ('sync_version', ?1)",
             [next.to_string()],
-        ).map_err(|e| e.to_string())?;
+        )
+        .map_err(|e| e.to_string())?;
         Ok(())
     })?;
     Ok(next)
@@ -543,7 +739,27 @@ pub fn next_sync_version_public(app: &tauri::AppHandle) -> i64 {
 
 fn clip_to_wire(app: &tauri::AppHandle, sync_id: &str) -> Result<Option<WireClip>, String> {
     with_read_conn(app, |conn| {
-        let row: Option<(String, i64, String, String, String, String, Option<Vec<u8>>, Option<String>, Option<String>, Option<Vec<u8>>, Option<Vec<u8>>, i32, i32, Option<String>, i64, i32, Option<i64>, String, i32)> = conn
+        let row: Option<(
+            String,
+            i64,
+            String,
+            String,
+            String,
+            String,
+            Option<Vec<u8>>,
+            Option<String>,
+            Option<String>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            i32,
+            i32,
+            Option<String>,
+            i64,
+            i32,
+            Option<i64>,
+            String,
+            i32,
+        )> = conn
             .query_row(
                 "SELECT sync_id, sync_version, content_hash, content, content_type, source_app,
                         source_app_icon, content_highlighted, ocr_text, image_data, image_thumbnail,
@@ -551,20 +767,55 @@ fn clip_to_wire(app: &tauri::AppHandle, sync_id: &str) -> Result<Option<WireClip
                         COALESCE(origin_device_id, ''), copy_count
                  FROM clips WHERE sync_id = ?1 AND deleted = 0",
                 [sync_id],
-                |r| Ok((
-                    r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?,
-                    r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?,
-                    r.get(11)?, r.get(12)?, r.get(13)?, r.get(14)?, r.get(15)?,
-                    r.get(16)?, r.get(17)?, r.get(18)?,
-                )),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                        r.get(9)?,
+                        r.get(10)?,
+                        r.get(11)?,
+                        r.get(12)?,
+                        r.get(13)?,
+                        r.get(14)?,
+                        r.get(15)?,
+                        r.get(16)?,
+                        r.get(17)?,
+                        r.get(18)?,
+                    ))
+                },
             )
             .optional()
             .map_err(|e| e.to_string())?;
 
-        let Some((sync_id, sync_version, content_hash, content, content_type, source_app,
-                   source_app_icon, content_highlighted, ocr_text, image_data, image_thumbnail,
-                   image_width, image_height, language, created_at, pinned, collection_id,
-                   origin_device_id, copy_count)) = row else {
+        let Some((
+            sync_id,
+            sync_version,
+            content_hash,
+            content,
+            content_type,
+            source_app,
+            source_app_icon,
+            content_highlighted,
+            ocr_text,
+            image_data,
+            image_thumbnail,
+            image_width,
+            image_height,
+            language,
+            created_at,
+            pinned,
+            collection_id,
+            origin_device_id,
+            copy_count,
+        )) = row
+        else {
             return Ok(None);
         };
 
@@ -573,7 +824,8 @@ fn clip_to_wire(app: &tauri::AppHandle, sync_id: &str) -> Result<Option<WireClip
                 "SELECT sync_id FROM collections WHERE id = ?1",
                 [cid],
                 |r| r.get(0),
-            ).ok()
+            )
+            .ok()
         } else {
             None
         };
@@ -604,24 +856,66 @@ fn clip_to_wire(app: &tauri::AppHandle, sync_id: &str) -> Result<Option<WireClip
     })
 }
 
-fn clips_since_version(app: &tauri::AppHandle, since: i64, limit: usize, include_embeddings: bool) -> Result<Vec<WireClip>, String> {
+fn clips_since_version(
+    app: &tauri::AppHandle,
+    since: i64,
+    limit: usize,
+    include_embeddings: bool,
+) -> Result<Vec<WireClip>, String> {
     with_read_conn(app, |conn| {
-        let mut stmt = conn.prepare(
-            "SELECT sync_id, sync_version, content_hash, content, content_type, source_app,
+        let mut stmt = conn
+            .prepare(
+                "SELECT sync_id, sync_version, content_hash, content, content_type, source_app,
                     source_app_icon, content_highlighted, ocr_text, image_data, image_thumbnail,
                     image_width, image_height, language, created_at, pinned, collection_id,
                     COALESCE(origin_device_id, ''), copy_count
              FROM clips WHERE sync_version > ?1 AND deleted = 0 AND sync_id IS NOT NULL
-             ORDER BY sync_version ASC LIMIT ?2"
-        ).map_err(|e| e.to_string())?;
+             ORDER BY sync_version ASC LIMIT ?2",
+            )
+            .map_err(|e| e.to_string())?;
 
-        let rows: Vec<(String, i64, String, String, String, String, Option<Vec<u8>>, Option<String>, Option<String>, Option<Vec<u8>>, Option<Vec<u8>>, i32, i32, Option<String>, i64, i32, Option<i64>, String, i32)> = stmt
+        let rows: Vec<(
+            String,
+            i64,
+            String,
+            String,
+            String,
+            String,
+            Option<Vec<u8>>,
+            Option<String>,
+            Option<String>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            i32,
+            i32,
+            Option<String>,
+            i64,
+            i32,
+            Option<i64>,
+            String,
+            i32,
+        )> = stmt
             .query_map(rusqlite::params![since, limit], |r| {
                 Ok((
-                    r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?,
-                    r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?,
-                    r.get(11)?, r.get(12)?, r.get(13)?, r.get(14)?, r.get(15)?,
-                    r.get(16)?, r.get(17)?, r.get(18)?,
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                    r.get(9)?,
+                    r.get(10)?,
+                    r.get(11)?,
+                    r.get(12)?,
+                    r.get(13)?,
+                    r.get(14)?,
+                    r.get(15)?,
+                    r.get(16)?,
+                    r.get(17)?,
+                    r.get(18)?,
                 ))
             })
             .map_err(|e| e.to_string())?
@@ -629,17 +923,35 @@ fn clips_since_version(app: &tauri::AppHandle, since: i64, limit: usize, include
             .collect();
 
         let mut clips = Vec::new();
-        for (sync_id, sync_version, content_hash, content, content_type, source_app,
-             source_app_icon, content_highlighted, ocr_text, image_data, image_thumbnail,
-             image_width, image_height, language, created_at, pinned, collection_id,
-             origin_device_id, copy_count) in rows {
-
+        for (
+            sync_id,
+            sync_version,
+            content_hash,
+            content,
+            content_type,
+            source_app,
+            source_app_icon,
+            content_highlighted,
+            ocr_text,
+            image_data,
+            image_thumbnail,
+            image_width,
+            image_height,
+            language,
+            created_at,
+            pinned,
+            collection_id,
+            origin_device_id,
+            copy_count,
+        ) in rows
+        {
             let collection_sync_id: Option<String> = if let Some(cid) = collection_id {
                 conn.query_row(
                     "SELECT sync_id FROM collections WHERE id = ?1",
                     [cid],
                     |r| r.get(0),
-                ).ok()
+                )
+                .ok()
             } else {
                 None
             };
@@ -670,23 +982,32 @@ fn clips_since_version(app: &tauri::AppHandle, since: i64, limit: usize, include
 
             if include_embeddings {
                 // Get embedding from clip_embeddings
-                let clip_id: Option<i64> = conn.query_row(
-                    "SELECT id FROM clips WHERE sync_id = ?1",
-                    [&wire_clip.sync_id],
-                    |r| r.get(0),
-                ).optional().map_err(|e| e.to_string())?;
+                let clip_id: Option<i64> = conn
+                    .query_row(
+                        "SELECT id FROM clips WHERE sync_id = ?1",
+                        [&wire_clip.sync_id],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(|e| e.to_string())?;
 
                 if let Some(id) = clip_id {
-                    let emb_blob: Option<Vec<u8>> = conn.query_row(
-                        "SELECT embedding FROM clip_embeddings WHERE rowid = ?1",
-                        [id],
-                        |r| r.get(0),
-                    ).optional().map_err(|e| e.to_string())?;
+                    let emb_blob: Option<Vec<u8>> = conn
+                        .query_row(
+                            "SELECT embedding FROM clip_embeddings WHERE rowid = ?1",
+                            [id],
+                            |r| r.get(0),
+                        )
+                        .optional()
+                        .map_err(|e| e.to_string())?;
 
                     if let Some(blob) = emb_blob {
                         if blob.len() % 4 == 0 {
                             wire_clip.set_embedding(Some(
-                                &blob.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect::<Vec<f32>>()
+                                &blob
+                                    .chunks_exact(4)
+                                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                                    .collect::<Vec<f32>>(),
                             ));
                         }
                     }
@@ -700,7 +1021,11 @@ fn clips_since_version(app: &tauri::AppHandle, since: i64, limit: usize, include
     })
 }
 
-fn collections_since_version(app: &tauri::AppHandle, since: i64, limit: usize) -> Result<Vec<WireCollection>, String> {
+fn collections_since_version(
+    app: &tauri::AppHandle,
+    since: i64,
+    limit: usize,
+) -> Result<Vec<WireCollection>, String> {
     with_read_conn(app, |conn| {
         let mut stmt = conn.prepare(
             "SELECT sync_id, sync_version, name, color, created_at, COALESCE(origin_device_id, '')
@@ -710,34 +1035,53 @@ fn collections_since_version(app: &tauri::AppHandle, since: i64, limit: usize) -
 
         let rows: Vec<(String, i64, String, Option<String>, i64, String)> = stmt
             .query_map(rusqlite::params![since, limit], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
             })
             .map_err(|e| e.to_string())?
             .filter_map(|r| r.ok())
             .collect();
 
-        Ok(rows.into_iter().map(|(sync_id, sync_version, name, color, created_at, origin_device_id)| {
-            WireCollection {
-                sync_id,
-                sync_version,
-                name,
-                color,
-                created_at,
-                origin_device_id,
-                deleted: false,
-            }
-        }).collect())
+        Ok(rows
+            .into_iter()
+            .map(
+                |(sync_id, sync_version, name, color, created_at, origin_device_id)| {
+                    WireCollection {
+                        sync_id,
+                        sync_version,
+                        name,
+                        color,
+                        created_at,
+                        origin_device_id,
+                        deleted: false,
+                    }
+                },
+            )
+            .collect())
     })
 }
 
-fn apply_wire_clip(app: &tauri::AppHandle, clip: &WireClip, _from_device: &str) -> Result<bool, String> {
+fn apply_wire_clip(
+    app: &tauri::AppHandle,
+    clip: &WireClip,
+    _from_device: &str,
+) -> Result<bool, String> {
     with_write_conn(app, |conn| {
         // Check existing version
-        let existing_version: Option<i64> = conn.query_row(
-            "SELECT sync_version FROM clips WHERE sync_id = ?1",
-            [&clip.sync_id],
-            |r| r.get(0),
-        ).optional().map_err(|e| e.to_string())?;
+        let existing_version: Option<i64> = conn
+            .query_row(
+                "SELECT sync_version FROM clips WHERE sync_id = ?1",
+                [&clip.sync_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
 
         if let Some(ev) = existing_version {
             if ev >= clip.sync_version {
@@ -751,14 +1095,22 @@ fn apply_wire_clip(app: &tauri::AppHandle, clip: &WireClip, _from_device: &str) 
                 "SELECT id FROM collections WHERE sync_id = ?1",
                 [csid],
                 |r| r.get(0),
-            ).optional().map_err(|e| e.to_string())?
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
         } else {
             None
         };
 
-        let icon_bytes = clip.source_app_icon.as_ref().and_then(|s| B64.decode(s).ok());
+        let icon_bytes = clip
+            .source_app_icon
+            .as_ref()
+            .and_then(|s| B64.decode(s).ok());
         let img_bytes = clip.image_data.as_ref().and_then(|s| B64.decode(s).ok());
-        let thumb_bytes = clip.image_thumbnail.as_ref().and_then(|s| B64.decode(s).ok());
+        let thumb_bytes = clip
+            .image_thumbnail
+            .as_ref()
+            .and_then(|s| B64.decode(s).ok());
 
         let rows = conn.execute(
             "INSERT INTO clips (sync_id, sync_version, content_hash, content, content_type,
@@ -798,11 +1150,14 @@ fn apply_wire_clip(app: &tauri::AppHandle, clip: &WireClip, _from_device: &str) 
 
         // Apply embedding if present
         if let Some(embedding) = clip.get_embedding() {
-            let clip_id: Option<i64> = conn.query_row(
-                "SELECT id FROM clips WHERE sync_id = ?1",
-                [&clip.sync_id],
-                |r| r.get(0),
-            ).optional().map_err(|e| e.to_string())?;
+            let clip_id: Option<i64> = conn
+                .query_row(
+                    "SELECT id FROM clips WHERE sync_id = ?1",
+                    [&clip.sync_id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
 
             if let Some(id) = clip_id {
                 let _ = conn.execute("DELETE FROM clip_embeddings WHERE rowid = ?1", [id]);
@@ -819,11 +1174,14 @@ fn apply_wire_clip(app: &tauri::AppHandle, clip: &WireClip, _from_device: &str) 
 
         // Enqueue for embedding if no embedding was synced
         if clip.get_embedding().is_none() {
-            let clip_id: Option<i64> = conn.query_row(
-                "SELECT id FROM clips WHERE sync_id = ?1",
-                [&clip.sync_id],
-                |r| r.get(0),
-            ).optional().map_err(|e| e.to_string())?;
+            let clip_id: Option<i64> = conn
+                .query_row(
+                    "SELECT id FROM clips WHERE sync_id = ?1",
+                    [&clip.sync_id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
 
             if let Some(id) = clip_id {
                 let state = app.state::<crate::AppState>();
@@ -837,11 +1195,14 @@ fn apply_wire_clip(app: &tauri::AppHandle, clip: &WireClip, _from_device: &str) 
 
 fn apply_wire_collection(app: &tauri::AppHandle, coll: &WireCollection) -> Result<bool, String> {
     with_write_conn(app, |conn| {
-        let existing_version: Option<i64> = conn.query_row(
-            "SELECT sync_version FROM collections WHERE sync_id = ?1",
-            [&coll.sync_id],
-            |r| r.get(0),
-        ).optional().map_err(|e| e.to_string())?;
+        let existing_version: Option<i64> = conn
+            .query_row(
+                "SELECT sync_version FROM collections WHERE sync_id = ?1",
+                [&coll.sync_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
 
         if let Some(ev) = existing_version {
             if ev >= coll.sync_version {
@@ -868,12 +1229,18 @@ fn apply_wire_collection(app: &tauri::AppHandle, coll: &WireCollection) -> Resul
     })
 }
 
-fn apply_delete_clip(app: &tauri::AppHandle, sync_id: &str, _from_device: &str) -> Result<bool, String> {
+fn apply_delete_clip(
+    app: &tauri::AppHandle,
+    sync_id: &str,
+    _from_device: &str,
+) -> Result<bool, String> {
     with_write_conn(app, |conn| {
-        let rows = conn.execute(
-            "UPDATE clips SET deleted = 1 WHERE sync_id = ?1 AND deleted = 0",
-            [sync_id],
-        ).map_err(|e| e.to_string())?;
+        let rows = conn
+            .execute(
+                "UPDATE clips SET deleted = 1 WHERE sync_id = ?1 AND deleted = 0",
+                [sync_id],
+            )
+            .map_err(|e| e.to_string())?;
         let _ = conn.execute_batch("INSERT INTO clips_fts(clips_fts) VALUES('rebuild');");
         Ok(rows > 0)
     })
@@ -881,10 +1248,12 @@ fn apply_delete_clip(app: &tauri::AppHandle, sync_id: &str, _from_device: &str) 
 
 fn apply_delete_collection(app: &tauri::AppHandle, sync_id: &str) -> Result<bool, String> {
     with_write_conn(app, |conn| {
-        let rows = conn.execute(
-            "UPDATE collections SET deleted = 1 WHERE sync_id = ?1 AND deleted = 0",
-            [sync_id],
-        ).map_err(|e| e.to_string())?;
+        let rows = conn
+            .execute(
+                "UPDATE collections SET deleted = 1 WHERE sync_id = ?1 AND deleted = 0",
+                [sync_id],
+            )
+            .map_err(|e| e.to_string())?;
         // Unassign clips
         let _ = conn.execute(
             "UPDATE clips SET collection_id = NULL WHERE collection_id = (SELECT id FROM collections WHERE sync_id = ?1)",
@@ -894,27 +1263,41 @@ fn apply_delete_collection(app: &tauri::AppHandle, sync_id: &str) -> Result<bool
     })
 }
 
-fn apply_move_clip(app: &tauri::AppHandle, clip_sync_id: &str, collection_sync_id: Option<&str>) -> Result<bool, String> {
+fn apply_move_clip(
+    app: &tauri::AppHandle,
+    clip_sync_id: &str,
+    collection_sync_id: Option<&str>,
+) -> Result<bool, String> {
     with_write_conn(app, |conn| {
         let collection_id: Option<i64> = if let Some(csid) = collection_sync_id {
-            conn.query_row("SELECT id FROM collections WHERE sync_id = ?1", [csid], |r| r.get(0)).optional().map_err(|e| e.to_string())?
+            conn.query_row(
+                "SELECT id FROM collections WHERE sync_id = ?1",
+                [csid],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
         } else {
             None
         };
-        let rows = conn.execute(
-            "UPDATE clips SET collection_id = ?1 WHERE sync_id = ?2",
-            rusqlite::params![collection_id, clip_sync_id],
-        ).map_err(|e| e.to_string())?;
+        let rows = conn
+            .execute(
+                "UPDATE clips SET collection_id = ?1 WHERE sync_id = ?2",
+                rusqlite::params![collection_id, clip_sync_id],
+            )
+            .map_err(|e| e.to_string())?;
         Ok(rows > 0)
     })
 }
 
 fn apply_set_pinned(app: &tauri::AppHandle, sync_id: &str, pinned: bool) -> Result<bool, String> {
     with_write_conn(app, |conn| {
-        let rows = conn.execute(
-            "UPDATE clips SET pinned = ?1 WHERE sync_id = ?2",
-            rusqlite::params![pinned as i32, sync_id],
-        ).map_err(|e| e.to_string())?;
+        let rows = conn
+            .execute(
+                "UPDATE clips SET pinned = ?1 WHERE sync_id = ?2",
+                rusqlite::params![pinned as i32, sync_id],
+            )
+            .map_err(|e| e.to_string())?;
         Ok(rows > 0)
     })
 }
@@ -927,7 +1310,10 @@ async fn run_session(
     peer_id: String,
     is_initiator: bool,
 ) {
-    eprintln!("[Sync] Session started with {} (initiator={})", peer_id, is_initiator);
+    eprintln!(
+        "[Sync] Session started with {} (initiator={})",
+        peer_id, is_initiator
+    );
 
     // Get our sync version
     let our_version = get_sync_version(&runtime.app).unwrap_or(0);
@@ -949,7 +1335,9 @@ async fn run_session(
 
     // Read peer's Hello/HelloAck
     let peer_version = match timeout(Duration::from_secs(10), transport.recv_msg()).await {
-        Ok(Ok(Msg::Hello { last_sync_version, .. })) => {
+        Ok(Ok(Msg::Hello {
+            last_sync_version, ..
+        })) => {
             // We're responder, send HelloAck
             let ack = Msg::HelloAck {
                 device_id: runtime.device_id.clone(),
@@ -960,9 +1348,9 @@ async fn run_session(
             let _ = transport.send_msg(&ack).await;
             last_sync_version
         }
-        Ok(Ok(Msg::HelloAck { last_sync_version, .. })) => {
-            last_sync_version
-        }
+        Ok(Ok(Msg::HelloAck {
+            last_sync_version, ..
+        })) => last_sync_version,
         Ok(Ok(other)) => {
             eprintln!("[Sync] Unexpected message from {}: {:?}", peer_id, other);
             return;
@@ -978,11 +1366,20 @@ async fn run_session(
     };
 
     // Mark as connected
-    runtime.connected.write().await.insert(peer_id.clone(), true);
+    runtime
+        .connected
+        .write()
+        .await
+        .insert(peer_id.clone(), true);
     let _ = runtime.app.emit("sync:connected", &peer_id);
-    let _ = runtime.event_tx.send(SyncEvent::Connected { device_id: peer_id.clone() });
+    let _ = runtime.event_tx.send(SyncEvent::Connected {
+        device_id: peer_id.clone(),
+    });
 
-    eprintln!("[Sync] Connected to {} (peer_version={})", peer_id, peer_version);
+    eprintln!(
+        "[Sync] Connected to {} (peer_version={})",
+        peer_id, peer_version
+    );
 
     // Delta sync: send clips and collections newer than peer's version
     let sync_embeddings = crate::settings::get_config_sync(runtime.app.clone())
@@ -990,7 +1387,8 @@ async fn run_session(
         .map(|c| c.sync.sync_embeddings)
         .unwrap_or(true);
 
-    let clips = clips_since_version(&runtime.app, peer_version, 500, sync_embeddings).unwrap_or_default();
+    let clips =
+        clips_since_version(&runtime.app, peer_version, 500, sync_embeddings).unwrap_or_default();
     let colls = collections_since_version(&runtime.app, peer_version, 100).unwrap_or_default();
 
     let mut items_sent = 0u32;
@@ -1007,7 +1405,10 @@ async fn run_session(
     }
 
     for coll in colls {
-        if let Err(e) = transport.send_msg(&Msg::Collection { collection: coll }).await {
+        if let Err(e) = transport
+            .send_msg(&Msg::Collection { collection: coll })
+            .await
+        {
             eprintln!("[Sync] Failed to send collection to {}: {}", peer_id, e);
             break;
         }
@@ -1048,20 +1449,60 @@ async fn run_session(
     }
 
     // Disconnect
-    runtime.connected.write().await.insert(peer_id.clone(), false);
+    runtime
+        .connected
+        .write()
+        .await
+        .insert(peer_id.clone(), false);
     let _ = runtime.app.emit("sync:disconnected", &peer_id);
-    let _ = runtime.event_tx.send(SyncEvent::Disconnected { device_id: peer_id.clone() });
+    let _ = runtime.event_tx.send(SyncEvent::Disconnected {
+        device_id: peer_id.clone(),
+    });
 
     // Update last_seen
     let _ = with_write_conn(&runtime.app, |conn| {
         conn.execute(
             "UPDATE paired_devices SET last_seen = ?1 WHERE device_id = ?2",
             rusqlite::params![now_ts(), peer_id],
-        ).ok();
+        )
+        .ok();
         Ok(())
     });
 
     eprintln!("[Sync] Session ended with {}", peer_id);
+}
+
+async fn run_pairing_session(
+    runtime: Arc<SyncRuntime>,
+    transport: NoiseTransport,
+    first_msg: Msg,
+) -> Result<(), String> {
+    let (device_id, device_name, platform, public_key, pin) = match first_msg {
+        Msg::PairRequest {
+            device_id,
+            device_name,
+            platform,
+            public_key,
+            pin,
+        } => (device_id, device_name, platform, public_key, pin),
+        other => {
+            return Err(format!(
+                "Expected PairRequest from unpaired peer, got {:?}",
+                other
+            ));
+        }
+    };
+
+    handle_pair_request(
+        &runtime,
+        &transport,
+        &device_id,
+        &device_name,
+        &platform,
+        &public_key,
+        &pin,
+    )
+    .await
 }
 
 async fn handle_message(
@@ -1094,7 +1535,10 @@ async fn handle_message(
             let _ = apply_delete_collection(&runtime.app, &sync_id);
             let _ = runtime.app.emit("collections-changed", ());
         }
-        Msg::MoveClipToCollection { clip_sync_id, collection_sync_id } => {
+        Msg::MoveClipToCollection {
+            clip_sync_id,
+            collection_sync_id,
+        } => {
             let _ = apply_move_clip(&runtime.app, &clip_sync_id, collection_sync_id.as_deref());
             let _ = runtime.app.emit("clips-changed", ());
         }
@@ -1102,21 +1546,50 @@ async fn handle_message(
             let _ = apply_set_pinned(&runtime.app, &sync_id, pinned);
             let _ = runtime.app.emit("clips-changed", ());
         }
-        Msg::PairRequest { device_id, device_name, platform, public_key, pin } => {
-            handle_pair_request(runtime, transport, &device_id, &device_name, &platform, &public_key, &pin).await?;
+        Msg::PairRequest {
+            device_id,
+            device_name,
+            platform,
+            public_key,
+            pin,
+        } => {
+            handle_pair_request(
+                runtime,
+                transport,
+                &device_id,
+                &device_name,
+                &platform,
+                &public_key,
+                &pin,
+            )
+            .await?;
         }
-        Msg::PairAccept { device_id, device_name, platform, public_key } => {
+        Msg::PairAccept {
+            device_id,
+            device_name,
+            platform,
+            public_key,
+        } => {
             // Save the paired device
             let pub_bytes = B64.decode(&public_key).map_err(|e| e.to_string())?;
-            save_paired_device(&runtime.app, &device_id, &device_name, &platform, &pub_bytes)?;
+            save_paired_device(
+                &runtime.app,
+                &device_id,
+                &device_name,
+                &platform,
+                &pub_bytes,
+            )?;
             let _ = runtime.event_tx.send(SyncEvent::PairingComplete {
                 device_id: device_id.clone(),
                 device_name: device_name.clone(),
             });
-            let _ = runtime.app.emit("sync:paired", serde_json::json!({
-                "deviceId": device_id,
-                "deviceName": device_name,
-            }));
+            let _ = runtime.app.emit(
+                "sync:paired",
+                serde_json::json!({
+                    "deviceId": device_id,
+                    "deviceName": device_name,
+                }),
+            );
             eprintln!("[Sync] Paired with {}", device_id);
         }
         Msg::PairReject { reason } => {
@@ -1146,6 +1619,21 @@ async fn handle_pair_request(
     public_key_b64: &str,
     pin: &str,
 ) -> Result<(), String> {
+    let remote_public_key = transport.remote_public_key();
+
+    let announced_public_key =
+        match validate_announced_public_key(public_key_b64, remote_public_key) {
+            Ok(pk) => pk,
+            Err(reason) => {
+                let _ = transport
+                    .send_msg(&Msg::PairReject {
+                        reason: reason.clone(),
+                    })
+                    .await;
+                return Err(format!("Pairing rejected: {}", reason));
+            }
+        };
+
     // Verify PIN
     let valid = {
         let guard = runtime.pairing_pin.lock().await;
@@ -1157,35 +1645,47 @@ async fn handle_pair_request(
     };
 
     if !valid {
-        transport.send_msg(&Msg::PairReject {
-            reason: "Invalid or expired PIN".into(),
-        }).await?;
+        transport
+            .send_msg(&Msg::PairReject {
+                reason: "Invalid or expired PIN".into(),
+            })
+            .await?;
         return Err("Pairing rejected: bad PIN".into());
     }
 
     // Save paired device
-    let pub_bytes = B64.decode(public_key_b64).map_err(|e| e.to_string())?;
-    save_paired_device(&runtime.app, device_id, device_name, platform, &pub_bytes)?;
+    save_paired_device(
+        &runtime.app,
+        device_id,
+        device_name,
+        platform,
+        &announced_public_key,
+    )?;
 
     // Clear PIN
     *runtime.pairing_pin.lock().await = None;
 
     // Send PairAccept
-    transport.send_msg(&Msg::PairAccept {
-        device_id: runtime.device_id.clone(),
-        device_name: runtime.device_name.clone(),
-        platform: runtime.platform.clone(),
-        public_key: B64.encode(&runtime.public_key),
-    }).await?;
+    transport
+        .send_msg(&Msg::PairAccept {
+            device_id: runtime.device_id.clone(),
+            device_name: runtime.device_name.clone(),
+            platform: runtime.platform.clone(),
+            public_key: B64.encode(&runtime.public_key),
+        })
+        .await?;
 
     let _ = runtime.event_tx.send(SyncEvent::PairingComplete {
         device_id: device_id.to_string(),
         device_name: device_name.to_string(),
     });
-    let _ = runtime.app.emit("sync:paired", serde_json::json!({
-        "deviceId": device_id,
-        "deviceName": device_name,
-    }));
+    let _ = runtime.app.emit(
+        "sync:paired",
+        serde_json::json!({
+            "deviceId": device_id,
+            "deviceName": device_name,
+        }),
+    );
 
     eprintln!("[Sync] Paired with {} ({})", device_name, device_id);
     Ok(())
@@ -1206,7 +1706,10 @@ async fn run_server(runtime: Arc<SyncRuntime>) {
             }
             Err(e) => {
                 if e.contains("Address already in use") && attempt < 6 {
-                    eprintln!("[Sync] Port {} busy (attempt {}/6), retrying...", bound_port, attempt);
+                    eprintln!(
+                        "[Sync] Port {} busy (attempt {}/6), retrying...",
+                        bound_port, attempt
+                    );
                     tokio::time::sleep(Duration::from_millis(350)).await;
                     continue;
                 }
@@ -1220,21 +1723,25 @@ async fn run_server(runtime: Arc<SyncRuntime>) {
 
     let listener = match listener {
         Some(l) => l,
-        None => {
-            match bind_listener(0).await {
-                Ok(l) => l,
-                Err(e) => {
-                    eprintln!("[Sync] Failed to bind listener: {}", e);
-                    return;
-                }
+        None => match bind_listener(0).await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("[Sync] Failed to bind listener: {}", e);
+                return;
             }
-        }
+        },
     };
 
-    let actual_port = listener.local_addr().map(|a: std::net::SocketAddr| a.port()).unwrap_or(bound_port);
+    let actual_port = listener
+        .local_addr()
+        .map(|a: std::net::SocketAddr| a.port())
+        .unwrap_or(bound_port);
 
     if actual_port != runtime.port {
-        eprintln!("[Sync] Using fallback port {} (default {} unavailable)", actual_port, runtime.port);
+        eprintln!(
+            "[Sync] Using fallback port {} (default {} unavailable)",
+            actual_port, runtime.port
+        );
     }
 
     #[cfg(target_os = "windows")]
@@ -1254,7 +1761,12 @@ async fn run_server(runtime: Arc<SyncRuntime>) {
         }
     };
 
-    if let Err(e) = discovery.start(actual_port, &runtime.device_name, &runtime.platform, &runtime.public_key) {
+    if let Err(e) = discovery.start(
+        actual_port,
+        &runtime.device_name,
+        &runtime.platform,
+        &runtime.public_key,
+    ) {
         eprintln!("[Sync] Discovery start failed: {}", e);
         return;
     }
@@ -1282,24 +1794,54 @@ async fn run_server(runtime: Arc<SyncRuntime>) {
                 let rt = runtime.clone();
                 let priv_key = rt.private_key;
                 tauri::async_runtime::spawn(async move {
-                    match timeout(HANDSHAKE_TIMEOUT, NoiseTransport::accept(stream, &priv_key)).await {
+                    match timeout(HANDSHAKE_TIMEOUT, NoiseTransport::accept(stream, &priv_key))
+                        .await
+                    {
                         Ok(Ok(transport)) => {
-                            // Identify peer by public key
                             let remote_pk = transport.remote_public_key().to_vec();
-                            let peer_id = with_read_conn(&rt.app, |conn| {
-                                conn.query_row(
-                                    "SELECT device_id FROM paired_devices WHERE public_key = ?1",
-                                    [&remote_pk],
-                                    |r| r.get(0),
-                                ).optional().map_err(|e| e.to_string())
-                            }).ok().flatten().unwrap_or_else(|| "unknown".to_string());
+                            let paired_peer_id =
+                                match paired_device_id_by_public_key(&rt.app, &remote_pk) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        eprintln!(
+                                            "[Sync] Failed to lookup paired peer by key: {}",
+                                            e
+                                        );
+                                        return;
+                                    }
+                                };
 
-                            if peer_id == "unknown" {
-                                eprintln!("[Sync] Unknown peer (key not in paired_devices), dropping");
+                            if let Some(peer_id) = paired_peer_id {
+                                run_session(rt, transport, peer_id, false).await;
                                 return;
                             }
 
-                            run_session(rt, transport, peer_id, false).await;
+                            // Unpaired peer: only allow pairing request as first message.
+                            let first_msg = match timeout(
+                                Duration::from_secs(10),
+                                transport.recv_msg(),
+                            )
+                            .await
+                            {
+                                Ok(Ok(msg)) => msg,
+                                Ok(Err(e)) => {
+                                    eprintln!(
+                                        "[Sync] Failed to read first message from unpaired peer: {}",
+                                        e
+                                    );
+                                    return;
+                                }
+                                Err(_) => {
+                                    eprintln!(
+                                        "[Sync] Timeout waiting for first message from unpaired peer"
+                                    );
+                                    return;
+                                }
+                            };
+
+                            if let Err(e) = run_pairing_session(rt, transport, first_msg).await {
+                                eprintln!("[Sync] Unpaired peer rejected: {}", e);
+                            }
                         }
                         Ok(Err(e)) => {
                             eprintln!("[Sync] Handshake failed: {}", e);
@@ -1323,7 +1865,10 @@ async fn bind_listener(port: u16) -> Result<TcpListener, String> {
     // Try IPv6 first
     if let Ok(v6_socket) = TcpSocket::new_v6() {
         let _ = v6_socket.set_reuseaddr(true);
-        if v6_socket.bind(SocketAddr::from((Ipv6Addr::UNSPECIFIED, port))).is_ok() {
+        if v6_socket
+            .bind(SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)))
+            .is_ok()
+        {
             if let Ok(listener) = v6_socket.listen(128) {
                 return Ok(listener);
             }
@@ -1333,13 +1878,18 @@ async fn bind_listener(port: u16) -> Result<TcpListener, String> {
     // Fallback to IPv4
     let v4_socket = TcpSocket::new_v4().map_err(|e| e.to_string())?;
     let _ = v4_socket.set_reuseaddr(true);
-    v4_socket.bind(SocketAddr::from(([0, 0, 0, 0], port))).map_err(|e| e.to_string())?;
+    v4_socket
+        .bind(SocketAddr::from(([0, 0, 0, 0], port)))
+        .map_err(|e| e.to_string())?;
     v4_socket.listen(128).map_err(|e| e.to_string())
 }
 
 // ─── Discovery event loop ─────────────────────────────────────────────────
 
-async fn discovery_event_loop(runtime: Arc<SyncRuntime>, mut rx: broadcast::Receiver<DiscoveryEvent>) {
+async fn discovery_event_loop(
+    runtime: Arc<SyncRuntime>,
+    mut rx: broadcast::Receiver<DiscoveryEvent>,
+) {
     loop {
         let event = match timeout(Duration::from_secs(1), rx.recv()).await {
             Ok(Ok(e)) => e,
@@ -1351,7 +1901,13 @@ async fn discovery_event_loop(runtime: Arc<SyncRuntime>, mut rx: broadcast::Rece
         match event {
             DiscoveryEvent::DeviceFound(d) | DiscoveryEvent::DeviceUpdated(d) => {
                 let is_paired = is_paired(&runtime.app, &d.device_id);
-                let connected = runtime.connected.read().await.get(&d.device_id).copied().unwrap_or(false);
+                let connected = runtime
+                    .connected
+                    .read()
+                    .await
+                    .get(&d.device_id)
+                    .copied()
+                    .unwrap_or(false);
 
                 let payload = SyncDiscoveredDevicePayload {
                     device_id: d.device_id.clone(),
@@ -1361,7 +1917,11 @@ async fn discovery_event_loop(runtime: Arc<SyncRuntime>, mut rx: broadcast::Rece
                     is_connected: connected,
                 };
 
-                runtime.discovered.write().await.insert(payload.device_id.clone(), payload.clone());
+                runtime
+                    .discovered
+                    .write()
+                    .await
+                    .insert(payload.device_id.clone(), payload.clone());
                 let _ = runtime.app.emit("sync:discovered-updated", payload);
 
                 // If paired and not connected, try to connect
@@ -1369,7 +1929,16 @@ async fn discovery_event_loop(runtime: Arc<SyncRuntime>, mut rx: broadcast::Rece
                     let rt = runtime.clone();
                     let device = d;
                     tauri::async_runtime::spawn(async move {
-                        connect_and_sync(rt, &device.device_id, &device.device_name, &device.platform, &device.public_key, &device.addresses, device.port).await;
+                        connect_and_sync(
+                            rt,
+                            &device.device_id,
+                            &device.device_name,
+                            &device.platform,
+                            &device.public_key,
+                            &device.addresses,
+                            device.port,
+                        )
+                        .await;
                     });
                 }
             }
@@ -1377,7 +1946,9 @@ async fn discovery_event_loop(runtime: Arc<SyncRuntime>, mut rx: broadcast::Rece
                 runtime.discovered.write().await.remove(&id);
                 runtime.connected.write().await.insert(id.clone(), false);
                 let _ = runtime.app.emit("sync:discovered-lost", &id);
-                let _ = runtime.event_tx.send(SyncEvent::DeviceLost { device_id: id });
+                let _ = runtime
+                    .event_tx
+                    .send(SyncEvent::DeviceLost { device_id: id });
             }
         }
     }
@@ -1395,27 +1966,68 @@ async fn connect_and_sync(
     port: u16,
 ) {
     // Already connected?
-    if runtime.connected.read().await.get(device_id).copied().unwrap_or(false) {
+    if runtime
+        .connected
+        .read()
+        .await
+        .get(device_id)
+        .copied()
+        .unwrap_or(false)
+    {
+        return;
+    }
+
+    let expected_public_key = match paired_public_key_by_device_id(&runtime.app, device_id) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "[Sync] Failed to read expected key for {}: {}",
+                device_id, e
+            );
+            None
+        }
+    };
+
+    let connect_addrs = build_connect_addrs(addresses, port);
+    if connect_addrs.is_empty() {
+        eprintln!(
+            "[Sync] No routable addresses for {} (raw: {:?})",
+            device_id, addresses
+        );
         return;
     }
 
     // Try each address
     let mut last_err = String::new();
-    for ip in addresses {
-        if ip.is_loopback() || ip.is_unspecified() {
-            continue;
-        }
-        let addr = SocketAddr::new(*ip, port);
-        match timeout(CONNECT_TIMEOUT, NoiseTransport::connect(addr, &runtime.private_key)).await {
+    for addr in connect_addrs {
+        eprintln!("[Sync] Dial {} at {}", device_id, addr);
+        match timeout(
+            CONNECT_TIMEOUT,
+            NoiseTransport::connect(addr, &runtime.private_key),
+        )
+        .await
+        {
             Ok(Ok(transport)) => {
+                if let Some(expected) = expected_public_key.as_ref() {
+                    if transport.remote_public_key() != expected.as_slice() {
+                        last_err = format!("identity mismatch at {}", addr);
+                        eprintln!(
+                            "[Sync] Rejecting {} at {}: remote key mismatch",
+                            device_id, addr
+                        );
+                        continue;
+                    }
+                }
                 eprintln!("[Sync] Connected to {} at {}", device_id, addr);
                 run_session(runtime, transport, device_id.to_string(), true).await;
                 return;
             }
             Ok(Err(e)) => {
+                eprintln!("[Sync] Dial failed {} at {}: {}", device_id, addr, e);
                 last_err = e;
             }
             Err(_) => {
+                eprintln!("[Sync] Dial timeout {} at {}", device_id, addr);
                 last_err = "timeout".to_string();
             }
         }
@@ -1437,7 +2049,14 @@ async fn reconnect_loop(runtime: Arc<SyncRuntime>, device_id: String) {
         }
 
         // Already connected?
-        if runtime.connected.read().await.get(&device_id).copied().unwrap_or(false) {
+        if runtime
+            .connected
+            .read()
+            .await
+            .get(&device_id)
+            .copied()
+            .unwrap_or(false)
+        {
             backoff = RECONNECT_BASE;
             tokio::time::sleep(Duration::from_secs(10)).await;
             continue;
@@ -1459,7 +2078,8 @@ async fn reconnect_loop(runtime: Arc<SyncRuntime>, device_id: String) {
                 &d.public_key,
                 &d.addresses,
                 d.port,
-            ).await;
+            )
+            .await;
             backoff = RECONNECT_BASE;
         } else {
             // Not discovered yet, wait for mDNS
@@ -1574,7 +2194,9 @@ pub fn apply_config_change(
 /// Called by clipboard.rs after a clip is saved locally.
 pub fn on_local_clip_saved(app: &tauri::AppHandle, clip_sync_id: &str) {
     let Some(runtime) = RUNTIME.get() else { return };
-    if !runtime.started.load(Ordering::SeqCst) { return; }
+    if !runtime.started.load(Ordering::SeqCst) {
+        return;
+    }
 
     let app_clone = app.clone();
     let sync_id = clip_sync_id.to_string();
@@ -1605,14 +2227,20 @@ pub fn on_collection_changed(app: &tauri::AppHandle) {
 }
 
 fn trigger_flush_for_all_paired(app: &tauri::AppHandle) {
-    let Some(runtime) = RUNTIME.get().cloned() else { return };
-    if !runtime.started.load(Ordering::SeqCst) { return; }
+    let Some(runtime) = RUNTIME.get().cloned() else {
+        return;
+    };
+    if !runtime.started.load(Ordering::SeqCst) {
+        return;
+    }
 
     let auto_connect = crate::settings::get_config_sync(app.clone())
         .ok()
         .map(|c| c.sync.auto_connect)
         .unwrap_or(true);
-    if !auto_connect { return; }
+    if !auto_connect {
+        return;
+    }
 
     // The reconnect loop + discovery event handling will trigger sync
     // for any newly available paired devices. For already-connected peers,
@@ -1651,24 +2279,30 @@ pub async fn sync_get_status(app: tauri::AppHandle) -> Result<SyncStatusPayload,
                 "SELECT COALESCE(MIN(last_sync_version), 0) FROM paired_devices",
                 [],
                 |r| r.get(0),
-            ).map_err(|e| e.to_string())
-        }).unwrap_or(0i64);
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap_or(0i64);
 
         let pending_clips: i64 = with_read_conn(&app, |conn| {
             conn.query_row(
                 "SELECT COUNT(*) FROM clips WHERE sync_version > ?1 AND deleted = 0",
                 [min_sent],
                 |r| r.get(0),
-            ).map_err(|e| e.to_string())
-        }).unwrap_or(0);
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap_or(0);
 
         let pending_colls: i64 = with_read_conn(&app, |conn| {
             conn.query_row(
                 "SELECT COUNT(*) FROM collections WHERE sync_version > ?1 AND deleted = 0",
                 [min_sent],
                 |r| r.get(0),
-            ).map_err(|e| e.to_string())
-        }).unwrap_or(0);
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap_or(0);
 
         (pending_clips + pending_colls) as usize
     } else {
@@ -1685,7 +2319,9 @@ pub async fn sync_get_status(app: tauri::AppHandle) -> Result<SyncStatusPayload,
 }
 
 #[tauri::command]
-pub async fn sync_list_paired_devices(app: tauri::AppHandle) -> Result<Vec<SyncPairedDevicePayload>, String> {
+pub async fn sync_list_paired_devices(
+    app: tauri::AppHandle,
+) -> Result<Vec<SyncPairedDevicePayload>, String> {
     let paired = load_paired_devices(&app)?;
     let connected = if let Some(rt) = RUNTIME.get() {
         rt.connected.read().await
@@ -1693,18 +2329,21 @@ pub async fn sync_list_paired_devices(app: tauri::AppHandle) -> Result<Vec<SyncP
         return Ok(vec![]);
     };
 
-    Ok(paired.into_iter().map(|d| {
-        let online = connected.get(&d.device_id).copied().unwrap_or(false);
-        SyncPairedDevicePayload {
-            device_id: d.device_id,
-            device_name: d.device_name,
-            platform: d.platform,
-            paired_at: d.paired_at,
-            last_seen: d.last_seen,
-            last_sync_version: d.last_sync_version,
-            online,
-        }
-    }).collect())
+    Ok(paired
+        .into_iter()
+        .map(|d| {
+            let online = connected.get(&d.device_id).copied().unwrap_or(false);
+            SyncPairedDevicePayload {
+                device_id: d.device_id,
+                device_name: d.device_name,
+                platform: d.platform,
+                paired_at: d.paired_at,
+                last_seen: d.last_seen,
+                last_sync_version: d.last_sync_version,
+                online,
+            }
+        })
+        .collect())
 }
 
 #[tauri::command]
@@ -1725,7 +2364,9 @@ pub async fn sync_pair_device_manual(
     platform: String,
     public_key_base64: String,
 ) -> Result<(), String> {
-    let public_key = B64.decode(public_key_base64.trim()).map_err(|e| e.to_string())?;
+    let public_key = B64
+        .decode(public_key_base64.trim())
+        .map_err(|e| e.to_string())?;
     save_paired_device(&app, &device_id, &device_name, &platform, &public_key)?;
 
     // Trigger reconnect
@@ -1744,7 +2385,9 @@ pub async fn sync_list_discovered_devices(
     app: tauri::AppHandle,
 ) -> Result<Vec<SyncDiscoveredDevicePayload>, String> {
     let _ = app;
-    let Some(rt) = RUNTIME.get() else { return Ok(vec![]) };
+    let Some(rt) = RUNTIME.get() else {
+        return Ok(vec![]);
+    };
     Ok(rt.discovered.read().await.values().cloned().collect())
 }
 
@@ -1760,12 +2403,18 @@ pub async fn sync_start_pairing(app: tauri::AppHandle) -> Result<SyncPairingCode
         *rt.pairing_pin.lock().await = Some((pin.clone(), expires_at));
     }
 
-    let _ = app.emit("sync:pairing-offer", SyncPairingCodePayload {
-        code: pin.clone(),
-        expires_at,
-    });
+    let _ = app.emit(
+        "sync:pairing-offer",
+        SyncPairingCodePayload {
+            code: pin.clone(),
+            expires_at,
+        },
+    );
 
-    Ok(SyncPairingCodePayload { code: pin, expires_at })
+    Ok(SyncPairingCodePayload {
+        code: pin,
+        expires_at,
+    })
 }
 
 #[tauri::command]
@@ -1786,15 +2435,31 @@ pub async fn sync_pair_with_code(
             .ok_or_else(|| String::from("Device not discovered"))?
     };
 
+    let connect_addrs = build_connect_addrs(&device.addresses, device.port);
+    if connect_addrs.is_empty() {
+        return Err("No routable address found for discovered device".into());
+    }
+
     // Connect to device
     let mut last_err = String::new();
-    for ip in &device.addresses {
-        if ip.is_loopback() || ip.is_unspecified() {
-            continue;
-        }
-        let addr = SocketAddr::new(*ip, device.port);
-        match timeout(CONNECT_TIMEOUT, NoiseTransport::connect(addr, &rt.private_key)).await {
+    for addr in connect_addrs {
+        eprintln!("[Sync] Pair dial {} at {}", device.device_id, addr);
+        match timeout(
+            CONNECT_TIMEOUT,
+            NoiseTransport::connect(addr, &rt.private_key),
+        )
+        .await
+        {
             Ok(Ok(transport)) => {
+                if transport.remote_public_key() != device.public_key.as_slice() {
+                    last_err = format!("identity mismatch at {}", addr);
+                    eprintln!(
+                        "[Sync] Pair reject {} at {}: remote key mismatch",
+                        device.device_id, addr
+                    );
+                    continue;
+                }
+
                 // Send PairRequest
                 let pair_msg = Msg::PairRequest {
                     device_id: rt.device_id.clone(),
@@ -1808,18 +2473,35 @@ pub async fn sync_pair_with_code(
 
                 // Wait for response
                 match timeout(Duration::from_secs(10), transport.recv_msg()).await {
-                    Ok(Ok(Msg::PairAccept { device_id: their_id, device_name: their_name, platform: their_platform, public_key: their_key })) => {
-                        let pub_bytes = B64.decode(&their_key).map_err(|e| e.to_string())?;
-                        save_paired_device(&app, &their_id, &their_name, &their_platform, &pub_bytes)?;
+                    Ok(Ok(Msg::PairAccept {
+                        device_id: their_id,
+                        device_name: their_name,
+                        platform: their_platform,
+                        public_key: their_key,
+                    })) => {
+                        let pub_bytes = validate_announced_public_key(
+                            &their_key,
+                            transport.remote_public_key(),
+                        )?;
+                        save_paired_device(
+                            &app,
+                            &their_id,
+                            &their_name,
+                            &their_platform,
+                            &pub_bytes,
+                        )?;
 
                         let _ = rt.event_tx.send(SyncEvent::PairingComplete {
                             device_id: their_id.clone(),
                             device_name: their_name.clone(),
                         });
-                        let _ = app.emit("sync:paired", serde_json::json!({
-                            "deviceId": their_id,
-                            "deviceName": their_name,
-                        }));
+                        let _ = app.emit(
+                            "sync:paired",
+                            serde_json::json!({
+                                "deviceId": their_id,
+                                "deviceName": their_name,
+                            }),
+                        );
 
                         eprintln!("[Sync] Paired with {}", their_name);
 
@@ -1874,11 +2556,21 @@ fn ensure_windows_firewall_rules(listen_port: u16) {
     );
 
     // PowerShell -EncodedCommand expects UTF-16LE bytes encoded as base64.
-    let utf16_bytes: Vec<u8> = script.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+    let utf16_bytes: Vec<u8> = script
+        .encode_utf16()
+        .flat_map(|u| u.to_le_bytes())
+        .collect();
     let b64 = B64.encode(&utf16_bytes);
 
     match Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", &b64])
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-EncodedCommand",
+            &b64,
+        ])
         .output()
     {
         Ok(out) if out.status.success() => {
@@ -2049,7 +2741,10 @@ mod tests {
             deleted: false,
             embedding: None,
         };
-        client.send_msg(&Msg::Clip { clip: clip.clone() }).await.unwrap();
+        client
+            .send_msg(&Msg::Clip { clip: clip.clone() })
+            .await
+            .unwrap();
 
         // Receive echoed message
         let echoed = client.recv_msg().await.unwrap();
@@ -2217,7 +2912,11 @@ mod tests {
         drop(listener); // Close the listener
 
         // Connect should fail since nothing is listening
-        let result = timeout(Duration::from_millis(500), NoiseTransport::connect(addr, &client_key)).await;
+        let result = timeout(
+            Duration::from_millis(500),
+            NoiseTransport::connect(addr, &client_key),
+        )
+        .await;
         assert!(result.is_err() || result.unwrap().is_err());
     }
 
@@ -2286,7 +2985,9 @@ mod tests {
             deleted: false,
         };
 
-        let msg = Msg::Collection { collection: coll.clone() };
+        let msg = Msg::Collection {
+            collection: coll.clone(),
+        };
         let line = msg.to_line().unwrap();
         let parsed = Msg::from_line(&line).unwrap();
 
@@ -2336,7 +3037,12 @@ mod tests {
         let parsed = Msg::from_line(&line).unwrap();
 
         match parsed {
-            Msg::PairAccept { device_id, device_name, platform, .. } => {
+            Msg::PairAccept {
+                device_id,
+                device_name,
+                platform,
+                ..
+            } => {
                 assert_eq!(device_id, "dev-b");
                 assert_eq!(device_name, "Desktop");
                 assert_eq!(platform, "windows");
@@ -2347,7 +3053,9 @@ mod tests {
 
     #[test]
     fn delete_clip_roundtrip() {
-        let msg = Msg::DeleteClip { sync_id: "clip-1".into() };
+        let msg = Msg::DeleteClip {
+            sync_id: "clip-1".into(),
+        };
         let line = msg.to_line().unwrap();
         let parsed = Msg::from_line(&line).unwrap();
 
@@ -2361,7 +3069,10 @@ mod tests {
 
     #[test]
     fn set_clip_pinned_roundtrip() {
-        let msg = Msg::SetClipPinned { sync_id: "clip-1".into(), pinned: true };
+        let msg = Msg::SetClipPinned {
+            sync_id: "clip-1".into(),
+            pinned: true,
+        };
         let line = msg.to_line().unwrap();
         let parsed = Msg::from_line(&line).unwrap();
 
@@ -2384,7 +3095,10 @@ mod tests {
         let parsed = Msg::from_line(&line).unwrap();
 
         match parsed {
-            Msg::MoveClipToCollection { clip_sync_id, collection_sync_id } => {
+            Msg::MoveClipToCollection {
+                clip_sync_id,
+                collection_sync_id,
+            } => {
                 assert_eq!(clip_sync_id, "clip-1");
                 assert_eq!(collection_sync_id, Some("coll-1".into()));
             }
@@ -2404,7 +3118,12 @@ mod tests {
         let parsed = Msg::from_line(&line).unwrap();
 
         match parsed {
-            Msg::Hello { device_id, last_sync_version, protocol_version, .. } => {
+            Msg::Hello {
+                device_id,
+                last_sync_version,
+                protocol_version,
+                ..
+            } => {
                 assert_eq!(device_id, "dev-1");
                 assert_eq!(last_sync_version, 42);
                 assert_eq!(protocol_version, PROTOCOL_VERSION);
@@ -2425,12 +3144,69 @@ mod tests {
         let parsed = Msg::from_line(&line).unwrap();
 
         match parsed {
-            Msg::HelloAck { device_id, last_sync_version, .. } => {
+            Msg::HelloAck {
+                device_id,
+                last_sync_version,
+                ..
+            } => {
                 assert_eq!(device_id, "dev-2");
                 assert_eq!(last_sync_version, 38);
             }
             _ => panic!("Expected HelloAck"),
         }
+    }
+
+    #[test]
+    fn build_connect_addrs_prioritizes_ipv4_then_ipv6() {
+        let addresses = vec![
+            IpAddr::V6("fe80::1".parse::<std::net::Ipv6Addr>().unwrap()),
+            IpAddr::V6("2001:db8::1".parse::<std::net::Ipv6Addr>().unwrap()),
+            IpAddr::V4("192.168.1.20".parse::<std::net::Ipv4Addr>().unwrap()),
+        ];
+
+        let ordered = build_connect_addrs_with_scopes(&addresses, 47524, &[12, 99]);
+        assert!(!ordered.is_empty());
+
+        // First should be IPv4.
+        assert!(matches!(ordered[0], SocketAddr::V4(_)));
+
+        // Ensure link-local with scope candidates exists.
+        let mut has_scope_12 = false;
+        let mut has_scope_99 = false;
+        for addr in ordered {
+            if let SocketAddr::V6(v6) = addr {
+                if v6.ip().is_unicast_link_local() {
+                    if v6.scope_id() == 12 {
+                        has_scope_12 = true;
+                    }
+                    if v6.scope_id() == 99 {
+                        has_scope_99 = true;
+                    }
+                }
+            }
+        }
+
+        assert!(has_scope_12);
+        assert!(has_scope_99);
+    }
+
+    #[test]
+    fn validate_announced_public_key_rejects_mismatch() {
+        let real = [7u8; 32];
+        let fake = [9u8; 32];
+        let announced = B64.encode(fake);
+
+        let result = validate_announced_public_key(&announced, &real);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_announced_public_key_accepts_match() {
+        let real = [11u8; 32];
+        let announced = B64.encode(real);
+
+        let result = validate_announced_public_key(&announced, &real).unwrap();
+        assert_eq!(result, real);
     }
 
     // ─── Noise Listener wrapper for tests ────────────────────────────────
@@ -2446,18 +3222,29 @@ mod tests {
             // Try IPv6 first
             if let Ok(v6_socket) = TcpSocket::new_v6() {
                 let _ = v6_socket.set_reuseaddr(true);
-                if v6_socket.bind(SocketAddr::from((Ipv6Addr::UNSPECIFIED, port))).is_ok() {
+                if v6_socket
+                    .bind(SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)))
+                    .is_ok()
+                {
                     if let Ok(listener) = v6_socket.listen(128) {
-                        return Ok(Self { listener, our_private_key });
+                        return Ok(Self {
+                            listener,
+                            our_private_key,
+                        });
                     }
                 }
             }
             // Fallback to IPv4
             let v4_socket = TcpSocket::new_v4().map_err(|e| e.to_string())?;
             let _ = v4_socket.set_reuseaddr(true);
-            v4_socket.bind(SocketAddr::from(([0, 0, 0, 0], port))).map_err(|e| e.to_string())?;
+            v4_socket
+                .bind(SocketAddr::from(([0, 0, 0, 0], port)))
+                .map_err(|e| e.to_string())?;
             let listener = v4_socket.listen(128).map_err(|e| e.to_string())?;
-            Ok(Self { listener, our_private_key })
+            Ok(Self {
+                listener,
+                our_private_key,
+            })
         }
 
         async fn accept_tcp(&self) -> Result<(TcpStream, std::net::SocketAddr), String> {

@@ -382,9 +382,7 @@ fn embed_single_clip(model: &EmbeddingModel, app: &tauri::AppHandle, clip_id: i6
         "INSERT INTO clip_embeddings(rowid, embedding) VALUES (?1, ?2)",
         rusqlite::params![clip_id, vec_bytes],
     ) {
-        Ok(_) => {
-            EmbedOutcome::Stored
-        }
+        Ok(_) => EmbedOutcome::Stored,
         Err(e) => {
             eprintln!("[Embed] Store failed clip {}: {}", clip_id, e);
             EmbedOutcome::Failed

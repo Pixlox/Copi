@@ -503,9 +503,17 @@ function SyncSection({
     publicKeyBase64: "",
   });
   const [manualError, setManualError] = useState<string | null>(null);
+  const [pairingError, setPairingError] = useState<string | null>(null);
   const [joinCode, setJoinCode] = useState("");
   const [pairingBusyId, setPairingBusyId] = useState<string | null>(null);
   const [countdownTick, setCountdownTick] = useState(0);
+
+  const formatError = (e: unknown): string =>
+    typeof e === "string"
+      ? e
+      : e instanceof Error
+      ? e.message
+      : "Sync operation failed";
 
   // Tick every second while a pairing code is active to update the countdown
   useEffect(() => {
@@ -615,7 +623,17 @@ function SyncSection({
 
       <SettingCard>
         <SettingRow label="Pairing Code" description="Generate a 4-digit code on this device and enter it on another device">
-          <button className="settings-btn primary" onClick={() => void onStartPairing()}>
+          <button
+            className="settings-btn primary"
+            onClick={async () => {
+              setPairingError(null);
+              try {
+                await onStartPairing();
+              } catch (e) {
+                setPairingError(formatError(e));
+              }
+            }}
+          >
             <Wifi size={12} /> Generate
           </button>
         </SettingRow>
@@ -647,6 +665,7 @@ function SyncSection({
             onChange={(e) => setJoinCode(e.target.value.replace(/[^0-9]/g, "").slice(0, 4))}
           />
         </div>
+        {pairingError && <span className="settings-sync-error">{pairingError}</span>}
         <div className="settings-sync-list">
           {discoveredDevices.length === 0 && (
             <div className="settings-row">
@@ -670,10 +689,13 @@ function SyncSection({
                 disabled={device.isPaired || joinCode.length !== 4 || pairingBusyId === device.deviceId}
                 onClick={async () => {
                   setPairingBusyId(device.deviceId);
+                  setPairingError(null);
                   try {
                     await onPairWithCode(device.deviceId, joinCode);
                     setJoinCode("");
                   } catch (e) {
+                    const message = formatError(e);
+                    setPairingError(message);
                     console.error("Pair by code failed", e);
                   } finally {
                     setPairingBusyId(null);

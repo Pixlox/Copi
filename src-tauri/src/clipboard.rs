@@ -7,8 +7,7 @@ use tauri::{Emitter, Manager};
 
 use crate::{
     macos::{get_app_icon_png, get_clipboard_source_app, get_frontmost_app_info, FrontmostApp},
-    sync,
-    AppState,
+    sync, AppState,
 };
 
 struct ClipboardImagePayload {
