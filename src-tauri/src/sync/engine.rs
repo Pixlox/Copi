@@ -1268,7 +1268,7 @@ async fn run_server(runtime: Arc<SyncRuntime>) {
         if let Some(d) = disc.as_ref() {
             let rx = d.subscribe();
             drop(disc);
-            tokio::spawn(discovery_event_loop(rt, rx));
+            tauri::async_runtime::spawn(discovery_event_loop(rt, rx));
         }
     }
 
@@ -1281,7 +1281,7 @@ async fn run_server(runtime: Arc<SyncRuntime>) {
                 eprintln!("[Sync] Incoming connection from {}", addr);
                 let rt = runtime.clone();
                 let priv_key = rt.private_key;
-                tokio::spawn(async move {
+                tauri::async_runtime::spawn(async move {
                     match timeout(HANDSHAKE_TIMEOUT, NoiseTransport::accept(stream, &priv_key)).await {
                         Ok(Ok(transport)) => {
                             // Identify peer by public key
@@ -1368,7 +1368,7 @@ async fn discovery_event_loop(runtime: Arc<SyncRuntime>, mut rx: broadcast::Rece
                 if is_paired && !connected {
                     let rt = runtime.clone();
                     let device = d;
-                    tokio::spawn(async move {
+                    tauri::async_runtime::spawn(async move {
                         connect_and_sync(rt, &device.device_id, &device.device_name, &device.platform, &device.public_key, &device.addresses, device.port).await;
                     });
                 }
@@ -1512,20 +1512,23 @@ fn start_runtime_inner(runtime: Arc<SyncRuntime>) -> Result<(), String> {
     }
 
     let generation = runtime.generation.fetch_add(1, Ordering::SeqCst) + 1;
-    let _ = generation; // Used for future generation-based restarts
+    let _ = generation;
 
     let _ = runtime.event_tx.send(SyncEvent::Started);
     let _ = runtime.app.emit("sync:status", "started");
 
-    // TCP server
-    tokio::spawn(run_server(runtime.clone()));
+    // Use Tauri's async runtime (available during/after setup)
+    let rt = runtime.clone();
+    tauri::async_runtime::spawn(async move {
+        run_server(rt).await;
+    });
 
     // Reconnect loops for existing paired devices
     let paired = load_paired_devices(&runtime.app).unwrap_or_default();
     for device in paired {
         let rt = runtime.clone();
         let device_id = device.device_id.clone();
-        tokio::spawn(async move {
+        tauri::async_runtime::spawn(async move {
             reconnect_loop(rt, device_id).await;
         });
     }
@@ -1556,7 +1559,7 @@ pub fn apply_config_change(
         let _ = start_runtime_inner(runtime);
     } else {
         let rt = runtime.clone();
-        tokio::spawn(async move {
+        tauri::async_runtime::spawn(async move {
             rt.started.store(false, Ordering::SeqCst);
             rt.discovered.write().await.clear();
             if let Some(disc) = rt.discovery.write().await.take() {
@@ -1575,7 +1578,7 @@ pub fn on_local_clip_saved(app: &tauri::AppHandle, clip_sync_id: &str) {
 
     let app_clone = app.clone();
     let sync_id = clip_sync_id.to_string();
-    tokio::spawn(async move {
+    tauri::async_runtime::spawn(async move {
         let wire_clip = match clip_to_wire(&app_clone, &sync_id) {
             Ok(Some(c)) => c,
             _ => return,
@@ -1728,7 +1731,7 @@ pub async fn sync_pair_device_manual(
     // Trigger reconnect
     if let Some(rt) = RUNTIME.get() {
         let rt = rt.clone();
-        tokio::spawn(async move {
+        tauri::async_runtime::spawn(async move {
             reconnect_loop(rt, device_id).await;
         });
     }
@@ -1822,7 +1825,7 @@ pub async fn sync_pair_with_code(
 
                         // Start reconnect loop for this device
                         let rt = rt.clone();
-                        tokio::spawn(async move {
+                        tauri::async_runtime::spawn(async move {
                             reconnect_loop(rt, their_id).await;
                         });
 
