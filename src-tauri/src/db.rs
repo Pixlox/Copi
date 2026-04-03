@@ -112,7 +112,8 @@ pub fn init_db(app: &tauri::AppHandle) -> Result<DbConnections> {
         CREATE TABLE IF NOT EXISTS sync_peers (
             device_id TEXT PRIMARY KEY,
             display_name TEXT NOT NULL DEFAULT '',
-            last_seen INTEGER NOT NULL DEFAULT 0
+            last_seen INTEGER NOT NULL DEFAULT 0,
+            last_addr TEXT
         );
 
         CREATE TABLE IF NOT EXISTS sync_cursors (

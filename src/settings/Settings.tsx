@@ -469,6 +469,9 @@ function SyncSection() {
   const [pairingCode, setPairingCode] = useState<SyncPinPayload | null>(null);
   const [pairingError, setPairingError] = useState<string | null>(null);
   const [pairingBusyAddr, setPairingBusyAddr] = useState<string | null>(null);
+  const [manualTargetAddr, setManualTargetAddr] = useState("");
+  const [manualPin, setManualPin] = useState("");
+  const [manualPairingBusy, setManualPairingBusy] = useState(false);
   const [countdownTick, setCountdownTick] = useState(0);
 
   const formatError = (e: unknown): string =>
@@ -749,6 +752,52 @@ function SyncSection() {
                 : "Code expired"
               : "No active code"}
           </span>
+        </div>
+      </SettingCard>
+
+      <SettingCard>
+        <SettingRow
+          label="Pair by Address"
+          description="Fallback when discovery is blocked: enter peer IP (or IP:port) and PIN"
+        />
+        <SettingDivider />
+        {pairingError && <span className="settings-sync-error">{pairingError}</span>}
+        <div className="settings-sync-list">
+          <input
+            className="settings-sync-input"
+            placeholder="Peer address (example: 192.168.1.153 or 192.168.1.153:51827)"
+            value={manualTargetAddr}
+            onChange={(e) => setManualTargetAddr(e.target.value)}
+          />
+          <input
+            className="settings-sync-input"
+            placeholder="6-digit PIN"
+            value={manualPin}
+            onChange={(e) => setManualPin(e.target.value.replace(/[^0-9]/g, "").slice(0, 6))}
+          />
+          <button
+            className="settings-btn primary"
+            disabled={manualPairingBusy || manualPin.length !== 6 || manualTargetAddr.trim().length === 0}
+            onClick={async () => {
+              const targetAddr = manualTargetAddr.trim();
+              if (!targetAddr || manualPin.length !== 6) return;
+              setManualPairingBusy(true);
+              setPairingError(null);
+              try {
+                await invoke("sync_pair_with", { targetAddr, target_addr: targetAddr, pin: manualPin });
+                setManualPin("");
+                refreshStatus();
+                refreshPeers();
+                refreshDiscovered();
+              } catch (e) {
+                setPairingError(formatError(e));
+              } finally {
+                setManualPairingBusy(false);
+              }
+            }}
+          >
+            {manualPairingBusy ? "Pairing..." : "Pair by Address"}
+          </button>
         </div>
       </SettingCard>
 

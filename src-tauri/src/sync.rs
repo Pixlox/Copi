@@ -19,7 +19,7 @@ pub const SYNC_PORT: u16 = 51827;
 const SERVICE_TYPE: &str = "_copi._tcp.local.";
 const PROTOCOL_VERSION: u8 = 1;
 const PIN_TTL: Duration = Duration::from_secs(120);
-const RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
+const RECONNECT_BACKOFF: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const PING_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -108,6 +108,7 @@ pub struct SyncState {
     enabled: AtomicBool,
     generation: AtomicU64,
     live: RwLock<HashMap<String, PeerWriter>>,
+    connecting: RwLock<HashSet<String>>,
     known_addrs: RwLock<HashMap<String, SocketAddr>>,
     discovered: RwLock<HashMap<String, DiscoveredPeer>>,
     pairing_pin: Mutex<Option<(String, Instant)>>,
@@ -168,6 +169,19 @@ impl SyncState {
 
     pub async fn register_peer(&self, device_id: String, writer: PeerWriter) {
         self.live.write().await.insert(device_id, writer);
+    }
+
+    async fn try_begin_connect(&self, device_id: &str) -> bool {
+        let mut guard = self.connecting.write().await;
+        if guard.contains(device_id) {
+            return false;
+        }
+        guard.insert(device_id.to_string());
+        true
+    }
+
+    async fn end_connect(&self, device_id: &str) {
+        self.connecting.write().await.remove(device_id);
     }
 
     pub async fn unregister_peer(&self, device_id: &str) {
@@ -304,26 +318,14 @@ pub fn start_sync(app: AppHandle) -> Arc<SyncState> {
         }
     }
 
-    // Load trusted peers with their stored addresses
-    let peers_with_addrs = get_trusted_peers_with_addrs(&app).unwrap_or_default();
-    eprintln!("[Sync] Loaded {} trusted peers", peers_with_addrs.len());
-    let mut initial_addrs = HashMap::new();
-    let mut trusted_peers = Vec::new();
-    for (device_id, display_name, last_addr) in peers_with_addrs {
-        eprintln!("[Sync]   - peer: {} ({}) addr={:?}", display_name, device_id, last_addr);
-        if let Some(addr) = last_addr {
-            initial_addrs.insert(device_id.clone(), addr);
-        }
-        trusted_peers.push(TrustedPeer { device_id, display_name });
-    }
-
     let sync = Arc::new(SyncState {
         device_id,
         device_name,
         enabled: AtomicBool::new(false),
         generation: AtomicU64::new(0),
         live: RwLock::new(HashMap::new()),
-        known_addrs: RwLock::new(initial_addrs),
+        connecting: RwLock::new(HashSet::new()),
+        known_addrs: RwLock::new(HashMap::new()),
         discovered: RwLock::new(HashMap::new()),
         pairing_pin: Mutex::new(None),
         _mdns: mdns,
@@ -332,22 +334,29 @@ pub fn start_sync(app: AppHandle) -> Arc<SyncState> {
     let enabled = crate::settings::get_config_sync(app.clone())
         .map(|cfg| cfg.sync.enabled)
         .unwrap_or(false);
-    let debug_force_enable = std::env::var("COPI_SYNC_DEBUG_FORCE_ENABLE")
-        .ok()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    if enabled || debug_force_enable {
-        enable_runtime(app.clone(), sync.clone(), trusted_peers);
+    if enabled {
+        enable_runtime(app.clone(), sync.clone());
     }
 
     sync
 }
 
-fn enable_runtime(app: AppHandle, sync: Arc<SyncState>, trusted_peers: Vec<TrustedPeer>) {
+fn enable_runtime(app: AppHandle, sync: Arc<SyncState>) {
     sync.enabled.store(true, Ordering::SeqCst);
     let generation = sync.generation.fetch_add(1, Ordering::SeqCst) + 1;
     eprintln!("[Sync] Runtime enabled (generation={})", generation);
 
+    let peers_with_addrs = get_trusted_peers_with_addrs(&app).unwrap_or_default();
+    eprintln!("[Sync] Loaded {} trusted peers", peers_with_addrs.len());
+    let mut trusted_peers = Vec::new();
+    let mut addrs = HashMap::new();
+    for (device_id, display_name, last_addr) in peers_with_addrs {
+        eprintln!("[Sync]   - peer: {} ({}) addr={:?}", display_name, device_id, last_addr);
+        if let Some(addr) = last_addr {
+            addrs.insert(device_id.clone(), addr);
+        }
+        trusted_peers.push(TrustedPeer { device_id, display_name });
+    }
     {
         let app_clone = app.clone();
         let sync_clone = sync.clone();
@@ -360,7 +369,7 @@ fn enable_runtime(app: AppHandle, sync: Arc<SyncState>, trusted_peers: Vec<Trust
         let app_clone = app.clone();
         let sync_clone = sync.clone();
         tauri::async_runtime::spawn(async move {
-            run_browser(app_clone, sync_clone, trusted_peers, generation).await;
+            run_browser(app_clone, sync_clone, trusted_peers, addrs, generation).await;
         });
     }
 }
@@ -369,6 +378,7 @@ async fn disable_runtime(sync: Arc<SyncState>) {
     sync.enabled.store(false, Ordering::SeqCst);
     sync.generation.fetch_add(1, Ordering::SeqCst);
     sync.live.write().await.clear();
+    sync.connecting.write().await.clear();
     sync.known_addrs.write().await.clear();
     sync.discovered.write().await.clear();
     eprintln!("[Sync] Runtime disabled");
@@ -424,23 +434,30 @@ async fn run_browser(
     app: AppHandle,
     sync: Arc<SyncState>,
     trusted_peers: Vec<TrustedPeer>,
+    initial_addrs: HashMap<String, SocketAddr>,
     generation: u64,
 ) {
     eprintln!("[Sync] run_browser starting (generation={})", generation);
-    let Some(mdns) = sync._mdns.as_ref() else {
-        eprintln!("[Sync] mDNS unavailable; discovery/browser disabled");
-        return;
-    };
-    eprintln!("[Sync] Starting mDNS browse for service type: {}", SERVICE_TYPE);
-    let browse_rx = match mdns.browse(SERVICE_TYPE) {
-        Ok(rx) => {
-            eprintln!("[Sync] mDNS browse started successfully");
-            rx
+    {
+        let mut known = sync.known_addrs.write().await;
+        known.extend(initial_addrs);
+    }
+
+    let browse_rx = if let Some(mdns) = sync._mdns.as_ref() {
+        eprintln!("[Sync] Starting mDNS browse for service type: {}", SERVICE_TYPE);
+        match mdns.browse(SERVICE_TYPE) {
+            Ok(rx) => {
+                eprintln!("[Sync] mDNS browse started successfully");
+                Some(rx)
+            }
+            Err(error) => {
+                eprintln!("[Sync] Failed to start mDNS browse: {}", error);
+                None
+            }
         }
-        Err(error) => {
-            eprintln!("[Sync] Failed to start mDNS browse: {}", error);
-            return;
-        }
+    } else {
+        eprintln!("[Sync] mDNS unavailable; running direct-address fallback only");
+        None
     };
 
     eprintln!("[Sync] {} trusted peers to reconnect", trusted_peers.len());
@@ -455,34 +472,39 @@ async fn run_browser(
     }
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
-    std::thread::spawn(move || {
-        eprintln!("[Sync] mDNS event thread started");
-        while let Ok(event) = browse_rx.recv() {
-            eprintln!("[Sync] mDNS event received: {:?}", match &event {
-                ServiceEvent::ServiceResolved(info) => format!("Resolved: {}", info.get_fullname()),
-                ServiceEvent::ServiceRemoved(_, name) => format!("Removed: {}", name),
-                ServiceEvent::ServiceFound(_, name) => format!("Found: {}", name),
-                ServiceEvent::SearchStarted(_) => "SearchStarted".to_string(),
-                ServiceEvent::SearchStopped(_) => "SearchStopped".to_string(),
-            });
-            if event_tx.send(event).is_err() {
-                eprintln!("[Sync] mDNS event channel closed");
-                break;
+    if let Some(browse_rx) = browse_rx {
+        std::thread::spawn(move || {
+            eprintln!("[Sync] mDNS event thread started");
+            while let Ok(event) = browse_rx.recv() {
+                eprintln!("[Sync] mDNS event received: {:?}", match &event {
+                    ServiceEvent::ServiceResolved(info) => format!("Resolved: {}", info.get_fullname()),
+                    ServiceEvent::ServiceRemoved(_, name) => format!("Removed: {}", name),
+                    ServiceEvent::ServiceFound(_, name) => format!("Found: {}", name),
+                    ServiceEvent::SearchStarted(_) => "SearchStarted".to_string(),
+                    ServiceEvent::SearchStopped(_) => "SearchStopped".to_string(),
+                });
+                if event_tx.send(event).is_err() {
+                    eprintln!("[Sync] mDNS event channel closed");
+                    break;
+                }
             }
-        }
-        eprintln!("[Sync] mDNS event thread ending");
-    });
+            eprintln!("[Sync] mDNS event thread ending");
+        });
+    }
 
     loop {
         if !sync.is_enabled() || sync.current_generation() != generation {
             break;
         }
-        let event = match tokio::time::timeout(Duration::from_secs(1), event_rx.recv()).await {
-            Ok(Some(event)) => event,
-            Ok(None) => break,
-            Err(_) => continue,
+        let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv()).await;
+        let maybe_event = match event {
+            Ok(Some(event)) => Some(event),
+            Ok(None) => None,
+            Err(_) => None,
         };
-        match event {
+
+        if let Some(event) = maybe_event {
+            match event {
             ServiceEvent::ServiceResolved(info) => {
                 let full = info.get_fullname().to_string();
                 let mut peer_id = extract_peer_id(&full);
@@ -515,6 +537,7 @@ async fn run_browser(
                         .await
                         .insert(peer_id.clone(), peer_addr);
                 }
+                let _ = update_peer_address(&app, &peer_id, peer_addr);
 
                 let trusted = is_trusted_peer(&app, &peer_id).unwrap_or(false);
                 eprintln!(
@@ -556,11 +579,11 @@ async fn run_browser(
                 let peer_id = extract_peer_id(&fullname);
                 if !peer_id.is_empty() {
                     eprintln!("[Sync] mDNS removed peer={}", peer_id);
-                    sync.known_addrs.write().await.remove(&peer_id);
                     sync.discovered.write().await.remove(&peer_id);
                 }
             }
             _ => {}
+            }
         }
     }
 }
@@ -601,6 +624,9 @@ async fn connect_to_peer(app: AppHandle, sync: Arc<SyncState>, peer_id: String, 
         eprintln!("[Sync] connect_to_peer: sync disabled, not connecting to {}", peer_id);
         return;
     }
+    if !sync.try_begin_connect(&peer_id).await {
+        return;
+    }
     eprintln!("[Sync] Dialing peer={} addr={}", peer_id, addr);
     let stream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
         Ok(Ok(stream)) => {
@@ -609,19 +635,30 @@ async fn connect_to_peer(app: AppHandle, sync: Arc<SyncState>, peer_id: String, 
         }
         Ok(Err(error)) => {
             eprintln!("[Sync] Failed to connect to {} at {}: {}", peer_id, addr, error);
+            sync.end_connect(&peer_id).await;
             return;
         }
         Err(_) => {
             eprintln!("[Sync] Connect timeout to {} at {}", peer_id, addr);
+            sync.end_connect(&peer_id).await;
             return;
         }
     };
 
     eprintln!("[Sync] Starting session with peer={} as initiator", peer_id);
-    match handle_connection(app, sync, stream, true, Some(peer_id.clone())).await {
+    match handle_connection(app, sync.clone(), stream, true, Some(peer_id.clone())).await {
         Ok(()) => eprintln!("[Sync] Session with {} ended normally", peer_id),
         Err(e) => eprintln!("[Sync] Session with {} ended with error: {}", peer_id, e),
     }
+    // Allow future reconnect attempts
+    // (this also runs after successful sessions end)
+    //
+    // Note: non-initiator sessions are not tracked in `connecting`.
+    // This only guards outbound dial storms.
+    //
+    // We intentionally keep this here rather than in `handle_connection`
+    // because `connect_to_peer` is the owner of outbound connect state.
+    sync.end_connect(&peer_id).await;
 }
 
 async fn handle_connection(
@@ -651,7 +688,10 @@ async fn run_session(
         return Err(anyhow!("sync disabled"));
     }
     // Get peer address before splitting the stream
-    let peer_addr = stream.peer_addr().ok();
+    let peer_addr = stream
+        .peer_addr()
+        .ok()
+        .map(|addr| SocketAddr::new(addr.ip(), SYNC_PORT));
     stream.set_nodelay(true).ok();
     let (read_half, write_half) = stream.into_split();
     let writer = PeerWriter(Arc::new(AsyncMutex::new(write_half)));
@@ -685,6 +725,9 @@ async fn run_session(
             if sync.verify_pin(&pin) {
                 eprintln!("[Sync] Pair request accepted from {} ({})", device_name, device_id);
                 save_trusted_peer(&app, &device_id, &device_name)?;
+                if let Some(addr) = peer_addr {
+                    let _ = update_peer_address(&app, &device_id, addr);
+                }
                 sync.clear_pin();
                 writer
                     .send(&Msg::PairAccept {
@@ -1153,11 +1196,13 @@ pub fn update_peer_address(app: &AppHandle, device_id: &str, addr: SocketAddr) -
         .lock()
         .map_err(|e| anyhow!("lock poisoned: {}", e))?;
     let addr_str = addr.to_string();
-    conn.execute(
+    let rows = conn.execute(
         "UPDATE sync_peers SET last_addr = ?1, last_seen = ?2 WHERE device_id = ?3",
         rusqlite::params![addr_str, now_ts(), device_id],
     )?;
-    eprintln!("[Sync] Updated peer address: device_id={} addr={}", device_id, addr_str);
+    if rows > 0 {
+        eprintln!("[Sync] Updated peer address: device_id={} addr={}", device_id, addr_str);
+    }
     Ok(())
 }
 
@@ -1648,6 +1693,11 @@ pub async fn sync_pair_with(
             device_name,
         } => {
             save_trusted_peer(&app, &device_id, &device_name).map_err(|e| e.to_string())?;
+            let _ = update_peer_address(&app, &device_id, SocketAddr::new(addr.ip(), SYNC_PORT));
+            sync.known_addrs
+                .write()
+                .await
+                .insert(device_id.clone(), SocketAddr::new(addr.ip(), SYNC_PORT));
             let _ = app.emit(
                 "sync:paired",
                 PairedEvent {
@@ -1731,73 +1781,6 @@ pub async fn sync_list_discovered(app: AppHandle) -> Result<Vec<DiscoveredPeer>,
     Ok(values)
 }
 
-/// Debug command to manually add a trusted peer (for testing when mDNS doesn't work)
-#[tauri::command]
-pub async fn sync_add_peer_manual(
-    app: AppHandle,
-    device_id: String,
-    display_name: String,
-    addr: String,
-) -> Result<(), String> {
-    eprintln!("[Sync] Manual add peer: device_id={} name={} addr={}", device_id, display_name, addr);
-    save_trusted_peer(&app, &device_id, &display_name).map_err(|e| e.to_string())?;
-    
-    // Also store the address so we can connect
-    if let Some(sync) = app.state::<AppState>().sync.get() {
-        if let Ok(socket_addr) = parse_target_addr(&addr) {
-            // Save to database for persistence
-            if let Err(e) = update_peer_address(&app, &device_id, socket_addr) {
-                eprintln!("[Sync] Failed to persist peer address: {}", e);
-            }
-            
-            sync.known_addrs.write().await.insert(device_id.clone(), socket_addr);
-            eprintln!("[Sync] Stored address for peer: {}", socket_addr);
-            
-            // Try to connect immediately
-            let app_clone = app.clone();
-            let sync_clone = sync.clone();
-            tauri::async_runtime::spawn(async move {
-                connect_to_peer(app_clone, sync_clone, device_id, socket_addr).await;
-            });
-        }
-    }
-    Ok(())
-}
-
-/// Debug command to manually trigger connection to a peer by IP
-#[tauri::command]
-pub async fn sync_connect_to_ip(
-    app: AppHandle,
-    addr: String,
-) -> Result<(), String> {
-    eprintln!("[Sync] Manual connect to: {}", addr);
-    let state = app.state::<AppState>();
-    let sync = state
-        .sync
-        .get()
-        .cloned()
-        .ok_or_else(|| "sync not initialized".to_string())?;
-    if !sync.is_enabled() {
-        return Err("sync is disabled".to_string());
-    }
-    
-    let socket_addr = parse_target_addr(&addr).map_err(|e| e.to_string())?;
-    
-    // Connect and send a Hello to discover the peer's device_id
-    let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(socket_addr))
-        .await
-        .map_err(|_| "connect timeout".to_string())
-        .and_then(|r| r.map_err(|e| e.to_string()))?;
-    
-    // Let the session handle the rest
-    let app_clone = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let _ = handle_connection(app_clone, sync, stream, true, None).await;
-    });
-    
-    Ok(())
-}
-
 pub fn next_sync_version(app: &AppHandle) -> i64 {
     let state = app.state::<AppState>();
     let conn = match state.db_write.lock() {
@@ -1840,8 +1823,7 @@ pub fn apply_config_change(
     }
 
     if is_enabled {
-        let trusted_peers = get_trusted_peers(app).unwrap_or_default();
-        enable_runtime(app.clone(), sync, trusted_peers);
+        enable_runtime(app.clone(), sync);
     } else {
         tauri::async_runtime::spawn(async move {
             disable_runtime(sync).await;

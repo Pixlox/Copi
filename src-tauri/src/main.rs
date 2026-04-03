@@ -596,8 +596,6 @@ fn main() {
             sync::sync_generate_pin,
             sync::sync_pair_with,
             sync::sync_remove_peer,
-            sync::sync_add_peer_manual,
-            sync::sync_connect_to_ip,
             collections::create_collection,
             collections::delete_collection,
             collections::rename_collection,
