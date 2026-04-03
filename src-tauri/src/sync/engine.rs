@@ -1752,7 +1752,7 @@ pub async fn sync_list_discovered_devices(
 pub async fn sync_start_pairing(app: tauri::AppHandle) -> Result<SyncPairingCodePayload, String> {
     let pin: String = {
         let mut rng = rand::thread_rng();
-        format!("{:06}", rng.gen_range(0u32..1_000_000))
+        format!("{:04}", rng.gen_range(0u32..10_000))
     };
     let expires_at = now_ts() + 120;
 
@@ -1873,8 +1873,7 @@ fn ensure_windows_firewall_rules(listen_port: u16) {
         mdns_rule = mdns_rule
     );
 
-    let encoded: String = script.encode_utf16().flat_map(|u| u.to_le_bytes()).map(|b| b as char).collect();
-    // Proper base64 encode of UTF-16LE
+    // PowerShell -EncodedCommand expects UTF-16LE bytes encoded as base64.
     let utf16_bytes: Vec<u8> = script.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
     let b64 = B64.encode(&utf16_bytes);
 
@@ -1890,7 +1889,27 @@ fn ensure_windows_firewall_rules(listen_port: u16) {
             if (stderr.contains("Access is denied") || stderr.contains("System Error 5"))
                 && !ELEVATION_ATTEMPTED.swap(true, Ordering::SeqCst)
             {
-                eprintln!("[Sync] Firewall needs elevation, skipping (UAC prompt may be shown)");
+                let elevate_cmd = format!(
+                    "Start-Process PowerShell -Verb RunAs -ArgumentList '-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {}'",
+                    b64
+                );
+                match Command::new("powershell")
+                    .args(["-NoProfile", "-NonInteractive", "-Command", &elevate_cmd])
+                    .status()
+                {
+                    Ok(status) if status.success() => {
+                        eprintln!("[Sync] Requested firewall elevation via UAC prompt");
+                    }
+                    Ok(status) => {
+                        eprintln!(
+                            "[Sync] Firewall elevation command exited with status {}",
+                            status
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("[Sync] Failed to request firewall elevation: {}", e);
+                    }
+                }
             }
         }
         Err(e) => {
@@ -1917,9 +1936,9 @@ mod tests {
     fn pin_generation_format() {
         let pin: String = {
             let mut rng = rand::thread_rng();
-            format!("{:06}", rng.gen_range(0u32..1_000_000))
+            format!("{:04}", rng.gen_range(0u32..10_000))
         };
-        assert_eq!(pin.len(), 6);
+        assert_eq!(pin.len(), 4);
         assert!(pin.chars().all(|c| c.is_ascii_digit()));
     }
 
