@@ -1821,13 +1821,7 @@ pub async fn sync_list_discovered(app: AppHandle) -> Result<Vec<DiscoveredPeer>,
     Ok(values)
 }
 
-pub fn next_sync_version(app: &AppHandle) -> i64 {
-    let state = app.state::<AppState>();
-    let conn = match state.db_write.lock() {
-        Ok(conn) => conn,
-        Err(_) => return 0,
-    };
-
+pub fn next_sync_version_from_conn(conn: &rusqlite::Connection) -> i64 {
     let current: i64 = conn
         .query_row(
             "SELECT COALESCE(value, '0') FROM settings WHERE key = 'sync_version'",

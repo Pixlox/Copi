@@ -889,7 +889,7 @@ fn insert_clip(
     let icon = fetch_app_icon(&state, source_app);
     let conn = state.db_write.lock().unwrap();
     let sync_id = uuid::Uuid::new_v4().to_string();
-    let sync_version = sync::next_sync_version(app);
+    let sync_version = sync::next_sync_version_from_conn(&conn);
     let origin_device_id: Option<String> = conn
         .query_row("SELECT device_id FROM device_info LIMIT 1", [], |row| {
             row.get(0)
@@ -976,7 +976,7 @@ fn insert_image_clip(
 
     let conn = state.db_write.lock().unwrap();
     let sync_id = uuid::Uuid::new_v4().to_string();
-    let sync_version = sync::next_sync_version(app);
+    let sync_version = sync::next_sync_version_from_conn(&conn);
     let origin_device_id: Option<String> = conn
         .query_row("SELECT device_id FROM device_info LIMIT 1", [], |row| {
             row.get(0)

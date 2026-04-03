@@ -135,9 +135,10 @@ pub async fn get_search_status(app: tauri::AppHandle) -> Result<SearchStatusPayl
 pub async fn toggle_pin(app: tauri::AppHandle, clip_id: i64) -> Result<(), String> {
     let state = app.state::<AppState>();
     let conn = state.db_write.lock().map_err(|e| e.to_string())?;
+    let sync_version = sync::next_sync_version_from_conn(&conn);
     let updated = conn.execute(
         "UPDATE clips SET pinned = CASE WHEN pinned = 1 THEN 0 ELSE 1 END, sync_version = ?1 WHERE id = ?2 AND deleted = 0",
-        rusqlite::params![sync::next_sync_version(&app), clip_id],
+        rusqlite::params![sync_version, clip_id],
     )
     .map_err(|e| e.to_string())?;
     let mut sync_key: Option<String> = None;
@@ -165,7 +166,7 @@ pub async fn toggle_pin(app: tauri::AppHandle, clip_id: i64) -> Result<(), Strin
 pub async fn delete_clip(app: tauri::AppHandle, clip_id: i64) -> Result<(), String> {
     let state = app.state::<AppState>();
     let conn = state.db_write.lock().map_err(|e| e.to_string())?;
-    let sync_version = sync::next_sync_version(&app);
+    let sync_version = sync::next_sync_version_from_conn(&conn);
     conn.execute("DELETE FROM clip_embeddings WHERE rowid = ?", [clip_id])
         .ok();
     let updated = conn
@@ -221,7 +222,7 @@ pub async fn update_clip_content(
     let detected_language = query_parser::detect_language(&new_content).map(str::to_string);
     let state = app.state::<AppState>();
     let conn = state.db_write.lock().map_err(|e| e.to_string())?;
-    let sync_version = sync::next_sync_version(&app);
+    let sync_version = sync::next_sync_version_from_conn(&conn);
     let updated = conn.execute(
         "UPDATE clips
          SET content = ?1, content_hash = ?2, content_type = ?3, language = COALESCE(?5, language), sync_version = ?6

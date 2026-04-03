@@ -300,8 +300,8 @@ pub async fn get_db_size(app: tauri::AppHandle) -> Result<u64, String> {
 pub async fn clear_all_history(app: tauri::AppHandle) -> Result<(), String> {
     let state = app.state::<crate::AppState>();
     let mut conn = state.db_write.lock().map_err(|e| e.to_string())?;
+    let sync_version = sync::next_sync_version_from_conn(&conn);
     let tx = conn.transaction().map_err(|e| e.to_string())?;
-    let sync_version = sync::next_sync_version(&app);
     tx.execute(
         "UPDATE clips SET deleted = 1, sync_version = ?1 WHERE deleted = 0",
         rusqlite::params![sync_version],

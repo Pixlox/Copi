@@ -845,7 +845,7 @@ pub(crate) fn cleanup_old_clips(app: &tauri::AppHandle) {
     ) else {
         return;
     };
-    let sync_version = sync::next_sync_version(app);
+    let sync_version = sync::next_sync_version_from_conn(&conn);
     let Ok(count) = conn.execute(
         "UPDATE clips SET deleted = 1, sync_version = ?1 WHERE created_at < ?2 AND pinned = 0 AND deleted = 0",
         rusqlite::params![sync_version, cutoff],

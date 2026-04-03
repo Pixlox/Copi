@@ -25,7 +25,7 @@ pub fn create_collection(
     let conn = state.db_write.lock().map_err(|e| e.to_string())?;
     let now = chrono::Utc::now().timestamp();
     let sync_id = uuid::Uuid::new_v4().to_string();
-    let sync_version = sync::next_sync_version(&app);
+    let sync_version = sync::next_sync_version_from_conn(&conn);
     let origin_device_id: Option<String> = conn
         .query_row("SELECT device_id FROM device_info LIMIT 1", [], |row| {
             row.get(0)
@@ -51,7 +51,7 @@ pub fn delete_collection(app: tauri::AppHandle, id: i64) -> Result<(), String> {
         .ok_or_else(|| "App state not ready yet".to_string())?;
     let conn = state.db_write.lock().map_err(|e| e.to_string())?;
 
-    let sync_version = sync::next_sync_version(&app);
+    let sync_version = sync::next_sync_version_from_conn(&conn);
 
     conn.execute(
         "UPDATE clips SET collection_id = NULL, sync_version = ?1 WHERE collection_id = ?2 AND deleted = 0",
@@ -80,7 +80,7 @@ pub fn rename_collection(app: tauri::AppHandle, id: i64, name: String) -> Result
         .try_state::<AppState>()
         .ok_or_else(|| "App state not ready yet".to_string())?;
     let conn = state.db_write.lock().map_err(|e| e.to_string())?;
-    let sync_version = sync::next_sync_version(&app);
+    let sync_version = sync::next_sync_version_from_conn(&conn);
     let updated = conn
         .execute(
             "UPDATE collections SET name = ?1, sync_version = ?2 WHERE id = ?3 AND deleted = 0",
@@ -139,7 +139,7 @@ pub fn update_collection_color(
         .try_state::<AppState>()
         .ok_or_else(|| "App state not ready yet".to_string())?;
     let conn = state.db_write.lock().map_err(|e| e.to_string())?;
-    let sync_version = sync::next_sync_version(&app);
+    let sync_version = sync::next_sync_version_from_conn(&conn);
     let updated = conn
         .execute(
             "UPDATE collections SET color = ?1, sync_version = ?2 WHERE id = ?3 AND deleted = 0",
@@ -165,7 +165,7 @@ pub fn move_clip_to_collection(
         .try_state::<AppState>()
         .ok_or_else(|| "App state not ready yet".to_string())?;
     let conn = state.db_write.lock().map_err(|e| e.to_string())?;
-    let sync_version = sync::next_sync_version(&app);
+    let sync_version = sync::next_sync_version_from_conn(&conn);
     let updated = conn
         .execute(
             "UPDATE clips SET collection_id = ?1, sync_version = ?2 WHERE id = ?3 AND deleted = 0",
