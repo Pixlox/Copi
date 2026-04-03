@@ -125,8 +125,11 @@ impl SyncState {
 
     pub async fn push_clip(&self, clip: WireClip) -> Result<()> {
         if !self.is_enabled() {
+            eprintln!("[Sync] push_clip: sync disabled");
             return Ok(());
         }
+        let peer_count = self.live.read().await.len();
+        eprintln!("[Sync] push_clip: broadcasting to {} peers, hash={}", peer_count, clip.hash);
         self.broadcast(Msg::ClipPush { clip }).await
     }
 
@@ -560,11 +563,15 @@ async fn reconnect_loop(
 
 async fn connect_to_peer(app: AppHandle, sync: Arc<SyncState>, peer_id: String, addr: SocketAddr) {
     if !sync.is_enabled() {
+        eprintln!("[Sync] connect_to_peer: sync disabled, not connecting to {}", peer_id);
         return;
     }
     eprintln!("[Sync] Dialing peer={} addr={}", peer_id, addr);
     let stream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
-        Ok(Ok(stream)) => stream,
+        Ok(Ok(stream)) => {
+            eprintln!("[Sync] TCP connected to peer={} addr={}", peer_id, addr);
+            stream
+        }
         Ok(Err(error)) => {
             eprintln!("[Sync] Failed to connect to {} at {}: {}", peer_id, addr, error);
             return;
@@ -575,7 +582,11 @@ async fn connect_to_peer(app: AppHandle, sync: Arc<SyncState>, peer_id: String, 
         }
     };
 
-    let _ = handle_connection(app, sync, stream, true, Some(peer_id)).await;
+    eprintln!("[Sync] Starting session with peer={} as initiator", peer_id);
+    match handle_connection(app, sync, stream, true, Some(peer_id.clone())).await {
+        Ok(()) => eprintln!("[Sync] Session with {} ended normally", peer_id),
+        Err(e) => eprintln!("[Sync] Session with {} ended with error: {}", peer_id, e),
+    }
 }
 
 async fn handle_connection(
@@ -721,7 +732,7 @@ async fn run_session(
     }
 
     sync.register_peer(peer_id.clone(), writer.clone()).await;
-    eprintln!("[Sync] Session connected peer={} name={}", peer_id, peer_name);
+    eprintln!("[Sync] Session connected peer={} name={} (now registered)", peer_id, peer_name);
     let _ = app.emit(
         "sync:connected",
         PairedEvent {
@@ -731,9 +742,12 @@ async fn run_session(
     );
 
     let peer_cursor = peer_cursors.get(&sync.device_id).copied().unwrap_or(0);
+    eprintln!("[Sync] Peer {} has cursor {} for our device {}", peer_id, peer_cursor, sync.device_id);
     let delta = get_clips_since(&app, &sync.device_id, peer_cursor)?;
+    eprintln!("[Sync] Sending {} clips to peer {} (since cursor {})", delta.len(), peer_id, peer_cursor);
     if !delta.is_empty() {
         writer.send(&Msg::ClipBatch { clips: delta }).await?;
+        eprintln!("[Sync] Sent clip batch to peer {}", peer_id);
     }
 
     let mut ping = tokio::time::interval(PING_INTERVAL);
@@ -826,20 +840,26 @@ async fn handle_message(
 async fn receive_clips(
     app: &AppHandle,
     sync: &Arc<SyncState>,
-    _peer_id: &str,
+    peer_id: &str,
     writer: &PeerWriter,
     clips: Vec<WireClip>,
 ) -> Result<()> {
+    eprintln!("[Sync] Receiving {} clips from peer {}", clips.len(), peer_id);
     if !sync.is_enabled() {
+        eprintln!("[Sync] Sync disabled, ignoring incoming clips");
         return Ok(());
     }
     let mut max_by_source: HashMap<String, i64> = HashMap::new();
     let mut inserted_any = false;
+    let mut insert_count = 0;
 
     for clip in clips {
         if clip.source_device.is_empty() || clip.source_device == sync.device_id {
+            eprintln!("[Sync] Skipping clip from self or empty source: hash={}", clip.hash);
             continue;
         }
+
+        eprintln!("[Sync] Processing clip: hash={} kind={} source={}", clip.hash, clip.kind, clip.source_device);
 
         max_by_source
             .entry(clip.source_device.clone())
@@ -877,13 +897,17 @@ async fn receive_clips(
 
             if rows > 0 {
                 inserted_any = true;
+                insert_count += 1;
                 let clip_id = conn.last_insert_rowid();
+                eprintln!("[Sync] Inserted clip id={} hash={}", clip_id, clip.hash);
                 if let Err(error) = state.clip_tx.try_send(clip_id) {
                     eprintln!(
                         "[Sync][debug] embed queue full/dropped for clip {}: {}",
                         clip_id, error
                     );
                 }
+            } else {
+                eprintln!("[Sync] Clip already exists or ignored: hash={}", clip.hash);
             }
 
             if clip.kind == "image" {
@@ -920,8 +944,10 @@ async fn receive_clips(
     }
 
     if inserted_any {
-        eprintln!("[Sync] Applied incoming clips and emitted new-clip");
+        eprintln!("[Sync] Applied {} incoming clips from peer {} and emitted new-clip", insert_count, peer_id);
         let _ = app.emit("new-clip", ());
+    } else {
+        eprintln!("[Sync] No new clips inserted from peer {}", peer_id);
     }
 
     Ok(())
@@ -1037,22 +1063,26 @@ pub fn is_trusted_peer(app: &AppHandle, device_id: &str) -> Result<bool> {
             |row| row.get(0),
         )
         .optional()?;
-    Ok(exists.is_some())
+    let is_trusted = exists.is_some();
+    eprintln!("[Sync] is_trusted_peer device_id={} result={}", device_id, is_trusted);
+    Ok(is_trusted)
 }
 
 pub fn save_trusted_peer(app: &AppHandle, device_id: &str, display_name: &str) -> Result<()> {
+    eprintln!("[Sync] Saving trusted peer: device_id={} display_name={}", device_id, display_name);
     let state = app.state::<AppState>();
     let conn = state
         .db_write
         .lock()
         .map_err(|e| anyhow!("lock poisoned: {}", e))?;
-    conn.execute(
+    let rows = conn.execute(
         "INSERT INTO sync_peers(device_id, display_name, last_seen)
          VALUES (?1, ?2, ?3)
          ON CONFLICT(device_id)
          DO UPDATE SET display_name = excluded.display_name, last_seen = excluded.last_seen",
         rusqlite::params![device_id, display_name, now_ts()],
     )?;
+    eprintln!("[Sync] Saved trusted peer rows_affected={}", rows);
     Ok(())
 }
 
