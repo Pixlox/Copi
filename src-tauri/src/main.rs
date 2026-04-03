@@ -591,13 +591,13 @@ fn main() {
             settings::set_config,
             settings::get_db_size,
             settings::clear_all_history,
-            sync::sync_get_status,
-            sync::sync_list_paired_devices,
-            sync::sync_unpair_device,
-            sync::sync_pair_device_manual,
-            sync::sync_list_discovered_devices,
-            sync::sync_start_pairing,
-            sync::sync_pair_with_code,
+            sync::engine::sync_get_status,
+            sync::engine::sync_list_paired_devices,
+            sync::engine::sync_unpair_device,
+            sync::engine::sync_pair_device_manual,
+            sync::engine::sync_list_discovered_devices,
+            sync::engine::sync_start_pairing,
+            sync::engine::sync_pair_with_code,
             collections::create_collection,
             collections::delete_collection,
             collections::rename_collection,
@@ -844,7 +844,7 @@ pub(crate) fn cleanup_old_clips(app: &tauri::AppHandle) {
     ) else {
         return;
     };
-    let sync_version = sync::engine::SyncEngine::next_sync_version(&conn).unwrap_or(0);
+    let sync_version = sync::next_sync_version(app);
     let Ok(count) = conn.execute(
         "UPDATE clips SET deleted = 1, sync_version = ?1 WHERE created_at < ?2 AND pinned = 0 AND deleted = 0",
         rusqlite::params![sync_version, cutoff],
@@ -852,19 +852,6 @@ pub(crate) fn cleanup_old_clips(app: &tauri::AppHandle) {
         return;
     };
     if count > 0 {
-        if let Ok(mut stmt) =
-            conn.prepare("SELECT sync_id FROM clips WHERE deleted = 1 AND sync_version = ?1")
-        {
-            let ids: Vec<String> = stmt
-                .query_map([sync_version], |r| r.get(0))
-                .ok()
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default();
-            drop(stmt);
-            for id in ids {
-                sync::runtime::queue_clip_sync_change(app, id);
-            }
-        }
         eprintln!("[Cleanup] Removed {} old clips", count);
     }
 }

@@ -716,6 +716,7 @@ dependencies = [
  "digest",
  "hex",
  "hostname",
+ "if-addrs",
  "mdns-sd",
  "objc2",
  "objc2-app-kit",

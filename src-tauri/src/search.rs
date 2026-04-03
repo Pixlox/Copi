@@ -1,5 +1,5 @@
 use crate::query_parser::{self, Ordering, ParsedQuery};
-use crate::sync::runtime;
+use crate::sync;
 use crate::AppState;
 use rusqlite::{OptionalExtension, ToSql};
 use serde::{Deserialize, Serialize};
@@ -137,7 +137,7 @@ pub async fn toggle_pin(app: tauri::AppHandle, clip_id: i64) -> Result<(), Strin
     let conn = state.db_write.lock().map_err(|e| e.to_string())?;
     let updated = conn.execute(
         "UPDATE clips SET pinned = CASE WHEN pinned = 1 THEN 0 ELSE 1 END, sync_version = ?1 WHERE id = ?2 AND deleted = 0",
-        rusqlite::params![crate::sync::engine::SyncEngine::next_sync_version(&conn).unwrap_or(0), clip_id],
+        rusqlite::params![sync::next_sync_version(&app), clip_id],
     )
     .map_err(|e| e.to_string())?;
     if updated > 0 {
@@ -146,7 +146,7 @@ pub async fn toggle_pin(app: tauri::AppHandle, clip_id: i64) -> Result<(), Strin
                 r.get::<_, String>(0)
             })
         {
-            runtime::queue_clip_sync_change(&app, sync_id);
+            sync::on_local_clip_saved(&app, &sync_id);
         }
     }
     drop(conn);
@@ -158,7 +158,7 @@ pub async fn toggle_pin(app: tauri::AppHandle, clip_id: i64) -> Result<(), Strin
 pub async fn delete_clip(app: tauri::AppHandle, clip_id: i64) -> Result<(), String> {
     let state = app.state::<AppState>();
     let conn = state.db_write.lock().map_err(|e| e.to_string())?;
-    let sync_version = crate::sync::engine::SyncEngine::next_sync_version(&conn).unwrap_or(0);
+    let sync_version = sync::next_sync_version(&app);
     conn.execute("DELETE FROM clip_embeddings WHERE rowid = ?", [clip_id])
         .ok();
     let updated = conn
@@ -173,7 +173,7 @@ pub async fn delete_clip(app: tauri::AppHandle, clip_id: i64) -> Result<(), Stri
                 r.get::<_, String>(0)
             })
         {
-            runtime::queue_clip_sync_change(&app, sync_id);
+            sync::on_local_clip_saved(&app, &sync_id);
         }
     }
     drop(conn);
@@ -207,7 +207,7 @@ pub async fn update_clip_content(
     let detected_language = query_parser::detect_language(&new_content).map(str::to_string);
     let state = app.state::<AppState>();
     let conn = state.db_write.lock().map_err(|e| e.to_string())?;
-    let sync_version = crate::sync::engine::SyncEngine::next_sync_version(&conn).unwrap_or(0);
+    let sync_version = sync::next_sync_version(&app);
     let updated = conn.execute(
         "UPDATE clips
          SET content = ?1, content_hash = ?2, content_type = ?3, language = COALESCE(?5, language), sync_version = ?6
@@ -228,7 +228,7 @@ pub async fn update_clip_content(
                 r.get::<_, String>(0)
             })
         {
-            runtime::queue_clip_sync_change(&app, sync_id);
+            sync::on_local_clip_saved(&app, &sync_id);
         }
     }
     drop(conn);

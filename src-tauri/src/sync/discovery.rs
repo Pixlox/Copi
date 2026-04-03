@@ -1,7 +1,6 @@
-//! mDNS Service Discovery
+//! mDNS Service Discovery for Copi sync.
 //!
-//! Uses mDNS to discover other Copi instances on the local network.
-//! Service type: `_copi._tcp.local.`
+//! Advertises this device and browses for peers on the local network.
 
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use std::collections::HashMap;
@@ -12,236 +11,199 @@ use std::thread;
 use std::time::Duration;
 use tokio::sync::broadcast;
 
-use super::device::{DeviceInfo, Platform};
-use super::{SyncError, SyncResult};
-
-/// mDNS service type for Copi
 const SERVICE_TYPE: &str = "_copi._tcp.local.";
-
-/// Default port for sync connections
-pub const DEFAULT_SYNC_PORT: u16 = 47524; // "COPI" on phone keypad (2674) + offset
-
-/// Maximum retries for mDNS browse on disconnect before giving up
-const BROWSE_MAX_RETRIES: u32 = 3;
-
-/// Delay between browse retry attempts
 const BROWSE_RETRY_DELAY: Duration = Duration::from_secs(2);
 
-/// Discovered device on the network
 #[derive(Debug, Clone)]
 pub struct DiscoveredDevice {
     pub device_id: String,
     pub device_name: String,
-    pub platform: Platform,
+    pub platform: String,
+    pub public_key: Vec<u8>,
     pub addresses: Vec<IpAddr>,
     pub port: u16,
 }
 
-/// Discovery service for finding peers on the network
+#[derive(Debug, Clone)]
+pub enum DiscoveryEvent {
+    DeviceFound(DiscoveredDevice),
+    DeviceUpdated(DiscoveredDevice),
+    DeviceLost(String),
+}
+
 pub struct DiscoveryService {
     daemon: ServiceDaemon,
     our_device_id: String,
     discovered: Arc<RwLock<HashMap<String, DiscoveredDevice>>>,
     event_tx: broadcast::Sender<DiscoveryEvent>,
     service_name: String,
-    stopped: AtomicBool,
-}
-
-/// Events from the discovery service
-#[derive(Debug, Clone)]
-pub enum DiscoveryEvent {
-    /// New device discovered
-    DeviceFound(DiscoveredDevice),
-    /// Device went offline
-    DeviceLost(String),
-    /// Device info updated (e.g., IP changed)
-    DeviceUpdated(DiscoveredDevice),
+    stopped: Arc<AtomicBool>,
 }
 
 impl DiscoveryService {
-    /// Create a new discovery service
-    pub fn new(device_info: &DeviceInfo) -> SyncResult<Self> {
-        let daemon = ServiceDaemon::new()
-            .map_err(|e| SyncError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-
-        let (event_tx, _) = broadcast::channel(100);
-        let service_name = format!("copi-{}", &device_info.device_id[..8]);
+    pub fn new(
+        device_id: &str,
+        _device_name: &str,
+        _platform: &str,
+        _public_key: &[u8],
+    ) -> Result<Self, String> {
+        let daemon = ServiceDaemon::new().map_err(|e| format!("mDNS daemon failed: {}", e))?;
+        let (event_tx, _) = broadcast::channel(64);
+        let service_name = format!("copi-{}", &device_id[..8.min(device_id.len())]);
 
         Ok(Self {
             daemon,
-            our_device_id: device_info.device_id.clone(),
+            our_device_id: device_id.to_string(),
             discovered: Arc::new(RwLock::new(HashMap::new())),
             event_tx,
             service_name,
-            stopped: AtomicBool::new(false),
+            stopped: Arc::new(AtomicBool::new(false)),
         })
     }
 
-    /// Start advertising this device and browsing for others
-    pub fn start(&self, device_info: &DeviceInfo, port: u16) -> SyncResult<()> {
-        // Register our service
-        self.register_service(device_info, port)?;
-
-        // Start browsing for other services
+    pub fn start(
+        &self,
+        port: u16,
+        device_name: &str,
+        platform: &str,
+        public_key: &[u8],
+    ) -> Result<(), String> {
+        self.register_service(port, device_name, platform, public_key)?;
         self.browse()?;
-
         Ok(())
     }
 
-    /// Register this device as an mDNS service
-    fn register_service(&self, device_info: &DeviceInfo, port: u16) -> SyncResult<()> {
-        let platform_str = match device_info.platform {
-            Platform::MacOS => "macos",
-            Platform::Windows => "windows",
-            Platform::Linux => "linux",
-            Platform::Unknown => "unknown",
-        };
-
-        // Encode public key as base64 for TXT record
-        let public_key_b64 = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            &device_info.public_key,
-        );
+    fn register_service(
+        &self,
+        port: u16,
+        device_name: &str,
+        platform: &str,
+        public_key: &[u8],
+    ) -> Result<(), String> {
+        let public_key_b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, public_key);
 
         let properties = [
-            ("id", device_info.device_id.as_str()),
-            ("name", device_info.device_name.as_str()),
-            ("platform", platform_str),
+            ("id", self.our_device_id.as_str()),
+            ("name", device_name),
+            ("platform", platform),
             ("pubkey", &public_key_b64),
-            ("version", "1"),
+            ("version", "2"),
         ];
 
         let service = ServiceInfo::new(
             SERVICE_TYPE,
             &self.service_name,
             &format!("{}.local.", self.service_name),
-            (), // Empty IPs, will be auto-filled by enable_addr_auto()
+            (),
             port,
             &properties[..],
         )
-        .map_err(|e| SyncError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)))?
-        .enable_addr_auto(); // Auto-fill host IPs from network interfaces
+        .map_err(|e| format!("ServiceInfo build failed: {}", e))?
+        .enable_addr_auto();
 
         self.daemon
             .register(service)
-            .map_err(|e| SyncError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            .map_err(|e| format!("mDNS register failed: {}", e))?;
 
         eprintln!(
             "[Sync] Registered mDNS service: {} on port {}",
             self.service_name, port
         );
-
         Ok(())
     }
 
-    /// Browse for other Copi services on the network.
-    /// The browse thread automatically retries on disconnect (up to
-    /// BROWSE_MAX_RETRIES) to handle transient network interface changes.
-    fn browse(&self) -> SyncResult<()> {
+    fn browse(&self) -> Result<(), String> {
         let daemon = self.daemon.clone();
         let discovered = self.discovered.clone();
         let event_tx = self.event_tx.clone();
         let our_device_id = self.our_device_id.clone();
+        let stopped = self.stopped.clone();
 
-        // Use std::thread for the blocking mDNS receiver (crossbeam channel)
         thread::Builder::new()
-            .name("mdns-browse".to_string())
-            .spawn(move || {
-                let mut retries = 0u32;
+            .name("mdns-browse".into())
+            .spawn(move || loop {
+                if stopped.load(Ordering::SeqCst) {
+                    break;
+                }
+                let receiver = match daemon.browse(SERVICE_TYPE) {
+                    Ok(r) => r,
+                    Err(_) => {
+                        thread::sleep(BROWSE_RETRY_DELAY);
+                        continue;
+                    }
+                };
 
                 loop {
-                    let receiver = match daemon.browse(SERVICE_TYPE) {
-                        Ok(r) => {
-                            // Successful browse resets the retry counter
-                            retries = 0;
-                            r
+                    match receiver.recv() {
+                        Ok(event) => {
+                            Self::handle_event(&event, &discovered, &event_tx, &our_device_id);
                         }
-                        Err(e) => {
-                            eprintln!("[Sync] mDNS browse start failed: {:?}", e);
-                            retries += 1;
-                            if retries > BROWSE_MAX_RETRIES {
-                                eprintln!("[Sync] mDNS browse retries exhausted, giving up");
-                                break;
-                            }
-                            thread::sleep(BROWSE_RETRY_DELAY);
-                            continue;
-                        }
-                    };
-
-                    // Process events until the channel disconnects
-                    loop {
-                        match receiver.recv() {
-                            Ok(event) => {
-                                Self::handle_discovery_event(
-                                    event,
-                                    &discovered,
-                                    &event_tx,
-                                    &our_device_id,
-                                );
-                            }
-                            Err(_) => {
-                                // Channel disconnected (network interface change, daemon restart)
-                                break;
-                            }
-                        }
+                        Err(_) => break,
                     }
-
-                    retries += 1;
-                    if retries > BROWSE_MAX_RETRIES {
-                        eprintln!(
-                            "[Sync] mDNS browse disconnected {} times, giving up",
-                            retries
-                        );
-                        break;
-                    }
-
-                    eprintln!(
-                        "[Sync] mDNS browse disconnected, retrying ({}/{})",
-                        retries, BROWSE_MAX_RETRIES
-                    );
-                    thread::sleep(BROWSE_RETRY_DELAY);
                 }
+
+                if stopped.load(Ordering::SeqCst) {
+                    break;
+                }
+                thread::sleep(BROWSE_RETRY_DELAY);
             })
-            .map_err(SyncError::IoError)?;
+            .map_err(|e| format!("Failed to spawn browse thread: {}", e))?;
 
         Ok(())
     }
 
-    /// Handle an mDNS discovery event (runs on blocking thread)
-    fn handle_discovery_event(
-        event: ServiceEvent,
+    fn handle_event(
+        event: &ServiceEvent,
         discovered: &Arc<RwLock<HashMap<String, DiscoveredDevice>>>,
         event_tx: &broadcast::Sender<DiscoveryEvent>,
         our_device_id: &str,
     ) {
         match event {
             ServiceEvent::ServiceResolved(info) => {
-                // Parse device info from TXT records
-                let device_id = info.get_property_val_str("id");
-                let device_name = info.get_property_val_str("name");
-                let platform_str = info.get_property_val_str("platform");
-
-                // Skip if missing required fields or if it's our own device
-                let Some(device_id) = device_id else { return };
+                let device_id = match info.get_property_val_str("id") {
+                    Some(id) => id,
+                    None => return,
+                };
                 if device_id == our_device_id {
                     return;
                 }
 
-                let device_name = device_name.unwrap_or("Unknown");
-                let platform = match platform_str.unwrap_or("unknown") {
-                    "macos" => Platform::MacOS,
-                    "windows" => Platform::Windows,
-                    "linux" => Platform::Linux,
-                    _ => Platform::Unknown,
-                };
+                let device_name = info
+                    .get_property_val_str("name")
+                    .unwrap_or("Unknown")
+                    .to_string();
+                let platform = info
+                    .get_property_val_str("platform")
+                    .unwrap_or("unknown")
+                    .to_string();
+                let public_key = info
+                    .get_property_val_str("pubkey")
+                    .and_then(|s| {
+                        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s).ok()
+                    })
+                    .unwrap_or_default();
 
-                let addresses: Vec<IpAddr> = info.get_addresses().iter().copied().collect();
+                let addresses: Vec<IpAddr> = info
+                    .get_addresses()
+                    .iter()
+                    .copied()
+                    .filter(|ip| match ip {
+                        IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_unspecified(),
+                        IpAddr::V6(v6) => !v6.is_loopback() && !v6.is_unspecified(),
+                    })
+                    .collect();
+
+                if addresses.is_empty() {
+                    return;
+                }
+
                 let port = info.get_port();
-
                 let device = DiscoveredDevice {
                     device_id: device_id.to_string(),
-                    device_name: device_name.to_string(),
+                    device_name,
                     platform,
+                    public_key,
                     addresses,
                     port,
                 };
@@ -253,70 +215,49 @@ impl DiscoveryService {
                     is_new
                 };
 
-                let _ = if is_new {
+                if is_new {
                     eprintln!(
-                        "[Sync] Discovered device: {} ({}) at {:?}:{}",
+                        "[Sync] Discovered: {} ({}) at {:?}:{}",
                         device.device_name, device.platform, device.addresses, device.port
                     );
-                    event_tx.send(DiscoveryEvent::DeviceFound(device))
+                    let _ = event_tx.send(DiscoveryEvent::DeviceFound(device));
                 } else {
-                    event_tx.send(DiscoveryEvent::DeviceUpdated(device))
-                };
+                    let _ = event_tx.send(DiscoveryEvent::DeviceUpdated(device));
+                }
             }
-
-            ServiceEvent::ServiceRemoved(_service_type, fullname) => {
-                // Extract device ID from service name
-                // Service name format: "copi-{device_id_prefix}"
+            ServiceEvent::ServiceRemoved(_, fullname) => {
                 let device_id = {
                     let map = discovered.read().unwrap();
                     map.iter()
-                        .find(|(_, d)| fullname.contains(&d.device_id[..8]))
+                        .find(|(_, d)| fullname.contains(&d.device_id[..8.min(d.device_id.len())]))
                         .map(|(id, _)| id.clone())
                 };
-
-                if let Some(device_id) = device_id {
-                    {
-                        let mut map = discovered.write().unwrap();
-                        map.remove(&device_id);
-                    }
-                    eprintln!("[Sync] Device lost: {}", device_id);
-                    let _ = event_tx.send(DiscoveryEvent::DeviceLost(device_id));
+                if let Some(id) = device_id {
+                    discovered.write().unwrap().remove(&id);
+                    let _ = event_tx.send(DiscoveryEvent::DeviceLost(id));
                 }
             }
-
             _ => {}
         }
     }
 
-    /// Subscribe to discovery events
     pub fn subscribe(&self) -> broadcast::Receiver<DiscoveryEvent> {
         self.event_tx.subscribe()
     }
 
-    /// Get a specific discovered device by ID (blocking)
     pub fn get_device(&self, device_id: &str) -> Option<DiscoveredDevice> {
         self.discovered.read().ok()?.get(device_id).cloned()
     }
 
-    /// Stop the discovery service (idempotent — safe to call multiple times)
-    pub fn stop(&self) -> SyncResult<()> {
-        if self.stopped.swap(true, Ordering::SeqCst) {
-            // Already stopped
-            return Ok(());
-        }
-
-        // Unregister our service
+    pub fn stop(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
         let _ = self.daemon.unregister(&self.service_name);
-        // Stop browsing
         let _ = self.daemon.stop_browse(SERVICE_TYPE);
-
-        eprintln!("[Sync] Discovery service stopped");
-        Ok(())
     }
 }
 
 impl Drop for DiscoveryService {
     fn drop(&mut self) {
-        let _ = self.stop();
+        self.stop();
     }
 }

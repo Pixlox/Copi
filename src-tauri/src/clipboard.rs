@@ -7,8 +7,7 @@ use tauri::{Emitter, Manager};
 
 use crate::{
     macos::{get_app_icon_png, get_clipboard_source_app, get_frontmost_app_info, FrontmostApp},
-    sync::engine::SyncEngine,
-    sync::runtime,
+    sync,
     AppState,
 };
 
@@ -891,7 +890,7 @@ fn insert_clip(
     let icon = fetch_app_icon(&state, source_app);
     let conn = state.db_write.lock().unwrap();
     let sync_id = uuid::Uuid::new_v4().to_string();
-    let sync_version = SyncEngine::next_sync_version(&conn).unwrap_or(0);
+    let sync_version = sync::next_sync_version(app);
     let origin_device_id: Option<String> = conn
         .query_row("SELECT device_id FROM device_info LIMIT 1", [], |row| {
             row.get(0)
@@ -942,7 +941,7 @@ fn insert_clip(
         drop(conn);
         if let Some(clip_id) = clip_id {
             enqueue_embedding(&state, clip_id, "insert_clip");
-            runtime::queue_clip_sync_change(app, sync_id);
+            sync::on_local_clip_saved(app, &sync_id);
         }
         let _ = app.emit("new-clip", ());
     }
@@ -974,7 +973,7 @@ fn insert_image_clip(
 
     let conn = state.db_write.lock().unwrap();
     let sync_id = uuid::Uuid::new_v4().to_string();
-    let sync_version = SyncEngine::next_sync_version(&conn).unwrap_or(0);
+    let sync_version = sync::next_sync_version(app);
     let origin_device_id: Option<String> = conn
         .query_row("SELECT device_id FROM device_info LIMIT 1", [], |row| {
             row.get(0)
@@ -1041,7 +1040,7 @@ fn insert_image_clip(
         if let (Some(clip_id), true) = (clip_id, ocr_text.is_some()) {
             enqueue_embedding(&state, clip_id, "insert_image_clip");
         }
-        runtime::queue_clip_sync_change(app, sync_id);
+        sync::on_local_clip_saved(app, &sync_id);
         let _ = app.emit("new-clip", ());
     }
 }

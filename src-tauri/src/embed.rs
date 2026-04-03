@@ -383,10 +383,6 @@ fn embed_single_clip(model: &EmbeddingModel, app: &tauri::AppHandle, clip_id: i6
         rusqlite::params![clip_id, vec_bytes],
     ) {
         Ok(_) => {
-            if let (Some(sync_id), Some(sync_version)) = (sync_id, sync_version) {
-                let _ =
-                    crate::sync::runtime::queue_embedding_sync_change(app, sync_id, sync_version);
-            }
             EmbedOutcome::Stored
         }
         Err(e) => {

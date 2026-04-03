@@ -51,6 +51,7 @@ digest = "0.10"                     # Digest traits for blake2
 base64 = "0.22"                     # Base64 encoding for mDNS TXT records
 thiserror = "2"                     # Error handling
 hostname = "0.4"                    # Get device hostname
+if-addrs = "0.13"                   # Interface enumeration for scoped IPv6
 
 # Desktop-only plugins
 [target."cfg(not(any(target_os = \"android\", target_os = \"ios\")))".dependencies]
@@ -85,7 +86,6 @@ windows = { version = "0.61", features = [
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
-
 
 
 

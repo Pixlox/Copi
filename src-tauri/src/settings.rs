@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager};
 
-use crate::sync::runtime;
+use crate::sync;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -301,7 +301,7 @@ pub async fn clear_all_history(app: tauri::AppHandle) -> Result<(), String> {
     let state = app.state::<crate::AppState>();
     let mut conn = state.db_write.lock().map_err(|e| e.to_string())?;
     let tx = conn.transaction().map_err(|e| e.to_string())?;
-    let sync_version = crate::sync::engine::SyncEngine::next_sync_version(&tx).unwrap_or(0);
+    let sync_version = sync::next_sync_version(&app);
     tx.execute(
         "UPDATE clips SET deleted = 1, sync_version = ?1 WHERE deleted = 0",
         rusqlite::params![sync_version],
@@ -318,22 +318,6 @@ pub async fn clear_all_history(app: tauri::AppHandle) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
 
-    let state = app.state::<crate::AppState>();
-    let conn = state.db_write.lock().map_err(|e| e.to_string())?;
-    let mut stmt = conn
-        .prepare("SELECT sync_id FROM clips WHERE deleted = 1")
-        .map_err(|e| e.to_string())?;
-    let ids: Vec<String> = stmt
-        .query_map([], |row| row.get(0))
-        .map_err(|e| e.to_string())?
-        .filter_map(|r| r.ok())
-        .collect();
-    drop(stmt);
-    drop(conn);
-
-    for id in ids {
-        runtime::queue_clip_sync_change(&app, id);
-    }
     let _ = app.emit("clips-changed", ());
     let _ = app.emit("collections-changed", ());
     Ok(())
