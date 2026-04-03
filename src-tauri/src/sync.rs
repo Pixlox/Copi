@@ -5,6 +5,7 @@ use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
@@ -104,17 +105,35 @@ impl PeerWriter {
 pub struct SyncState {
     pub device_id: String,
     pub device_name: String,
+    enabled: AtomicBool,
+    generation: AtomicU64,
     live: RwLock<HashMap<String, PeerWriter>>,
+    known_addrs: RwLock<HashMap<String, SocketAddr>>,
+    discovered: RwLock<HashMap<String, DiscoveredPeer>>,
     pairing_pin: Mutex<Option<(String, Instant)>>,
     _mdns: Option<ServiceDaemon>,
 }
 
 impl SyncState {
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::SeqCst)
+    }
+
+    fn current_generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
     pub async fn push_clip(&self, clip: WireClip) -> Result<()> {
+        if !self.is_enabled() {
+            return Ok(());
+        }
         self.broadcast(Msg::ClipPush { clip }).await
     }
 
     pub async fn push_blob(&self, hash: String, data: String) -> Result<()> {
+        if !self.is_enabled() {
+            return Ok(());
+        }
         self.broadcast(Msg::BlobData { hash, data }).await
     }
 
@@ -245,6 +264,8 @@ pub fn start_sync(app: AppHandle) -> Arc<SyncState> {
         device_name
     };
 
+    ensure_windows_firewall_rules(SYNC_PORT);
+
     let mdns = match ServiceDaemon::new() {
         Ok(mdns) => Some(mdns),
         Err(error) => {
@@ -278,31 +299,55 @@ pub fn start_sync(app: AppHandle) -> Arc<SyncState> {
     let sync = Arc::new(SyncState {
         device_id,
         device_name,
+        enabled: AtomicBool::new(false),
+        generation: AtomicU64::new(0),
         live: RwLock::new(HashMap::new()),
+        known_addrs: RwLock::new(HashMap::new()),
+        discovered: RwLock::new(HashMap::new()),
         pairing_pin: Mutex::new(None),
         _mdns: mdns,
     });
 
-    {
-        let app_clone = app.clone();
-        let sync_clone = sync.clone();
-        tauri::async_runtime::spawn(async move {
-            run_server(app_clone, sync_clone).await;
-        });
-    }
-
-    {
-        let app_clone = app.clone();
-        let sync_clone = sync.clone();
-        tauri::async_runtime::spawn(async move {
-            run_browser(app_clone, sync_clone, trusted_peers).await;
-        });
+    let enabled = crate::settings::get_config_sync(app.clone())
+        .map(|cfg| cfg.sync.enabled)
+        .unwrap_or(false);
+    if enabled {
+        enable_runtime(app.clone(), sync.clone(), trusted_peers);
     }
 
     sync
 }
 
-async fn run_server(app: AppHandle, sync: Arc<SyncState>) {
+fn enable_runtime(app: AppHandle, sync: Arc<SyncState>, trusted_peers: Vec<TrustedPeer>) {
+    sync.enabled.store(true, Ordering::SeqCst);
+    let generation = sync.generation.fetch_add(1, Ordering::SeqCst) + 1;
+
+    {
+        let app_clone = app.clone();
+        let sync_clone = sync.clone();
+        tauri::async_runtime::spawn(async move {
+            run_server(app_clone, sync_clone, generation).await;
+        });
+    }
+
+    {
+        let app_clone = app.clone();
+        let sync_clone = sync.clone();
+        tauri::async_runtime::spawn(async move {
+            run_browser(app_clone, sync_clone, trusted_peers, generation).await;
+        });
+    }
+}
+
+async fn disable_runtime(sync: Arc<SyncState>) {
+    sync.enabled.store(false, Ordering::SeqCst);
+    sync.generation.fetch_add(1, Ordering::SeqCst);
+    sync.live.write().await.clear();
+    sync.known_addrs.write().await.clear();
+    sync.discovered.write().await.clear();
+}
+
+async fn run_server(app: AppHandle, sync: Arc<SyncState>, generation: u64) {
     let listener = match TcpListener::bind(("0.0.0.0", SYNC_PORT)).await {
         Ok(listener) => listener,
         Err(error) => {
@@ -314,22 +359,34 @@ async fn run_server(app: AppHandle, sync: Arc<SyncState>) {
     eprintln!("[Sync] TCP server listening on port {}", SYNC_PORT);
 
     loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
+        if !sync.is_enabled() || sync.current_generation() != generation {
+            break;
+        }
+        match tokio::time::timeout(Duration::from_secs(1), listener.accept()).await {
+            Ok(Ok((stream, _))) => {
+                if !sync.is_enabled() || sync.current_generation() != generation {
+                    break;
+                }
                 let app_clone = app.clone();
                 let sync_clone = sync.clone();
                 tauri::async_runtime::spawn(async move {
                     let _ = handle_connection(app_clone, sync_clone, stream, false, None).await;
                 });
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 eprintln!("[Sync] Accept error: {}", error);
             }
+            Err(_) => {}
         }
     }
 }
 
-async fn run_browser(app: AppHandle, sync: Arc<SyncState>, trusted_peers: Vec<TrustedPeer>) {
+async fn run_browser(
+    app: AppHandle,
+    sync: Arc<SyncState>,
+    trusted_peers: Vec<TrustedPeer>,
+    generation: u64,
+) {
     let Some(mdns) = sync._mdns.as_ref() else {
         eprintln!("[Sync] mDNS unavailable; discovery/browser disabled");
         return;
@@ -342,15 +399,12 @@ async fn run_browser(app: AppHandle, sync: Arc<SyncState>, trusted_peers: Vec<Tr
         }
     };
 
-    let known_addrs = Arc::new(RwLock::new(HashMap::<String, SocketAddr>::new()));
-
     for peer in &trusted_peers {
         let app_clone = app.clone();
         let sync_clone = sync.clone();
-        let known_clone = known_addrs.clone();
         let peer_id = peer.device_id.clone();
         tauri::async_runtime::spawn(async move {
-            reconnect_loop(app_clone, sync_clone, peer_id, known_clone).await;
+            reconnect_loop(app_clone, sync_clone, peer_id, generation).await;
         });
     }
 
@@ -363,15 +417,19 @@ async fn run_browser(app: AppHandle, sync: Arc<SyncState>, trusted_peers: Vec<Tr
         }
     });
 
-    while let Some(event) = event_rx.recv().await {
+    loop {
+        if !sync.is_enabled() || sync.current_generation() != generation {
+            break;
+        }
+        let event = match tokio::time::timeout(Duration::from_secs(1), event_rx.recv()).await {
+            Ok(Some(event)) => event,
+            Ok(None) => break,
+            Err(_) => continue,
+        };
         match event {
             ServiceEvent::ServiceResolved(info) => {
                 let full = info.get_fullname().to_string();
-                let mut peer_id = full
-                    .strip_suffix(SERVICE_TYPE)
-                    .unwrap_or(&full)
-                    .trim_end_matches('.')
-                    .to_string();
+                let mut peer_id = extract_peer_id(&full);
 
                 if peer_id.is_empty() {
                     if let Some(name) = info.get_property_val_str("id") {
@@ -396,11 +454,17 @@ async fn run_browser(app: AppHandle, sync: Arc<SyncState>, trusted_peers: Vec<Tr
 
                 let peer_addr = SocketAddr::new(ip, info.get_port());
                 {
-                    known_addrs.write().await.insert(peer_id.clone(), peer_addr);
+                    sync.known_addrs
+                        .write()
+                        .await
+                        .insert(peer_id.clone(), peer_addr);
                 }
 
                 let trusted = is_trusted_peer(&app, &peer_id).unwrap_or(false);
                 if trusted {
+                    if !auto_connect_enabled(&app) {
+                        continue;
+                    }
                     let is_connected = sync.connected_peers().await.contains(&peer_id);
                     if !is_connected {
                         let app_clone = app.clone();
@@ -420,17 +484,18 @@ async fn run_browser(app: AppHandle, sync: Arc<SyncState>, trusted_peers: Vec<Tr
                         display_name,
                         addr: peer_addr.to_string(),
                     };
+                    sync.discovered
+                        .write()
+                        .await
+                        .insert(payload.device_id.clone(), payload.clone());
                     let _ = app.emit("sync:discovered", payload);
                 }
             }
             ServiceEvent::ServiceRemoved(_, fullname) => {
-                let peer_id = fullname
-                    .strip_suffix(SERVICE_TYPE)
-                    .unwrap_or(&fullname)
-                    .trim_end_matches('.')
-                    .to_string();
+                let peer_id = extract_peer_id(&fullname);
                 if !peer_id.is_empty() {
-                    known_addrs.write().await.remove(&peer_id);
+                    sync.known_addrs.write().await.remove(&peer_id);
+                    sync.discovered.write().await.remove(&peer_id);
                 }
             }
             _ => {}
@@ -442,15 +507,23 @@ async fn reconnect_loop(
     app: AppHandle,
     sync: Arc<SyncState>,
     peer_id: String,
-    known_addrs: Arc<RwLock<HashMap<String, SocketAddr>>>,
+    generation: u64,
 ) {
     loop {
+        if !sync.is_enabled() || sync.current_generation() != generation {
+            break;
+        }
         if sync.connected_peers().await.contains(&peer_id) {
             tokio::time::sleep(Duration::from_secs(5)).await;
             continue;
         }
 
-        let target_addr = known_addrs.read().await.get(&peer_id).copied();
+        if !auto_connect_enabled(&app) {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            continue;
+        }
+
+        let target_addr = sync.known_addrs.read().await.get(&peer_id).copied();
         if let Some(target_addr) = target_addr {
             connect_to_peer(app.clone(), sync.clone(), peer_id.clone(), target_addr).await;
             tokio::time::sleep(RECONNECT_BACKOFF).await;
@@ -461,6 +534,9 @@ async fn reconnect_loop(
 }
 
 async fn connect_to_peer(app: AppHandle, sync: Arc<SyncState>, peer_id: String, addr: SocketAddr) {
+    if !sync.is_enabled() {
+        return;
+    }
     let stream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(error)) => {
@@ -499,6 +575,9 @@ async fn run_session(
     initiator: bool,
     expected_peer: Option<String>,
 ) -> Result<()> {
+    if !sync.is_enabled() {
+        return Err(anyhow!("sync disabled"));
+    }
     stream.set_nodelay(true).ok();
     let (read_half, write_half) = stream.into_split();
     let writer = PeerWriter(Arc::new(AsyncMutex::new(write_half)));
@@ -719,6 +798,9 @@ async fn receive_clips(
     writer: &PeerWriter,
     clips: Vec<WireClip>,
 ) -> Result<()> {
+    if !sync.is_enabled() {
+        return Ok(());
+    }
     let mut max_by_source: HashMap<String, i64> = HashMap::new();
     let mut inserted_any = false;
 
@@ -1109,6 +1191,64 @@ fn now_ts() -> i64 {
         .unwrap_or(0)
 }
 
+fn auto_connect_enabled(app: &AppHandle) -> bool {
+    crate::settings::get_config_sync(app.clone())
+        .map(|cfg| cfg.sync.enabled && cfg.sync.auto_connect)
+        .unwrap_or(true)
+}
+
+fn extract_peer_id(fullname: &str) -> String {
+    let trimmed = fullname.trim_end_matches('.');
+    let svc = SERVICE_TYPE.trim_end_matches('.');
+
+    if let Some(prefix) = trimmed.strip_suffix(&format!(".{}", svc)) {
+        return prefix.to_string();
+    }
+    if let Some(prefix) = trimmed.strip_suffix(svc) {
+        return prefix.trim_end_matches('.').to_string();
+    }
+
+    trimmed
+        .split('.')
+        .next()
+        .map(|s| s.to_string())
+        .unwrap_or_default()
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_windows_firewall_rules(listen_port: u16) {
+    use std::process::Command;
+
+    let tcp_rule = format!("Copi LAN Sync TCP {}", listen_port);
+    let mdns_rule = "Copi mDNS UDP 5353";
+    let script = format!(
+        "$tcp = Get-NetFirewallRule -DisplayName '{tcp_rule}' -ErrorAction SilentlyContinue; if (-not $tcp) {{ New-NetFirewallRule -DisplayName '{tcp_rule}' -Direction Inbound -Action Allow -Protocol TCP -LocalPort {port} -Profile Any | Out-Null }}; $mdns = Get-NetFirewallRule -DisplayName '{mdns_rule}' -ErrorAction SilentlyContinue; if (-not $mdns) {{ New-NetFirewallRule -DisplayName '{mdns_rule}' -Direction Inbound -Action Allow -Protocol UDP -LocalPort 5353 -Profile Any | Out-Null }}",
+        tcp_rule = tcp_rule,
+        port = listen_port,
+        mdns_rule = mdns_rule
+    );
+
+    let utf16_bytes: Vec<u8> = script
+        .encode_utf16()
+        .flat_map(|u| u.to_le_bytes())
+        .collect();
+    let b64 = B64.encode(&utf16_bytes);
+
+    let _ = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-EncodedCommand",
+            &b64,
+        ])
+        .output();
+}
+
+#[cfg(not(target_os = "windows"))]
+fn ensure_windows_firewall_rules(_listen_port: u16) {}
+
 async fn lookup_clip_for_push(
     app: &AppHandle,
     our_device_id: &str,
@@ -1271,6 +1411,9 @@ pub async fn sync_generate_pin(app: AppHandle) -> Result<SyncPinPayload, String>
         .sync
         .get()
         .ok_or_else(|| "sync not initialized".to_string())?;
+    if !sync.is_enabled() {
+        return Err("sync is disabled".to_string());
+    }
     let pin = sync.generate_pin();
     Ok(SyncPinPayload {
         pin,
@@ -1279,13 +1422,36 @@ pub async fn sync_generate_pin(app: AppHandle) -> Result<SyncPinPayload, String>
 }
 
 #[tauri::command]
-pub async fn sync_pair_with(app: AppHandle, target_addr: String, pin: String) -> Result<(), String> {
+pub async fn sync_get_status(app: AppHandle) -> Result<serde_json::Value, String> {
+    let state = app.state::<AppState>();
+    let sync = state
+        .sync
+        .get()
+        .ok_or_else(|| "sync not initialized".to_string())?;
+    let connected_count = sync.connected_peers().await.len();
+    Ok(serde_json::json!({
+        "enabled": sync.is_enabled(),
+        "connectedCount": connected_count,
+        "deviceId": sync.device_id,
+        "deviceName": sync.device_name,
+    }))
+}
+
+#[tauri::command]
+pub async fn sync_pair_with(
+    app: AppHandle,
+    target_addr: String,
+    pin: String,
+) -> Result<(), String> {
     let state = app.state::<AppState>();
     let sync = state
         .sync
         .get()
         .cloned()
         .ok_or_else(|| "sync not initialized".to_string())?;
+    if !sync.is_enabled() {
+        return Err("sync is disabled".to_string());
+    }
 
     let addr = parse_target_addr(&target_addr).map_err(|e| e.to_string())?;
     let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
@@ -1344,7 +1510,10 @@ pub async fn sync_pair_with(app: AppHandle, target_addr: String, pin: String) ->
 }
 
 #[tauri::command]
-pub async fn sync_remove_peer(app: AppHandle, device_id: String) -> Result<(), String> {
+pub async fn sync_remove_peer(
+    app: AppHandle,
+    device_id: String,
+) -> Result<(), String> {
     remove_trusted_peer(&app, &device_id).map_err(|e| e.to_string())?;
     if let Some(sync) = app.state::<AppState>().sync.get() {
         sync.unregister_peer(&device_id).await;
@@ -1386,6 +1555,20 @@ pub async fn on_local_clip_saved(app: &AppHandle, content_hash: &str) {
     }
 }
 
+#[tauri::command]
+pub async fn sync_list_discovered(app: AppHandle) -> Result<Vec<DiscoveredPeer>, String> {
+    let state = app.state::<AppState>();
+    let sync = state
+        .sync
+        .get()
+        .ok_or_else(|| "sync not initialized".to_string())?;
+    if !sync.is_enabled() {
+        return Ok(Vec::new());
+    }
+    let values = sync.discovered.read().await.values().cloned().collect();
+    Ok(values)
+}
+
 pub fn next_sync_version(app: &AppHandle) -> i64 {
     let state = app.state::<AppState>();
     let conn = match state.db_write.lock() {
@@ -1412,10 +1595,29 @@ pub fn next_sync_version(app: &AppHandle) -> i64 {
 }
 
 pub fn apply_config_change(
-    _app: &AppHandle,
-    _previous: Option<&crate::settings::CopiConfig>,
-    _next: &crate::settings::CopiConfig,
+    app: &AppHandle,
+    previous: Option<&crate::settings::CopiConfig>,
+    next: &crate::settings::CopiConfig,
 ) {
+    let Some(sync) = app.try_state::<AppState>().and_then(|state| state.sync.get().cloned()) else {
+        return;
+    };
+
+    let was_enabled = previous.map(|cfg| cfg.sync.enabled).unwrap_or(false);
+    let is_enabled = next.sync.enabled;
+
+    if was_enabled == is_enabled {
+        return;
+    }
+
+    if is_enabled {
+        let trusted_peers = get_trusted_peers(app).unwrap_or_default();
+        enable_runtime(app.clone(), sync, trusted_peers);
+    } else {
+        tauri::async_runtime::spawn(async move {
+            disable_runtime(sync).await;
+        });
+    }
 }
 
 pub fn on_collection_changed(_app: &AppHandle) {}

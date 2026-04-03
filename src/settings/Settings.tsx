@@ -58,6 +58,13 @@ interface SyncIdentity {
   device_name: string;
 }
 
+interface SyncStatus {
+  enabled: boolean;
+  connectedCount: number;
+  deviceId?: string;
+  deviceName?: string;
+}
+
 interface SyncPairedDevice {
   device_id: string;
   display_name: string;
@@ -454,7 +461,9 @@ function DataSection({
 }
 
 function SyncSection() {
+  const [config, setConfig] = useState<CopiConfig | null>(null);
   const [identity, setIdentity] = useState<SyncIdentity | null>(null);
+  const [status, setStatus] = useState<SyncStatus | null>(null);
   const [pairedDevices, setPairedDevices] = useState<SyncPairedDevice[]>([]);
   const [discoveredDevices, setDiscoveredDevices] = useState<SyncDiscoveredDevice[]>([]);
   const [pairingCode, setPairingCode] = useState<SyncPinPayload | null>(null);
@@ -479,10 +488,47 @@ function SyncSection() {
       .catch(() => {});
   }, []);
 
+  const refreshConfig = useCallback(() => {
+    invoke<CopiConfig>("get_config").then(setConfig).catch(() => {});
+  }, []);
+
+  const refreshStatus = useCallback(() => {
+    invoke<SyncStatus>("sync_get_status").then(setStatus).catch(() => {});
+  }, []);
+
+  const saveSyncConfig = useCallback(
+    async (updater: (cfg: CopiConfig) => CopiConfig) => {
+      if (!config) return;
+      const next = updater(config);
+      setConfig(next);
+      await invoke("set_config", { config: next });
+    },
+    [config]
+  );
+
   const refreshSync = useCallback(() => {
     refreshIdentity();
+    refreshStatus();
     refreshPeers();
-  }, [refreshIdentity, refreshPeers]);
+    refreshConfig();
+  }, [refreshConfig, refreshIdentity, refreshPeers, refreshStatus]);
+
+  const refreshDiscovered = useCallback(() => {
+    invoke<Array<{ device_id: string; display_name: string; addr: string }>>("sync_list_discovered")
+      .then((items) => {
+        setDiscoveredDevices((prev) => {
+          const byId = new Map(prev.map((item) => [item.device_id, item]));
+          const next = items.map((item) => ({
+            device_id: item.device_id,
+            display_name: item.display_name,
+            addr: item.addr,
+            pin: byId.get(item.device_id)?.pin ?? "",
+          }));
+          return next.sort((a, b) => a.display_name.localeCompare(b.display_name));
+        });
+      })
+      .catch(() => {});
+  }, []);
 
   const upsertDiscovered = useCallback(
     (payload: { device_id: string; display_name: string; addr: string }) => {
@@ -503,7 +549,18 @@ function SyncSection() {
 
   useEffect(() => {
     refreshSync();
-  }, [refreshSync]);
+    refreshDiscovered();
+  }, [refreshDiscovered, refreshSync]);
+
+  useEffect(() => {
+    const unlistenConfig = listen("sync:config-updated", () => {
+      refreshSync();
+      refreshDiscovered();
+    });
+    return () => {
+      unlistenConfig.then((fn) => fn());
+    };
+  }, [refreshDiscovered, refreshSync]);
 
   useEffect(() => {
     const unlistenPaired = listen("sync:paired", () => {
@@ -557,8 +614,80 @@ function SyncSection() {
   return (
     <>
       <SettingCard>
+        <SettingRow label="Enable Sync" description="Turn LAN sync on or off for this device">
+          <Toggle
+            checked={Boolean(config?.sync.enabled)}
+            onChange={(value) => {
+              void saveSyncConfig((cfg) => ({
+                ...cfg,
+                sync: {
+                  ...cfg.sync,
+                  enabled: value,
+                },
+              }));
+            }}
+          />
+        </SettingRow>
+        <SettingDivider />
+        <SettingRow label="Device Name" description="Override hostname shown to peers">
+          <input
+            className="settings-sync-input"
+            value={config?.sync.device_name ?? ""}
+            onChange={(event) => {
+              const value = event.target.value;
+              setConfig((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      sync: {
+                        ...prev.sync,
+                        device_name: value,
+                      },
+                    }
+                  : prev
+              );
+            }}
+            onBlur={() => {
+              void saveSyncConfig((cfg) => ({
+                ...cfg,
+                sync: {
+                  ...cfg.sync,
+                  device_name:
+                    (cfg.sync.device_name ?? "").trim().length > 0
+                      ? (cfg.sync.device_name ?? "").trim()
+                      : null,
+                },
+              }));
+            }}
+            placeholder="Auto-detected hostname"
+          />
+        </SettingRow>
+        <SettingDivider />
+        <SettingRow label="Auto-connect" description="Reconnect to trusted peers automatically">
+          <Toggle
+            checked={Boolean(config?.sync.auto_connect ?? true)}
+            onChange={(value) => {
+              void saveSyncConfig((cfg) => ({
+                ...cfg,
+                sync: {
+                  ...cfg.sync,
+                  auto_connect: value,
+                },
+              }));
+            }}
+          />
+        </SettingRow>
+      </SettingCard>
+
+      <SettingCard>
         <SettingRow label="Status" description="Current LAN sync service status">
-          <button className="settings-btn" onClick={refreshSync}>
+          <button
+            className="settings-btn"
+            onClick={() => {
+              refreshSync();
+              refreshDiscovered();
+            }}
+          >
             <RefreshCw size={12} /> Refresh
           </button>
         </SettingRow>
@@ -566,11 +695,11 @@ function SyncSection() {
         <div className="settings-sync-metrics">
           <div className="settings-sync-metric">
             <span>Mode</span>
-            <strong>{identity ? "Enabled" : "Unavailable"}</strong>
+            <strong>{config?.sync.enabled ? "Enabled" : "Disabled"}</strong>
           </div>
           <div className="settings-sync-metric">
             <span>Connected</span>
-            <strong>{pairedDevices.filter((device) => device.online).length}</strong>
+            <strong>{status?.connectedCount ?? pairedDevices.filter((device) => device.online).length}</strong>
           </div>
           <div className="settings-sync-metric">
             <span>Paired</span>
@@ -625,7 +754,13 @@ function SyncSection() {
 
       <SettingCard>
         <SettingRow label="Found on this network" description="Discovered devices that can be paired">
-          <button className="settings-btn" onClick={refreshSync}>
+          <button
+            className="settings-btn"
+            onClick={() => {
+              refreshSync();
+              refreshDiscovered();
+            }}
+          >
             <RefreshCw size={12} /> Refresh
           </button>
         </SettingRow>
@@ -670,10 +805,11 @@ function SyncSection() {
                   setPairingBusyAddr(device.addr);
                   setPairingError(null);
                   try {
-                    await invoke("sync_pair_with", { target_addr: device.addr, pin: device.pin });
+                    await invoke("sync_pair_with", { targetAddr: device.addr, target_addr: device.addr, pin: device.pin });
                     setDiscoveredDevices((prev) =>
                       prev.filter((item) => item.device_id !== device.device_id)
                     );
+                    refreshStatus();
                     refreshPeers();
                   } catch (e) {
                     const message = formatError(e);
@@ -715,7 +851,8 @@ function SyncSection() {
                 <button
                   className="settings-btn danger"
                   onClick={async () => {
-                    await invoke("sync_remove_peer", { device_id: device.device_id });
+                    await invoke("sync_remove_peer", { deviceId: device.device_id, device_id: device.device_id });
+                    refreshStatus();
                     refreshPeers();
                   }}
                 >

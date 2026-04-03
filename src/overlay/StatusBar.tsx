@@ -81,13 +81,17 @@ function StatusBar({
     let alive = true;
     const refresh = async () => {
       try {
-        const [identity, peers] = await Promise.all([
-          invoke<{ device_id: string; device_name: string }>("sync_get_identity"),
+        const [status, peers] = await Promise.all([
+          invoke<{ enabled: boolean; connectedCount: number }>("sync_get_status"),
           invoke<Array<{ device_id: string; display_name: string; online: boolean }>>("sync_list_peers"),
         ]);
         if (!alive) return;
-        setSyncEnabled(Boolean(identity?.device_id));
-        setSyncConnected(peers.filter((peer) => peer.online).length);
+        setSyncEnabled(Boolean(status?.enabled));
+        setSyncConnected(
+          peers.length > 0
+            ? peers.filter((peer) => peer.online).length
+            : Number(status?.connectedCount ?? 0)
+        );
       } catch {
         if (!alive) return;
         setSyncEnabled(false);
