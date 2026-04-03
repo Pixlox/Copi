@@ -269,8 +269,12 @@ pub fn start_sync(app: AppHandle) -> Arc<SyncState> {
 
     ensure_windows_firewall_rules(SYNC_PORT);
 
+    eprintln!("[Sync] Creating mDNS daemon for device_id={} device_name={}", device_id, device_name);
     let mdns = match ServiceDaemon::new() {
-        Ok(mdns) => Some(mdns),
+        Ok(mdns) => {
+            eprintln!("[Sync] mDNS daemon created successfully");
+            Some(mdns)
+        }
         Err(error) => {
             eprintln!("[Sync] Failed to create mDNS daemon: {}", error);
             None
@@ -278,6 +282,7 @@ pub fn start_sync(app: AppHandle) -> Arc<SyncState> {
     };
     if let Some(mdns) = mdns.as_ref() {
         let properties: [(&str, &str); 2] = [("v", "1"), ("name", device_name.as_str())];
+        eprintln!("[Sync] Registering mDNS service type={} instance={}", SERVICE_TYPE, device_id);
         match ServiceInfo::new(
             SERVICE_TYPE,
             &device_id,
@@ -289,6 +294,8 @@ pub fn start_sync(app: AppHandle) -> Arc<SyncState> {
             Ok(service) => {
                 if let Err(error) = mdns.register(service.enable_addr_auto()) {
                     eprintln!("[Sync] Failed to register mDNS service: {}", error);
+                } else {
+                    eprintln!("[Sync] mDNS service registered successfully");
                 }
             }
             Err(error) => {
@@ -408,22 +415,29 @@ async fn run_browser(
     trusted_peers: Vec<TrustedPeer>,
     generation: u64,
 ) {
+    eprintln!("[Sync] run_browser starting (generation={})", generation);
     let Some(mdns) = sync._mdns.as_ref() else {
         eprintln!("[Sync] mDNS unavailable; discovery/browser disabled");
         return;
     };
+    eprintln!("[Sync] Starting mDNS browse for service type: {}", SERVICE_TYPE);
     let browse_rx = match mdns.browse(SERVICE_TYPE) {
-        Ok(rx) => rx,
+        Ok(rx) => {
+            eprintln!("[Sync] mDNS browse started successfully");
+            rx
+        }
         Err(error) => {
             eprintln!("[Sync] Failed to start mDNS browse: {}", error);
             return;
         }
     };
 
+    eprintln!("[Sync] {} trusted peers to reconnect", trusted_peers.len());
     for peer in &trusted_peers {
         let app_clone = app.clone();
         let sync_clone = sync.clone();
         let peer_id = peer.device_id.clone();
+        eprintln!("[Sync] Starting reconnect loop for trusted peer: {}", peer_id);
         tauri::async_runtime::spawn(async move {
             reconnect_loop(app_clone, sync_clone, peer_id, generation).await;
         });
@@ -431,11 +445,21 @@ async fn run_browser(
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
     std::thread::spawn(move || {
+        eprintln!("[Sync] mDNS event thread started");
         while let Ok(event) = browse_rx.recv() {
+            eprintln!("[Sync] mDNS event received: {:?}", match &event {
+                ServiceEvent::ServiceResolved(info) => format!("Resolved: {}", info.get_fullname()),
+                ServiceEvent::ServiceRemoved(_, name) => format!("Removed: {}", name),
+                ServiceEvent::ServiceFound(_, name) => format!("Found: {}", name),
+                ServiceEvent::SearchStarted(_) => "SearchStarted".to_string(),
+                ServiceEvent::SearchStopped(_) => "SearchStopped".to_string(),
+            });
             if event_tx.send(event).is_err() {
+                eprintln!("[Sync] mDNS event channel closed");
                 break;
             }
         }
+        eprintln!("[Sync] mDNS event thread ending");
     });
 
     loop {
