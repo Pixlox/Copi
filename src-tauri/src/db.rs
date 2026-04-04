@@ -94,6 +94,11 @@ pub fn init_db(app: &tauri::AppHandle) -> Result<DbConnections> {
             image_thumbnail BLOB,
             image_width INTEGER DEFAULT 0,
             image_height INTEGER DEFAULT 0,
+            is_file INTEGER DEFAULT 0,
+            file_name TEXT,
+            file_size INTEGER DEFAULT 0,
+            file_data BLOB,
+            file_path TEXT,
             created_at INTEGER NOT NULL,
             pinned INTEGER DEFAULT 0,
             collection_id INTEGER REFERENCES collections(id),
@@ -113,7 +118,8 @@ pub fn init_db(app: &tauri::AppHandle) -> Result<DbConnections> {
             device_id TEXT PRIMARY KEY,
             display_name TEXT NOT NULL DEFAULT '',
             last_seen INTEGER NOT NULL DEFAULT 0,
-            last_addr TEXT
+            last_addr TEXT,
+            public_key TEXT
         );
 
         CREATE TABLE IF NOT EXISTS sync_cursors (
@@ -282,6 +288,11 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         ("image_thumbnail", "BLOB"),
         ("image_width", "INTEGER DEFAULT 0"),
         ("image_height", "INTEGER DEFAULT 0"),
+        ("is_file", "INTEGER DEFAULT 0"),
+        ("file_name", "TEXT"),
+        ("file_size", "INTEGER DEFAULT 0"),
+        ("file_data", "BLOB"),
+        ("file_path", "TEXT"),
         ("pinned", "INTEGER DEFAULT 0"),
         ("language", "TEXT"),
         ("copy_count", "INTEGER DEFAULT 0"),
@@ -344,6 +355,10 @@ fn run_migrations(conn: &Connection) -> Result<()> {
 
     if !sync_peers_columns.iter().any(|c| c == "last_addr") {
         conn.execute("ALTER TABLE sync_peers ADD COLUMN last_addr TEXT", [])?;
+    }
+
+    if !sync_peers_columns.iter().any(|c| c == "public_key") {
+        conn.execute("ALTER TABLE sync_peers ADD COLUMN public_key TEXT", [])?;
     }
 
     conn.execute_batch(

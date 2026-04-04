@@ -7,6 +7,8 @@ export interface ClipResult {
   content: string;
   content_type: string;
   source_app: string;
+  source_device: string;
+  is_file: boolean;
   created_at: number;
   pinned: boolean;
   content_highlighted: string | null;
@@ -91,6 +93,8 @@ export function useSearch() {
           clip.ocr_text === next?.ocr_text &&
           clip.content_type === next?.content_type &&
           clip.source_app === next?.source_app &&
+          clip.source_device === next?.source_device &&
+          clip.is_file === next?.is_file &&
           clip.created_at === next?.created_at
         );
       })

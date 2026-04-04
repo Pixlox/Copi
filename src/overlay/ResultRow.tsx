@@ -1,4 +1,4 @@
-import { Pin } from "lucide-react";
+import { ArrowDownCircle, File, Pin } from "lucide-react";
 import { ClipResult } from "../hooks/useSearch";
 import { normalizeAppName } from "../utils/platform";
 
@@ -98,11 +98,12 @@ function ResultRow({
   onDoubleClick,
   appIcon,
 }: ResultRowProps) {
-  const badge = getTypeBadge(result.content_type);
+  const badge = result.is_file ? "FILE" : getTypeBadge(result.content_type);
   const rawPreview = cleanPreview(result.content);
   const preview = query.trim() ? extractSnippet(rawPreview, query) : rawPreview;
   const imageThumbnail = imageThumbnailData ?? null;
   const sourceAppLabel = normalizeAppName(result.source_app || "");
+  const isSyncedFromPeer = Boolean(result.source_device && result.source_device.trim().length > 0);
 
   return (
     <div
@@ -140,6 +141,20 @@ function ResultRow({
             style={{ color: "var(--text-secondary)" }}
             dangerouslySetInnerHTML={{ __html: query.trim() ? highlightMatches(preview, query) : result.content_highlighted }}
           />
+        ) : result.is_file ? (
+          <div className="flex items-center gap-2.5 h-full">
+            <div
+              className="h-[36px] w-[36px] rounded-md flex items-center justify-center shrink-0"
+              style={{ background: "var(--surface-primary)", color: "var(--text-tertiary)" }}
+            >
+              <File size={14} />
+            </div>
+            <div className="flex flex-col min-w-0">
+              <span className="text-[13px] truncate" style={{ color: "var(--text-secondary)" }}>
+                {cleanPreview(result.content) || "File"}
+              </span>
+            </div>
+          </div>
         ) : result.content_type === "image" ? (
           <div className="flex items-center gap-2.5 h-full">
             {imageThumbnail ? (
@@ -185,6 +200,15 @@ function ResultRow({
         {result.pinned && (
           <span className="rounded-full p-1" style={{ background: "var(--accent-bg)", color: "var(--accent-text)" }}>
             <Pin size={10} strokeWidth={2.2} />
+          </span>
+        )}
+        {isSyncedFromPeer && (
+          <span
+            className="rounded-full p-1"
+            style={{ background: "var(--surface-primary)", color: "var(--text-tertiary)" }}
+            title="Synced from another device"
+          >
+            <ArrowDownCircle size={10} strokeWidth={2.2} />
           </span>
         )}
         {showAppIcons && (

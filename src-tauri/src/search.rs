@@ -24,6 +24,8 @@ pub struct ClipResult {
     pub content: String,
     pub content_type: String,
     pub source_app: String,
+    pub source_device: String,
+    pub is_file: bool,
     pub created_at: i64,
     pub pinned: bool,
     pub content_highlighted: Option<String>,
@@ -51,7 +53,7 @@ struct ScoreEntry {
     score: f64,
 }
 
-const SEL: &str = "id, content, content_type, source_app, created_at, pinned, content_highlighted, ocr_text, COALESCE(copy_count, 0)";
+const SEL: &str = "id, content, content_type, source_app, COALESCE(source_device, ''), COALESCE(is_file, 0), created_at, pinned, content_highlighted, ocr_text, COALESCE(copy_count, 0)";
 
 fn row_to_clip(r: &rusqlite::Row) -> rusqlite::Result<ClipResult> {
     Ok(ClipResult {
@@ -59,11 +61,13 @@ fn row_to_clip(r: &rusqlite::Row) -> rusqlite::Result<ClipResult> {
         content: trunc(&r.get::<_, String>(1).unwrap_or_default()),
         content_type: r.get(2)?,
         source_app: r.get(3)?,
-        created_at: r.get(4)?,
-        pinned: r.get::<_, i64>(5)? != 0,
-        content_highlighted: r.get(6)?,
-        ocr_text: r.get(7).unwrap_or(None),
-        copy_count: r.get(8).unwrap_or(0),
+        source_device: r.get(4)?,
+        is_file: r.get::<_, i64>(5)? != 0,
+        created_at: r.get(6)?,
+        pinned: r.get::<_, i64>(7)? != 0,
+        content_highlighted: r.get(8)?,
+        ocr_text: r.get(9).unwrap_or(None),
+        copy_count: r.get(10).unwrap_or(0),
     })
 }
 

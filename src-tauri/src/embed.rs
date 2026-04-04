@@ -8,6 +8,7 @@ use tauri::{Emitter, Manager};
 use tokenizers::Tokenizer;
 
 const EMBED_DIMS: usize = 384;
+pub const EMBEDDING_MODEL_SIGNATURE: &str = "multilingual-e5-small-384-v1";
 const QUERY_CACHE_MAX: usize = 1024;
 const QUERY_CACHE_EVICT: usize = 256;
 const WORKER_CONCURRENCY: usize = 4;

@@ -2,6 +2,7 @@ use arboard::{Clipboard, ImageData};
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager};
 
@@ -16,6 +17,15 @@ struct ClipboardImagePayload {
     bytes: Vec<u8>,
 }
 
+struct ClipboardFilePayload {
+    path: PathBuf,
+    file_name: String,
+    file_size: i64,
+    file_data: Option<Vec<u8>>,
+}
+
+const FILE_AUTO_SYNC_MAX_BYTES: i64 = crate::sync::FILE_AUTO_SYNC_MAX_BYTES;
+
 // ─── Watch Clipboard ──────────────────────────────────────────────
 
 pub async fn watch_clipboard(app: &tauri::AppHandle) {
@@ -29,6 +39,7 @@ pub async fn watch_clipboard(app: &tauri::AppHandle) {
 
     let mut last_text_hash = String::new();
     let mut last_image_hash = String::new();
+    let mut last_file_hash = String::new();
     let mut last_non_copi_app: Option<FrontmostApp> = None;
     let mut last_change_count: Option<i64> = None;
 
@@ -70,6 +81,24 @@ pub async fn watch_clipboard(app: &tauri::AppHandle) {
             .or_else(|| current_frontmost.filter(|app| !app.is_copi() && !app.is_empty()))
             .or_else(|| last_non_copi_app.clone())
             .unwrap_or_default();
+
+        // ── File clipboard ────────────────────────────────────────
+        if let Ok(file_list) = clipboard.get().file_list() {
+            if !file_list.is_empty() {
+                let mut hash_input = String::new();
+                for path in &file_list {
+                    hash_input.push_str(path.to_string_lossy().as_ref());
+                    hash_input.push('\n');
+                }
+                let file_hash = compute_hash(&format!("file-list:{}", hash_input));
+                if file_hash != last_file_hash {
+                    last_file_hash = file_hash.clone();
+                    queue_file_capture(app, file_list, file_hash, source_app.clone());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(140)).await;
+                continue;
+            }
+        }
 
         // ── Text clipboard ────────────────────────────────────────
         if let Ok(text) = clipboard.get_text() {
@@ -305,14 +334,24 @@ pub async fn backfill_language_tags(app: &tauri::AppHandle) {
 #[tauri::command]
 pub async fn copy_to_clipboard(app: tauri::AppHandle, clip_id: i64) -> Result<(), String> {
     // Phase 1: read data from pool (no write lock held)
-    let (content_type, content, image_bytes, width, height) = {
+    let (content_type, content, image_bytes, width, height, is_file, file_name, file_data, file_path) = {
         let conn = app
             .state::<AppState>()
             .db_read_pool
             .get()
             .map_err(|e| e.to_string())?;
         conn.query_row(
-            "SELECT content_type, COALESCE(content, ''), COALESCE(image_data, X''), COALESCE(image_width, 0), COALESCE(image_height, 0) FROM clips WHERE id = ? AND deleted = 0",
+            "SELECT content_type,
+                    COALESCE(content, ''),
+                    COALESCE(image_data, X''),
+                    COALESCE(image_width, 0),
+                    COALESCE(image_height, 0),
+                    COALESCE(is_file, 0),
+                    COALESCE(file_name, ''),
+                    COALESCE(file_data, X''),
+                    COALESCE(file_path, '')
+             FROM clips
+             WHERE id = ? AND deleted = 0",
             [clip_id],
             |row| Ok((
                 row.get::<_, String>(0)?,
@@ -320,6 +359,10 @@ pub async fn copy_to_clipboard(app: tauri::AppHandle, clip_id: i64) -> Result<()
                 row.get::<_, Vec<u8>>(2)?,
                 row.get::<_, i64>(3)?,
                 row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)? != 0,
+                row.get::<_, String>(6)?,
+                row.get::<_, Vec<u8>>(7)?,
+                row.get::<_, String>(8)?,
             )),
         )
         .map_err(|e| e.to_string())?
@@ -329,7 +372,38 @@ pub async fn copy_to_clipboard(app: tauri::AppHandle, clip_id: i64) -> Result<()
     // Phase 2: set clipboard (no DB lock held)
     let mut clipboard = Clipboard::new().map_err(|e| e.to_string())?;
 
-    if content_type == "image" {
+    if is_file {
+        let mut target_path = if !file_path.trim().is_empty() {
+            PathBuf::from(file_path.trim())
+        } else {
+            PathBuf::new()
+        };
+
+        if target_path.as_os_str().is_empty() || !target_path.exists() {
+            if file_data.is_empty() {
+                return Err("File bytes unavailable for this clip".to_string());
+            }
+            let cache_root = app
+                .path()
+                .app_cache_dir()
+                .unwrap_or_else(|_| std::env::temp_dir().join("copi"));
+            let files_dir = cache_root.join("file-clips");
+            let _ = std::fs::create_dir_all(&files_dir);
+
+            let name = if file_name.trim().is_empty() {
+                format!("clip-file-{}", clip_id)
+            } else {
+                file_name.clone()
+            };
+            target_path = files_dir.join(name);
+            std::fs::write(&target_path, &file_data).map_err(|e| e.to_string())?;
+        }
+
+        clipboard
+            .set()
+            .file_list(&[target_path])
+            .map_err(|e| format!("Failed to set file list: {}", e))?;
+    } else if content_type == "image" {
         // PERF 1: Decode PNG back to RGBA
         if let Some((raw_bytes, w, h)) = png_to_rgba(&image_bytes) {
             let image = ImageData {
@@ -593,6 +667,65 @@ fn process_image_capture(
     );
 }
 
+fn queue_file_capture(
+    app: &tauri::AppHandle,
+    file_list: Vec<PathBuf>,
+    hash: String,
+    source_app: FrontmostApp,
+) {
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = tokio::task::spawn_blocking(move || {
+            process_file_capture(&app_handle, file_list, hash, source_app)
+        })
+        .await;
+    });
+}
+
+fn process_file_capture(
+    app: &tauri::AppHandle,
+    file_list: Vec<PathBuf>,
+    fallback_hash: String,
+    source_app: FrontmostApp,
+) {
+    let path = match file_list.into_iter().find(|p| p.is_file()) {
+        Some(path) => path,
+        None => return,
+    };
+
+    let meta = match std::fs::metadata(&path) {
+        Ok(meta) => meta,
+        Err(_) => return,
+    };
+    let file_size = meta.len() as i64;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| "file".to_string());
+
+    let file_data = if file_size > 0 && file_size <= FILE_AUTO_SYNC_MAX_BYTES {
+        std::fs::read(&path).ok()
+    } else {
+        None
+    };
+
+    let hash = if let Some(bytes) = file_data.as_ref() {
+        compute_hash_bytes(bytes)
+    } else {
+        fallback_hash
+    };
+
+    let payload = ClipboardFilePayload {
+        path,
+        file_name,
+        file_size,
+        file_data,
+    };
+
+    insert_file_clip(app, &payload, &hash, &source_app);
+}
+
 fn repair_image_clip(app: &tauri::AppHandle, clip_id: i64) -> bool {
     let state = app.state::<AppState>();
     let (stored_bytes, width, height, existing_ocr, has_thumbnail): (
@@ -699,13 +832,21 @@ fn repair_image_clip(app: &tauri::AppHandle, clip_id: i64) -> bool {
 }
 
 fn run_ocr(app: &tauri::AppHandle, bytes: &[u8], width: u32, height: u32) -> Option<String> {
+    if width < 3 || height < 3 {
+        return None;
+    }
+
     let state = app.state::<AppState>();
     let ocr = state.ocr_engine.as_ref()?;
     match ocr.recognize_text(bytes, width, height) {
         Ok(text) if !text.trim().is_empty() => Some(text),
         Ok(_) => None,
         Err(error) => {
-            eprintln!("[OCR] Failed: {}", error);
+            let msg = error.to_string();
+            if msg.contains("image is too small") {
+                return None;
+            }
+            eprintln!("[OCR] Failed: {}", msg);
             None
         }
     }
@@ -1049,6 +1190,79 @@ fn insert_image_clip(
         tauri::async_runtime::spawn(async move {
             crate::sync::on_local_clip_saved(&app_clone, &hash_str).await;
         });
+    }
+}
+
+fn insert_file_clip(
+    app: &tauri::AppHandle,
+    payload: &ClipboardFilePayload,
+    hash: &str,
+    source_app: &FrontmostApp,
+) {
+    let state = app.state::<AppState>();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    let icon = fetch_app_icon(&state, source_app);
+    let file_path = payload.path.to_string_lossy().to_string();
+
+    let conn = state.db_write.lock().unwrap();
+    let sync_id = uuid::Uuid::new_v4().to_string();
+    let sync_version = sync::next_sync_version_from_conn(&conn);
+    let origin_device_id: Option<String> = conn
+        .query_row("SELECT device_id FROM device_info LIMIT 1", [], |row| row.get(0))
+        .ok();
+
+    let result = conn.execute(
+        "INSERT INTO clips (content, content_hash, content_type, source_app, source_app_icon, created_at, sync_id, sync_version, deleted, origin_device_id, is_file, file_name, file_size, file_data, file_path)
+         VALUES (?1, ?2, 'text', ?3, ?4, ?5, ?6, ?7, 0, ?8, 1, ?9, ?10, ?11, ?12)
+         ON CONFLICT(content_hash) DO UPDATE SET
+            source_app = CASE
+                WHEN excluded.source_app <> '' THEN excluded.source_app
+                ELSE clips.source_app
+            END,
+            source_app_icon = CASE
+                WHEN length(excluded.source_app_icon) > 0 THEN excluded.source_app_icon
+                ELSE clips.source_app_icon
+            END,
+            created_at = excluded.created_at,
+            sync_id = COALESCE(clips.sync_id, excluded.sync_id),
+            sync_version = excluded.sync_version,
+            deleted = 0,
+            origin_device_id = COALESCE(clips.origin_device_id, excluded.origin_device_id),
+            is_file = 1,
+            file_name = COALESCE(excluded.file_name, clips.file_name),
+            file_size = CASE WHEN excluded.file_size > 0 THEN excluded.file_size ELSE clips.file_size END,
+            file_data = COALESCE(excluded.file_data, clips.file_data),
+            file_path = COALESCE(excluded.file_path, clips.file_path)",
+        rusqlite::params![
+            payload.file_name,
+            hash,
+            source_app.name,
+            icon,
+            now,
+            sync_id,
+            sync_version,
+            origin_device_id,
+            payload.file_name,
+            payload.file_size,
+            payload.file_data,
+            file_path,
+        ],
+    );
+
+    if result.is_ok() {
+        drop(conn);
+        let _ = app.emit("new-clip", ());
+        if payload.file_data.is_some() {
+            let app_clone = app.clone();
+            let hash_str = hash.to_string();
+            tauri::async_runtime::spawn(async move {
+                crate::sync::on_local_clip_saved(&app_clone, &hash_str).await;
+            });
+        }
     }
 }
 

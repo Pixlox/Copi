@@ -1,8 +1,13 @@
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+use hkdf::Hkdf;
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use rand::RngCore;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -12,6 +17,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
+use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::AppState;
 
@@ -22,10 +28,15 @@ const PIN_TTL: Duration = Duration::from_secs(120);
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const PING_INTERVAL: Duration = Duration::from_secs(60);
+pub const FILE_AUTO_SYNC_MAX_BYTES: i64 = 10 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 enum Msg {
+    AuthHello {
+        device_id: String,
+        session_seed: String,
+    },
     Hello {
         device_id: String,
         device_name: String,
@@ -42,10 +53,12 @@ enum Msg {
         device_id: String,
         device_name: String,
         pin: String,
+        public_key: String,
     },
     PairAccept {
         device_id: String,
         device_name: String,
+        public_key: String,
     },
     PairReject {
         reason: String,
@@ -63,6 +76,10 @@ enum Msg {
         hash: String,
         data: String,
     },
+    Secure {
+        nonce: u64,
+        payload: String,
+    },
     Ping,
     Pong,
 }
@@ -74,6 +91,16 @@ pub struct WireClip {
     source_device: String,
     kind: String,
     content: String,
+    #[serde(default)]
+    is_file: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_size: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_data: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_path: Option<String>,
     source_app: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     source_app_icon: Option<String>,
@@ -86,6 +113,10 @@ pub struct WireClip {
     pinned: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     image_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    embedding_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    embedding: Option<String>,
 }
 
 #[derive(Clone)]
@@ -102,12 +133,120 @@ impl PeerWriter {
     }
 }
 
+#[derive(Clone)]
+struct SecureSender {
+    writer: PeerWriter,
+    cipher: Arc<ChaCha20Poly1305>,
+    nonce: Arc<AtomicU64>,
+}
+
+impl SecureSender {
+    async fn send(&self, msg: &Msg) -> Result<()> {
+        let payload = serde_json::to_vec(msg).context("serialize secure msg")?;
+        let nonce = self.nonce.fetch_add(1, Ordering::SeqCst);
+        let nonce_bytes = nonce_to_bytes(nonce);
+        let encrypted = self
+            .cipher
+            .encrypt(Nonce::from_slice(&nonce_bytes), payload.as_ref())
+            .context("encrypt secure msg")?;
+        self.writer
+            .send(&Msg::Secure {
+                nonce,
+                payload: B64.encode(encrypted),
+            })
+            .await
+    }
+}
+
+struct SecureReceiver {
+    cipher: ChaCha20Poly1305,
+    next_nonce: u64,
+}
+
+impl SecureReceiver {
+    fn decrypt_msg(&mut self, nonce: u64, payload_b64: &str) -> Result<Msg> {
+        if nonce < self.next_nonce {
+            return Err(anyhow!("replayed secure frame nonce={}", nonce));
+        }
+        self.next_nonce = nonce + 1;
+
+        let ciphertext = B64.decode(payload_b64).context("decode secure payload")?;
+        let nonce_bytes = nonce_to_bytes(nonce);
+        let plaintext = self
+            .cipher
+            .decrypt(Nonce::from_slice(&nonce_bytes), ciphertext.as_ref())
+            .context("decrypt secure payload")?;
+        serde_json::from_slice(&plaintext).context("parse secure payload")
+    }
+}
+
+fn nonce_to_bytes(counter: u64) -> [u8; 12] {
+    let mut nonce = [0u8; 12];
+    nonce[4..].copy_from_slice(&counter.to_le_bytes());
+    nonce
+}
+
+fn parse_public_key_b64(data: &str) -> Result<PublicKey> {
+    let bytes = B64.decode(data).context("decode public key")?;
+    if bytes.len() != 32 {
+        return Err(anyhow!("invalid public key length"));
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    Ok(PublicKey::from(arr))
+}
+
+fn derive_secure_ciphers(
+    our_device_id: &str,
+    peer_device_id: &str,
+    our_secret: &StaticSecret,
+    peer_public: &PublicKey,
+    our_seed: &[u8],
+    peer_seed: &[u8],
+) -> Result<(ChaCha20Poly1305, ChaCha20Poly1305)> {
+    let shared = our_secret.diffie_hellman(peer_public);
+    let (seed_a, seed_b) = if our_device_id <= peer_device_id {
+        (our_seed, peer_seed)
+    } else {
+        (peer_seed, our_seed)
+    };
+
+    let mut ikm = Vec::with_capacity(32 + seed_a.len() + seed_b.len());
+    ikm.extend_from_slice(shared.as_bytes());
+    ikm.extend_from_slice(seed_a);
+    ikm.extend_from_slice(seed_b);
+
+    let hk = Hkdf::<Sha256>::new(None, &ikm);
+    let mut okm = [0u8; 64];
+    hk.expand(b"copi-sync-v2-session", &mut okm)
+        .map_err(|_| anyhow!("hkdf expand failed"))?;
+
+    let key_lower_to_upper = Key::from_slice(&okm[0..32]);
+    let key_upper_to_lower = Key::from_slice(&okm[32..64]);
+
+    let our_is_lower = our_device_id <= peer_device_id;
+    let tx = if our_is_lower {
+        ChaCha20Poly1305::new(key_lower_to_upper)
+    } else {
+        ChaCha20Poly1305::new(key_upper_to_lower)
+    };
+    let rx = if our_is_lower {
+        ChaCha20Poly1305::new(key_upper_to_lower)
+    } else {
+        ChaCha20Poly1305::new(key_lower_to_upper)
+    };
+
+    Ok((tx, rx))
+}
+
 pub struct SyncState {
     pub device_id: String,
     pub device_name: String,
+    identity_secret: [u8; 32],
+    identity_public_b64: String,
     enabled: AtomicBool,
     generation: AtomicU64,
-    live: RwLock<HashMap<String, PeerWriter>>,
+    live: RwLock<HashMap<String, SecureSender>>,
     connecting: RwLock<HashSet<String>>,
     known_addrs: RwLock<HashMap<String, SocketAddr>>,
     discovered: RwLock<HashMap<String, DiscoveredPeer>>,
@@ -142,7 +281,7 @@ impl SyncState {
     }
 
     async fn broadcast(&self, msg: Msg) -> Result<()> {
-        let peers: Vec<(String, PeerWriter)> = {
+        let peers: Vec<(String, SecureSender)> = {
             let guard = self.live.read().await;
             guard
                 .iter()
@@ -167,7 +306,7 @@ impl SyncState {
         Ok(())
     }
 
-    pub async fn register_peer(&self, device_id: String, writer: PeerWriter) {
+    async fn register_peer(&self, device_id: String, writer: SecureSender) {
         self.live.write().await.insert(device_id, writer);
     }
 
@@ -281,6 +420,17 @@ pub fn start_sync(app: AppHandle) -> Arc<SyncState> {
         device_name
     };
 
+    let (identity_secret, identity_public_b64) =
+        match get_or_create_sync_identity_keypair(&app) {
+            Ok(values) => values,
+            Err(error) => {
+                eprintln!("[Sync] Failed to load identity keypair: {}", error);
+                let secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+                let public = PublicKey::from(&secret);
+                (secret.to_bytes(), B64.encode(public.as_bytes()))
+            }
+        };
+
     ensure_windows_firewall_rules(SYNC_PORT);
 
     eprintln!("[Sync] Creating mDNS daemon for device_id={} device_name={}", device_id, device_name);
@@ -321,6 +471,8 @@ pub fn start_sync(app: AppHandle) -> Arc<SyncState> {
     let sync = Arc::new(SyncState {
         device_id,
         device_name,
+        identity_secret,
+        identity_public_b64,
         enabled: AtomicBool::new(false),
         generation: AtomicU64::new(0),
         live: RwLock::new(HashMap::new()),
@@ -689,24 +841,25 @@ async fn run_session(
     if !sync.is_enabled() {
         return Err(anyhow!("sync disabled"));
     }
-    // Get peer address before splitting the stream
     let peer_addr = stream
         .peer_addr()
         .ok()
         .map(|addr| SocketAddr::new(addr.ip(), SYNC_PORT));
     stream.set_nodelay(true).ok();
     let (read_half, write_half) = stream.into_split();
-    let writer = PeerWriter(Arc::new(AsyncMutex::new(write_half)));
+    let raw_writer = PeerWriter(Arc::new(AsyncMutex::new(write_half)));
     let mut reader = BufReader::new(read_half);
     let our_cursors = build_cursor_map(&app, &sync.device_id)?;
 
+    let our_secret = StaticSecret::from(sync.identity_secret);
+    let mut our_seed = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut our_seed);
+
     if initiator {
-        writer
-            .send(&Msg::Hello {
+        raw_writer
+            .send(&Msg::AuthHello {
                 device_id: sync.device_id.clone(),
-                device_name: sync.device_name.clone(),
-                protocol_version: PROTOCOL_VERSION,
-                cursors: our_cursors.clone(),
+                session_seed: B64.encode(our_seed),
             })
             .await?;
     }
@@ -718,23 +871,25 @@ async fn run_session(
     }
     let first_msg: Msg = serde_json::from_str(first_line.trim_end()).context("parse first msg")?;
 
-    let (peer_id, peer_name, peer_cursors) = match first_msg {
+    let (peer_id, peer_seed) = match first_msg {
         Msg::PairRequest {
             device_id,
             device_name,
             pin,
+            public_key,
         } => {
             if sync.verify_pin(&pin) {
                 eprintln!("[Sync] Pair request accepted from {} ({})", device_name, device_id);
-                save_trusted_peer(&app, &device_id, &device_name)?;
+                save_trusted_peer_with_key(&app, &device_id, &device_name, Some(&public_key))?;
                 if let Some(addr) = peer_addr {
                     let _ = update_peer_address(&app, &device_id, addr);
                 }
                 sync.clear_pin();
-                writer
+                raw_writer
                     .send(&Msg::PairAccept {
                         device_id: sync.device_id.clone(),
                         device_name: sync.device_name.clone(),
+                        public_key: sync.identity_public_b64.clone(),
                     })
                     .await?;
                 let _ = app.emit(
@@ -747,7 +902,7 @@ async fn run_session(
                 return Ok(());
             } else {
                 eprintln!("[Sync] Pair request rejected from {} ({})", device_name, device_id);
-                writer
+                raw_writer
                     .send(&Msg::PairReject {
                         reason: "Invalid or expired PIN".to_string(),
                     })
@@ -755,6 +910,81 @@ async fn run_session(
                 return Err(anyhow!("invalid pairing pin"));
             }
         }
+        Msg::AuthHello {
+            device_id,
+            session_seed,
+        } => {
+            let seed = B64.decode(session_seed).context("decode peer session seed")?;
+            if seed.len() != 16 {
+                return Err(anyhow!("invalid peer session seed length"));
+            }
+            (device_id, seed)
+        }
+        _ => return Err(anyhow!("expected secure auth hello")),
+    };
+
+    if peer_id == sync.device_id {
+        return Err(anyhow!("self-connection rejected"));
+    }
+    if !is_trusted_peer(&app, &peer_id)? {
+        return Err(anyhow!("untrusted peer {}", peer_id));
+    }
+
+    let peer_public_b64 = get_trusted_peer_public_key(&app, &peer_id)?
+        .ok_or_else(|| anyhow!("trusted peer missing public key, re-pair required"))?;
+    let peer_public = parse_public_key_b64(&peer_public_b64)?;
+
+    if !initiator {
+        raw_writer
+            .send(&Msg::AuthHello {
+                device_id: sync.device_id.clone(),
+                session_seed: B64.encode(our_seed),
+            })
+            .await?;
+    }
+
+    let (tx_cipher, rx_cipher) = derive_secure_ciphers(
+        &sync.device_id,
+        &peer_id,
+        &our_secret,
+        &peer_public,
+        &our_seed,
+        &peer_seed,
+    )?;
+    let secure_writer = SecureSender {
+        writer: raw_writer.clone(),
+        cipher: Arc::new(tx_cipher),
+        nonce: Arc::new(AtomicU64::new(0)),
+    };
+    let mut secure_receiver = SecureReceiver {
+        cipher: rx_cipher,
+        next_nonce: 0,
+    };
+
+    if initiator {
+        secure_writer
+            .send(&Msg::Hello {
+                device_id: sync.device_id.clone(),
+                device_name: sync.device_name.clone(),
+                protocol_version: PROTOCOL_VERSION,
+                cursors: our_cursors.clone(),
+            })
+            .await?;
+    }
+
+    let mut handshake_line = String::new();
+    let read = reader.read_line(&mut handshake_line).await?;
+    if read == 0 {
+        return Err(anyhow!("session closed before secure handshake"));
+    }
+    let handshake_outer: Msg =
+        serde_json::from_str(handshake_line.trim_end()).context("parse handshake outer msg")?;
+    let handshake_msg = match handshake_outer {
+        Msg::Secure { nonce, payload } => secure_receiver.decrypt_msg(nonce, &payload)?,
+        _ => return Err(anyhow!("expected secure handshake frame")),
+    };
+
+    let (peer_name, peer_cursors) = match handshake_msg {
         Msg::Hello {
             device_id,
             device_name,
@@ -765,11 +995,11 @@ async fn run_session(
             if protocol_version != PROTOCOL_VERSION {
                 return Err(anyhow!("protocol mismatch {}", protocol_version));
             }
-            if !is_trusted_peer(&app, &device_id)? {
-                return Err(anyhow!("untrusted peer {}", device_id));
+            if device_id != peer_id {
+                return Err(anyhow!("secure peer mismatch {} != {}", device_id, peer_id));
             }
-            save_trusted_peer(&app, &device_id, &device_name)?;
-            writer
+            save_trusted_peer_with_key(&app, &device_id, &device_name, Some(&peer_public_b64))?;
+            secure_writer
                 .send(&Msg::HelloAck {
                     device_id: sync.device_id.clone(),
                     device_name: sync.device_name.clone(),
@@ -777,7 +1007,7 @@ async fn run_session(
                     cursors: our_cursors.clone(),
                 })
                 .await?;
-            (device_id, device_name, cursors)
+            (device_name, cursors)
         }
         Msg::HelloAck {
             device_id,
@@ -792,15 +1022,13 @@ async fn run_session(
             if protocol_version != PROTOCOL_VERSION {
                 return Err(anyhow!("protocol mismatch {}", protocol_version));
             }
-            if !is_trusted_peer(&app, &device_id)? {
-                return Err(anyhow!("untrusted peer {}", device_id));
+            if device_id != peer_id {
+                return Err(anyhow!("secure peer mismatch {} != {}", device_id, peer_id));
             }
-            save_trusted_peer(&app, &device_id, &device_name)?;
-            (device_id, device_name, cursors)
+            save_trusted_peer_with_key(&app, &device_id, &device_name, Some(&peer_public_b64))?;
+            (device_name, cursors)
         }
-        _ => {
-            return Err(anyhow!("unexpected handshake message"));
-        }
+        _ => return Err(anyhow!("unexpected secure handshake message")),
     };
 
     if let Some(expected) = expected_peer {
@@ -818,7 +1046,7 @@ async fn run_session(
         return Ok(());
     }
 
-    sync.register_peer(peer_id.clone(), writer.clone()).await;
+    sync.register_peer(peer_id.clone(), secure_writer.clone()).await;
     eprintln!("[Sync] Session connected peer={} name={} (now registered)", peer_id, peer_name);
 
     // Save the peer address for cross-platform reconnection (mDNS workaround)
@@ -847,7 +1075,7 @@ async fn run_session(
     let delta = get_clips_since(&app, &sync.device_id, peer_cursor)?;
     eprintln!("[Sync] Sending {} clips to peer {} (since cursor {})", delta.len(), peer_id, peer_cursor);
     if !delta.is_empty() {
-        writer.send(&Msg::ClipBatch { clips: delta }).await?;
+        secure_writer.send(&Msg::ClipBatch { clips: delta }).await?;
         eprintln!("[Sync] Sent clip batch to peer {}", peer_id);
     }
 
@@ -859,14 +1087,28 @@ async fn run_session(
                 match read_result {
                     Ok(0) => break Ok(()),
                     Ok(_) => {
-                        let msg: Msg = match serde_json::from_str(line.trim_end()) {
+                        let outer: Msg = match serde_json::from_str(line.trim_end()) {
                             Ok(msg) => msg,
                             Err(error) => {
                                 eprintln!("[Sync] Failed to parse message from {}: {}", peer_id, error);
                                 break Err(anyhow!("invalid message from peer"));
                             }
                         };
-                        if let Err(error) = handle_message(&app, &sync, &peer_id, &writer, msg).await {
+                        let msg = match outer {
+                            Msg::Secure { nonce, payload } => {
+                                match secure_receiver.decrypt_msg(nonce, &payload) {
+                                    Ok(msg) => msg,
+                                    Err(error) => {
+                                        eprintln!("[Sync] Failed to decrypt message from {}: {}", peer_id, error);
+                                        break Err(anyhow!("failed to decrypt message"));
+                                    }
+                                }
+                            }
+                            _ => {
+                                break Err(anyhow!("received unencrypted message from trusted peer"));
+                            }
+                        };
+                        if let Err(error) = handle_message(&app, &sync, &peer_id, &secure_writer, msg).await {
                             break Err(error);
                         }
                     }
@@ -874,7 +1116,7 @@ async fn run_session(
                 }
             }
             _ = ping.tick() => {
-                if let Err(error) = writer.send(&Msg::Ping).await {
+                if let Err(error) = secure_writer.send(&Msg::Ping).await {
                     break Err(error);
                 }
             }
@@ -898,7 +1140,7 @@ async fn handle_message(
     app: &AppHandle,
     sync: &Arc<SyncState>,
     peer_id: &str,
-    writer: &PeerWriter,
+    writer: &SecureSender,
     msg: Msg,
 ) -> Result<()> {
     match msg {
@@ -942,7 +1184,7 @@ async fn receive_clips(
     app: &AppHandle,
     sync: &Arc<SyncState>,
     peer_id: &str,
-    writer: &PeerWriter,
+    writer: &SecureSender,
     clips: Vec<WireClip>,
 ) -> Result<()> {
     eprintln!("[Sync] Receiving {} clips from peer {}", clips.len(), peer_id);
@@ -971,6 +1213,12 @@ async fn receive_clips(
             .source_app_icon
             .as_ref()
             .and_then(|icon| B64.decode(icon).ok());
+        let decoded_file_data = clip
+            .file_data
+            .as_ref()
+            .and_then(|data| B64.decode(data).ok());
+        let has_remote_embedding = clip.embedding.is_some()
+            && clip.embedding_model.as_deref() == Some(crate::embed::EMBEDDING_MODEL_SIGNATURE);
         let should_request_blob = {
             let state = app.state::<AppState>();
             let conn = state
@@ -978,9 +1226,44 @@ async fn receive_clips(
                 .lock()
                 .map_err(|e| anyhow!("lock poisoned: {}", e))?;
 
-            let rows = conn.execute(
-                "INSERT OR IGNORE INTO clips (content, content_hash, content_type, source_app, source_app_icon, content_highlighted, ocr_text, language, created_at, pinned, image_data, source_device, deleted)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11, 0)",
+            let existing_clip_id: Option<i64> = conn
+                .query_row(
+                    "SELECT id FROM clips WHERE content_hash = ?1 AND deleted = 0 LIMIT 1",
+                    [clip.hash.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+
+            conn.execute(
+                "INSERT INTO clips (content, content_hash, content_type, source_app, source_app_icon, content_highlighted, ocr_text, language, created_at, pinned, image_data, source_device, deleted, is_file, file_name, file_size, file_data, file_path)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11, 0, ?12, ?13, ?14, ?15, ?16)
+                 ON CONFLICT(content_hash) DO UPDATE SET
+                    source_app = CASE
+                        WHEN excluded.source_app <> '' THEN excluded.source_app
+                        ELSE clips.source_app
+                    END,
+                    source_app_icon = CASE
+                        WHEN length(COALESCE(excluded.source_app_icon, X'')) > 0 THEN excluded.source_app_icon
+                        ELSE clips.source_app_icon
+                    END,
+                    content_highlighted = COALESCE(excluded.content_highlighted, clips.content_highlighted),
+                    ocr_text = COALESCE(excluded.ocr_text, clips.ocr_text),
+                    language = COALESCE(excluded.language, clips.language),
+                    pinned = CASE WHEN excluded.pinned = 1 THEN 1 ELSE clips.pinned END,
+                    created_at = CASE
+                        WHEN excluded.created_at > clips.created_at THEN excluded.created_at
+                        ELSE clips.created_at
+                    END,
+                    source_device = CASE
+                        WHEN clips.source_device = '' THEN excluded.source_device
+                        ELSE clips.source_device
+                    END,
+                    is_file = CASE WHEN excluded.is_file = 1 THEN 1 ELSE clips.is_file END,
+                    file_name = COALESCE(excluded.file_name, clips.file_name),
+                    file_size = CASE WHEN excluded.file_size > 0 THEN excluded.file_size ELSE clips.file_size END,
+                    file_data = COALESCE(excluded.file_data, clips.file_data),
+                    file_path = COALESCE(excluded.file_path, clips.file_path),
+                    deleted = 0",
                 rusqlite::params![
                     clip.content,
                     clip.hash,
@@ -993,25 +1276,45 @@ async fn receive_clips(
                     clip.created_at,
                     if clip.pinned { 1 } else { 0 },
                     clip.source_device,
+                    if clip.is_file { 1 } else { 0 },
+                    clip.file_name,
+                    clip.file_size.unwrap_or(0),
+                    decoded_file_data,
+                    clip.file_path,
                 ],
             )?;
 
-            if rows > 0 {
+            let clip_id: i64 = if let Some(id) = existing_clip_id {
+                id
+            } else {
+                conn.last_insert_rowid()
+            };
+
+            if existing_clip_id.is_none() {
                 inserted_any = true;
                 insert_count += 1;
-                let clip_id = conn.last_insert_rowid();
                 eprintln!("[Sync] Inserted clip id={} hash={}", clip_id, clip.hash);
-                if let Err(error) = state.clip_tx.try_send(clip_id) {
-                    eprintln!(
-                        "[Sync][debug] embed queue full/dropped for clip {}: {}",
-                        clip_id, error
-                    );
+                if !clip.is_file && !has_remote_embedding {
+                    if let Err(error) = state.clip_tx.try_send(clip_id) {
+                        eprintln!(
+                            "[Sync][debug] embed queue full/dropped for clip {}: {}",
+                            clip_id, error
+                        );
+                    }
                 }
             } else {
-                eprintln!("[Sync] Clip already exists or ignored: hash={}", clip.hash);
+                eprintln!("[Sync] Clip exists, merged metadata: hash={}", clip.hash);
             }
 
-            if clip.kind == "image" {
+            if has_remote_embedding {
+                if let Some(embedding_b64) = clip.embedding.as_ref() {
+                    if let Ok(embedding_bytes) = B64.decode(embedding_b64) {
+                        let _ = store_embedding_for_clip_id(&conn, clip_id, &embedding_bytes);
+                    }
+                }
+            }
+
+            if clip.kind == "image" && !clip.is_file {
                 if let Some(image_hash) = clip.image_hash.clone() {
                     let needs_blob: Option<i64> = conn
                         .query_row(
@@ -1103,6 +1406,19 @@ fn save_image_blob_if_missing(app: &AppHandle, hash: &str, bytes: &[u8]) -> Resu
     }
 }
 
+fn store_embedding_for_clip_id(conn: &rusqlite::Connection, clip_id: i64, embedding: &[u8]) -> Result<()> {
+    // 384 float32 values
+    if embedding.len() != 384 * 4 {
+        return Ok(());
+    }
+    conn.execute("DELETE FROM clip_embeddings WHERE rowid = ?1", [clip_id])?;
+    conn.execute(
+        "INSERT INTO clip_embeddings(rowid, embedding) VALUES (?1, ?2)",
+        rusqlite::params![clip_id, embedding],
+    )?;
+    Ok(())
+}
+
 pub fn get_or_create_device_id(app: &AppHandle) -> Result<String> {
     let state = app.state::<AppState>();
     let conn = state
@@ -1128,6 +1444,54 @@ pub fn get_or_create_device_id(app: &AppHandle) -> Result<String> {
         [device_id.clone()],
     )?;
     Ok(device_id)
+}
+
+pub fn get_or_create_sync_identity_keypair(app: &AppHandle) -> Result<([u8; 32], String)> {
+    let state = app.state::<AppState>();
+    let conn = state
+        .db_write
+        .lock()
+        .map_err(|e| anyhow!("lock poisoned: {}", e))?;
+
+    let private_b64: Option<String> = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'sync_private_key'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let public_b64: Option<String> = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'sync_public_key'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    if let (Some(private_b64), Some(public_b64)) = (private_b64, public_b64) {
+        let private_bytes = B64.decode(private_b64).context("decode sync private key")?;
+        if private_bytes.len() == 32 {
+            let mut secret = [0u8; 32];
+            secret.copy_from_slice(&private_bytes);
+            return Ok((secret, public_b64));
+        }
+    }
+
+    let secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+    let public = PublicKey::from(&secret);
+    let secret_b64 = B64.encode(secret.to_bytes());
+    let public_b64 = B64.encode(public.as_bytes());
+
+    conn.execute(
+        "INSERT OR REPLACE INTO settings(key, value) VALUES ('sync_private_key', ?1)",
+        [secret_b64],
+    )?;
+    conn.execute(
+        "INSERT OR REPLACE INTO settings(key, value) VALUES ('sync_public_key', ?1)",
+        [public_b64.clone()],
+    )?;
+
+    Ok((secret.to_bytes(), public_b64))
 }
 
 pub fn get_trusted_peers(app: &AppHandle) -> Result<Vec<TrustedPeer>> {
@@ -1169,7 +1533,12 @@ pub fn is_trusted_peer(app: &AppHandle, device_id: &str) -> Result<bool> {
     Ok(is_trusted)
 }
 
-pub fn save_trusted_peer(app: &AppHandle, device_id: &str, display_name: &str) -> Result<()> {
+pub fn save_trusted_peer_with_key(
+    app: &AppHandle,
+    device_id: &str,
+    display_name: &str,
+    public_key: Option<&str>,
+) -> Result<()> {
     eprintln!("[Sync] Saving trusted peer: device_id={} display_name={}", device_id, display_name);
     let state = app.state::<AppState>();
     let conn = state
@@ -1177,14 +1546,29 @@ pub fn save_trusted_peer(app: &AppHandle, device_id: &str, display_name: &str) -
         .lock()
         .map_err(|e| anyhow!("lock poisoned: {}", e))?;
     let rows = conn.execute(
-        "INSERT INTO sync_peers(device_id, display_name, last_seen)
-         VALUES (?1, ?2, ?3)
+        "INSERT INTO sync_peers(device_id, display_name, last_seen, public_key)
+         VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT(device_id)
-         DO UPDATE SET display_name = excluded.display_name, last_seen = excluded.last_seen",
-        rusqlite::params![device_id, display_name, now_ts()],
+         DO UPDATE SET display_name = excluded.display_name,
+                       last_seen = excluded.last_seen,
+                       public_key = COALESCE(excluded.public_key, sync_peers.public_key)",
+        rusqlite::params![device_id, display_name, now_ts(), public_key],
     )?;
     eprintln!("[Sync] Saved trusted peer rows_affected={}", rows);
     Ok(())
+}
+
+pub fn get_trusted_peer_public_key(app: &AppHandle, device_id: &str) -> Result<Option<String>> {
+    let state = app.state::<AppState>();
+    let conn = state.db_read_pool.get().context("db read pool")?;
+    conn.query_row(
+        "SELECT public_key FROM sync_peers WHERE device_id = ?1",
+        [device_id],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .optional()
+    .map(|v| v.flatten())
+    .map_err(Into::into)
 }
 
 pub fn remove_trusted_peer(app: &AppHandle, device_id: &str) -> Result<()> {
@@ -1304,7 +1688,13 @@ pub fn get_clips_since(app: &AppHandle, our_device_id: &str, since: i64) -> Resu
                 ocr_text,
                 content_highlighted,
                 language,
-                pinned
+                pinned,
+                COALESCE(is_file, 0),
+                file_name,
+                COALESCE(file_size, 0),
+                file_data,
+                file_path,
+                (SELECT embedding FROM clip_embeddings WHERE rowid = clips.id)
          FROM clips
          WHERE deleted = 0
            AND created_at > ?1
@@ -1326,6 +1716,12 @@ pub fn get_clips_since(app: &AppHandle, our_device_id: &str, since: i64) -> Resu
             row.get::<_, Option<String>>(8)?,
             row.get::<_, Option<String>>(9)?,
             row.get::<_, i64>(10)?,
+            row.get::<_, i64>(11)?,
+            row.get::<_, Option<String>>(12)?,
+            row.get::<_, i64>(13)?,
+            row.get::<_, Option<Vec<u8>>>(14)?,
+            row.get::<_, Option<String>>(15)?,
+            row.get::<_, Option<Vec<u8>>>(16)?,
         ))
     })?;
 
@@ -1343,6 +1739,12 @@ pub fn get_clips_since(app: &AppHandle, our_device_id: &str, since: i64) -> Resu
             content_highlighted,
             language,
             pinned,
+            is_file,
+            file_name,
+            file_size,
+            file_data,
+            _file_path,
+            embedding,
         ) = row?;
 
         let send_source = if source_device.is_empty() {
@@ -1357,6 +1759,21 @@ pub fn get_clips_since(app: &AppHandle, our_device_id: &str, since: i64) -> Resu
             None
         };
 
+        let encoded_file_data = if is_file != 0 && file_size > 0 && file_size <= FILE_AUTO_SYNC_MAX_BYTES
+        {
+            file_data
+                .as_ref()
+                .filter(|bytes| !bytes.is_empty())
+                .map(|bytes| B64.encode(bytes))
+        } else {
+            None
+        };
+
+        let embedding_encoded = embedding
+            .as_ref()
+            .filter(|bytes| !bytes.is_empty())
+            .map(|bytes| B64.encode(bytes));
+
         clips.push(WireClip {
             hash,
             created_at,
@@ -1367,6 +1784,11 @@ pub fn get_clips_since(app: &AppHandle, our_device_id: &str, since: i64) -> Resu
             } else {
                 content
             },
+            is_file: is_file != 0,
+            file_name,
+            file_size: if file_size > 0 { Some(file_size) } else { None },
+            file_data: encoded_file_data,
+            file_path: None,
             source_app,
             source_app_icon: source_app_icon.map(|icon| B64.encode(icon)),
             ocr_text,
@@ -1374,6 +1796,10 @@ pub fn get_clips_since(app: &AppHandle, our_device_id: &str, since: i64) -> Resu
             language,
             pinned: pinned != 0,
             image_hash,
+            embedding_model: embedding_encoded
+                .as_ref()
+                .map(|_| crate::embed::EMBEDDING_MODEL_SIGNATURE.to_string()),
+            embedding: embedding_encoded,
         });
     }
 
@@ -1522,6 +1948,12 @@ async fn lookup_clip_for_push(
                     row.get::<_, Option<String>>(9)?,
                     row.get::<_, i64>(10)?,
                     row.get::<_, Option<Vec<u8>>>(11)?,
+                    row.get::<_, i64>(12)?,
+                    row.get::<_, Option<String>>(13)?,
+                    row.get::<_, i64>(14)?,
+                    row.get::<_, Option<Vec<u8>>>(15)?,
+                    row.get::<_, Option<String>>(16)?,
+                    row.get::<_, Option<Vec<u8>>>(17)?,
                 ))
             })
             .optional()?;
@@ -1539,8 +1971,28 @@ async fn lookup_clip_for_push(
             language,
             pinned,
             image_data,
+            is_file,
+            file_name,
+            file_size,
+            file_data,
+            file_path,
+            embedding,
         )) = row
         {
+            let encoded_file_data = if is_file != 0 && file_size > 0 && file_size <= FILE_AUTO_SYNC_MAX_BYTES {
+                file_data
+                    .as_ref()
+                    .filter(|bytes| !bytes.is_empty())
+                    .map(|bytes| B64.encode(bytes))
+            } else {
+                None
+            };
+
+            let embedding_encoded = embedding
+                .as_ref()
+                .filter(|bytes| !bytes.is_empty())
+                .map(|bytes| B64.encode(bytes));
+
             let wire = WireClip {
                 hash: hash.clone(),
                 created_at,
@@ -1555,6 +2007,11 @@ async fn lookup_clip_for_push(
                 } else {
                     content
                 },
+                is_file: is_file != 0,
+                file_name,
+                file_size: if file_size > 0 { Some(file_size) } else { None },
+                file_data: encoded_file_data,
+                file_path,
                 source_app,
                 source_app_icon: source_app_icon.map(|icon| B64.encode(icon)),
                 ocr_text,
@@ -1566,6 +2023,10 @@ async fn lookup_clip_for_push(
                 } else {
                     None
                 },
+                embedding_model: embedding_encoded
+                    .as_ref()
+                    .map(|_| crate::embed::EMBEDDING_MODEL_SIGNATURE.to_string()),
+                embedding: embedding_encoded,
             };
             return Ok(Some((wire, image_data)));
         }
@@ -1585,7 +2046,13 @@ async fn lookup_clip_for_push(
                 content_highlighted,
                 language,
                 pinned,
-                image_data
+                image_data,
+                COALESCE(is_file, 0),
+                file_name,
+                COALESCE(file_size, 0),
+                file_data,
+                file_path,
+                (SELECT embedding FROM clip_embeddings WHERE rowid = clips.id)
          FROM clips
          WHERE content_hash = ?1
            AND deleted = 0
@@ -1608,7 +2075,13 @@ async fn lookup_clip_for_push(
                 content_highlighted,
                 language,
                 pinned,
-                image_data
+                image_data,
+                COALESCE(is_file, 0),
+                file_name,
+                COALESCE(file_size, 0),
+                file_data,
+                file_path,
+                (SELECT embedding FROM clip_embeddings WHERE rowid = clips.id)
          FROM clips
          WHERE sync_id = ?1
            AND deleted = 0
@@ -1716,6 +2189,7 @@ pub async fn sync_pair_with(
             device_id: sync.device_id.clone(),
             device_name: sync.device_name.clone(),
             pin,
+            public_key: sync.identity_public_b64.clone(),
         })
         .await
         .map_err(|e| e.to_string())?;
@@ -1735,8 +2209,10 @@ pub async fn sync_pair_with(
         Msg::PairAccept {
             device_id,
             device_name,
+            public_key,
         } => {
-            save_trusted_peer(&app, &device_id, &device_name).map_err(|e| e.to_string())?;
+            save_trusted_peer_with_key(&app, &device_id, &device_name, Some(&public_key))
+                .map_err(|e| e.to_string())?;
             let peer_addr = SocketAddr::new(addr.ip(), SYNC_PORT);
             let _ = update_peer_address(&app, &device_id, peer_addr);
             {
@@ -1796,6 +2272,9 @@ pub async fn on_local_clip_saved(app: &AppHandle, content_hash: &str) {
     };
 
     let (wire_clip, image_data) = clip;
+    if wire_clip.is_file && wire_clip.file_data.is_none() {
+        return;
+    }
     let image_hash = wire_clip.image_hash.clone();
     let is_image = wire_clip.kind == "image";
 
