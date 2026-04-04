@@ -1606,19 +1606,23 @@ pub fn get_trusted_peers_with_addrs(app: &AppHandle) -> Result<Vec<(String, Stri
     let conn = state.db_read_pool.get().context("db read pool")?;
 
     let mut stmt = conn.prepare(
-        "SELECT device_id, display_name, last_addr FROM sync_peers",
+        "SELECT device_id, display_name, last_addr, public_key FROM sync_peers",
     )?;
 
     let rows = stmt.query_map([], |row| {
         let device_id: String = row.get(0)?;
         let display_name: String = row.get(1)?;
         let last_addr: Option<String> = row.get(2)?;
-        Ok((device_id, display_name, last_addr))
+        let public_key: Option<String> = row.get(3)?;
+        Ok((device_id, display_name, last_addr, public_key))
     })?;
 
     let mut peers = Vec::new();
     for row in rows {
-        let (device_id, display_name, last_addr) = row?;
+        let (device_id, display_name, last_addr, public_key) = row?;
+        if public_key.as_deref().map(|v| v.trim().is_empty()).unwrap_or(true) {
+            continue;
+        }
         let addr = last_addr.and_then(|s| s.parse::<SocketAddr>().ok());
         peers.push((device_id, display_name, addr));
     }
