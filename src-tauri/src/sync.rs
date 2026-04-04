@@ -726,6 +726,9 @@ async fn run_browser(
                             eprintln!("[Sync] Auto-connect disabled; not dialing {}", peer_id);
                             continue;
                         }
+                        if !should_initiate_connection(&sync.device_id, &peer_id) {
+                            continue;
+                        }
                         let is_connected = sync.connected_peers().await.contains(&peer_id);
                         if !is_connected {
                             let app_clone = app.clone();
@@ -777,6 +780,11 @@ async fn reconnect_loop(app: AppHandle, sync: Arc<SyncState>, peer_id: String, g
         }
 
         if !auto_connect_enabled(&app) {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            continue;
+        }
+
+        if !should_initiate_connection(&sync.device_id, &peer_id) {
             tokio::time::sleep(Duration::from_secs(5)).await;
             continue;
         }
@@ -1993,6 +2001,10 @@ fn extract_peer_id(fullname: &str) -> String {
         .next()
         .map(|s| s.to_string())
         .unwrap_or_default()
+}
+
+fn should_initiate_connection(our_device_id: &str, peer_device_id: &str) -> bool {
+    our_device_id < peer_device_id
 }
 
 #[cfg(target_os = "windows")]
