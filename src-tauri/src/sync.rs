@@ -1266,6 +1266,14 @@ async fn receive_clips(
             continue;
         }
 
+        if clip.is_file && clip.file_data.is_none() {
+            eprintln!(
+                "[Sync] Skipping unsendable file clip (missing bytes): hash={}",
+                clip.hash
+            );
+            continue;
+        }
+
         eprintln!(
             "[Sync] Processing clip: hash={} kind={} source={}",
             clip.hash, clip.kind, clip.source_device
@@ -1793,31 +1801,42 @@ pub fn get_clips_since(app: &AppHandle, our_device_id: &str, since: i64) -> Resu
          WHERE deleted = 0
            AND created_at > ?1
            AND (source_device = '' OR source_device = ?2)
+           AND (
+                COALESCE(is_file, 0) = 0
+                OR (
+                    COALESCE(file_size, 0) > 0
+                    AND COALESCE(file_size, 0) <= ?3
+                    AND length(COALESCE(file_data, X'')) > 0
+                )
+           )
          ORDER BY created_at ASC
          LIMIT 500",
     )?;
 
-    let rows = stmt.query_map(rusqlite::params![since, our_device_id], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, String>(5)?,
-            row.get::<_, Option<Vec<u8>>>(6)?,
-            row.get::<_, Option<String>>(7)?,
-            row.get::<_, Option<String>>(8)?,
-            row.get::<_, Option<String>>(9)?,
-            row.get::<_, i64>(10)?,
-            row.get::<_, i64>(11)?,
-            row.get::<_, Option<String>>(12)?,
-            row.get::<_, i64>(13)?,
-            row.get::<_, Option<Vec<u8>>>(14)?,
-            row.get::<_, Option<String>>(15)?,
-            row.get::<_, Option<Vec<u8>>>(16)?,
-        ))
-    })?;
+    let rows = stmt.query_map(
+        rusqlite::params![since, our_device_id, FILE_AUTO_SYNC_MAX_BYTES],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<Vec<u8>>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, i64>(10)?,
+                row.get::<_, i64>(11)?,
+                row.get::<_, Option<String>>(12)?,
+                row.get::<_, i64>(13)?,
+                row.get::<_, Option<Vec<u8>>>(14)?,
+                row.get::<_, Option<String>>(15)?,
+                row.get::<_, Option<Vec<u8>>>(16)?,
+            ))
+        },
+    )?;
 
     let mut clips = Vec::new();
     for row in rows {

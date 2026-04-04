@@ -657,6 +657,47 @@ fn parse_file_uri_list(text: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn percent_decode_uri_decodes_spaces() {
+        let decoded = percent_decode_uri("/tmp/my%20file.txt");
+        assert_eq!(decoded, "/tmp/my file.txt");
+    }
+
+    #[test]
+    fn parse_file_uri_list_only_keeps_existing_paths() {
+        let temp = std::env::temp_dir().join("copi_clipboard_uri_test_existing.txt");
+        std::fs::write(&temp, b"ok").unwrap();
+
+        let existing_uri = format!("file://{}", temp.to_string_lossy());
+        let text = format!(
+            "{}\nfile:///definitely-not-existing-copi-path",
+            existing_uri
+        );
+        let paths = parse_file_uri_list(&text);
+
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], temp);
+
+        let _ = std::fs::remove_file(&temp);
+    }
+
+    #[test]
+    fn decode_file_uri_path_handles_localhost() {
+        let temp = std::env::temp_dir().join("copi_clipboard_uri_test_localhost.txt");
+        std::fs::write(&temp, b"ok").unwrap();
+
+        let uri = format!("file://localhost{}", temp.to_string_lossy());
+        let decoded = decode_file_uri_path(&uri).unwrap();
+
+        assert_eq!(decoded, temp);
+        let _ = std::fs::remove_file(&temp);
+    }
+}
+
 // PERF 1: PNG encoding/decoding
 fn rgba_to_png(bytes: &[u8], width: usize, height: usize) -> Option<Vec<u8>> {
     let mut png_bytes = Vec::new();
