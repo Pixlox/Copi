@@ -102,6 +102,22 @@ pub async fn watch_clipboard(app: &tauri::AppHandle) {
 
         // ── Text clipboard ────────────────────────────────────────
         if let Ok(text) = clipboard.get_text() {
+            let file_paths = parse_file_uri_list(&text);
+            if !file_paths.is_empty() {
+                let mut hash_input = String::new();
+                for path in &file_paths {
+                    hash_input.push_str(path.to_string_lossy().as_ref());
+                    hash_input.push('\n');
+                }
+                let file_hash = compute_hash(&format!("file-uri-list:{}", hash_input));
+                if file_hash != last_file_hash {
+                    last_file_hash = file_hash.clone();
+                    queue_file_capture(app, file_paths, file_hash, source_app.clone());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(140)).await;
+                continue;
+            }
+
             let hash = compute_hash(&text);
             if hash != last_text_hash && !text.trim().is_empty() {
                 last_text_hash = hash.clone();
@@ -334,7 +350,17 @@ pub async fn backfill_language_tags(app: &tauri::AppHandle) {
 #[tauri::command]
 pub async fn copy_to_clipboard(app: tauri::AppHandle, clip_id: i64) -> Result<(), String> {
     // Phase 1: read data from pool (no write lock held)
-    let (content_type, content, image_bytes, width, height, is_file, file_name, file_data, file_path) = {
+    let (
+        content_type,
+        content,
+        image_bytes,
+        width,
+        height,
+        is_file,
+        file_name,
+        file_data,
+        file_path,
+    ) = {
         let conn = app
             .state::<AppState>()
             .db_read_pool
@@ -353,17 +379,19 @@ pub async fn copy_to_clipboard(app: tauri::AppHandle, clip_id: i64) -> Result<()
              FROM clips
              WHERE id = ? AND deleted = 0",
             [clip_id],
-            |row| Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, i64>(5)? != 0,
-                row.get::<_, String>(6)?,
-                row.get::<_, Vec<u8>>(7)?,
-                row.get::<_, String>(8)?,
-            )),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)? != 0,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Vec<u8>>(7)?,
+                    row.get::<_, String>(8)?,
+                ))
+            },
         )
         .map_err(|e| e.to_string())?
     };
@@ -536,6 +564,97 @@ fn b64(data: &[u8]) -> String {
         }
     }
     encoded
+}
+
+fn decode_file_uri_path(raw: &str) -> Option<PathBuf> {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with("file://") {
+        return None;
+    }
+
+    let rest = &trimmed[7..];
+    let (authority, path_part) = if rest.starts_with('/') {
+        ("", rest)
+    } else {
+        match rest.split_once('/') {
+            Some((host, tail)) => (host, tail),
+            None => (rest, ""),
+        }
+    };
+    let authority_decoded = percent_decode_uri(authority);
+    let path_decoded = percent_decode_uri(path_part);
+
+    #[cfg(target_os = "windows")]
+    {
+        if !authority_decoded.is_empty() && authority_decoded != "localhost" {
+            let tail = path_decoded.trim_start_matches('/').replace('/', "\\");
+            if tail.is_empty() {
+                return None;
+            }
+            return Some(PathBuf::from(format!(
+                "\\\\{}\\{}",
+                authority_decoded, tail
+            )));
+        }
+
+        let normalized = path_decoded.trim_start_matches('/').replace('/', "\\");
+        if normalized.is_empty() {
+            return None;
+        }
+        Some(PathBuf::from(normalized))
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        if !authority_decoded.is_empty() && authority_decoded != "localhost" {
+            let full = format!(
+                "//{}/{}",
+                authority_decoded,
+                path_decoded.trim_start_matches('/')
+            );
+            if full.len() <= 2 {
+                return None;
+            }
+            return Some(PathBuf::from(full));
+        }
+
+        let decoded = if path_decoded.starts_with('/') {
+            path_decoded
+        } else {
+            format!("/{}", path_decoded)
+        };
+        if decoded.is_empty() {
+            return None;
+        }
+        Some(PathBuf::from(decoded))
+    }
+}
+
+fn percent_decode_uri(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let h1 = (bytes[i + 1] as char).to_digit(16);
+            let h2 = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(a), Some(b)) = (h1, h2) {
+                out.push(((a << 4) as u8) | (b as u8));
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+fn parse_file_uri_list(text: &str) -> Vec<PathBuf> {
+    text.lines()
+        .filter_map(decode_file_uri_path)
+        .filter(|path| path.exists())
+        .collect()
 }
 
 // PERF 1: PNG encoding/decoding
@@ -1212,7 +1331,9 @@ fn insert_file_clip(
     let sync_id = uuid::Uuid::new_v4().to_string();
     let sync_version = sync::next_sync_version_from_conn(&conn);
     let origin_device_id: Option<String> = conn
-        .query_row("SELECT device_id FROM device_info LIMIT 1", [], |row| row.get(0))
+        .query_row("SELECT device_id FROM device_info LIMIT 1", [], |row| {
+            row.get(0)
+        })
         .ok();
 
     let result = conn.execute(

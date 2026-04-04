@@ -269,7 +269,10 @@ impl SyncState {
             return Ok(());
         }
         let peer_count = self.live.read().await.len();
-        eprintln!("[Sync] push_clip: broadcasting to {} peers, hash={}", peer_count, clip.hash);
+        eprintln!(
+            "[Sync] push_clip: broadcasting to {} peers, hash={}",
+            peer_count, clip.hash
+        );
         self.broadcast(Msg::ClipPush { clip }).await
     }
 
@@ -420,20 +423,22 @@ pub fn start_sync(app: AppHandle) -> Arc<SyncState> {
         device_name
     };
 
-    let (identity_secret, identity_public_b64) =
-        match get_or_create_sync_identity_keypair(&app) {
-            Ok(values) => values,
-            Err(error) => {
-                eprintln!("[Sync] Failed to load identity keypair: {}", error);
-                let secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
-                let public = PublicKey::from(&secret);
-                (secret.to_bytes(), B64.encode(public.as_bytes()))
-            }
-        };
+    let (identity_secret, identity_public_b64) = match get_or_create_sync_identity_keypair(&app) {
+        Ok(values) => values,
+        Err(error) => {
+            eprintln!("[Sync] Failed to load identity keypair: {}", error);
+            let secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+            let public = PublicKey::from(&secret);
+            (secret.to_bytes(), B64.encode(public.as_bytes()))
+        }
+    };
 
     ensure_windows_firewall_rules(SYNC_PORT);
 
-    eprintln!("[Sync] Creating mDNS daemon for device_id={} device_name={}", device_id, device_name);
+    eprintln!(
+        "[Sync] Creating mDNS daemon for device_id={} device_name={}",
+        device_id, device_name
+    );
     let mdns = match ServiceDaemon::new() {
         Ok(mdns) => {
             eprintln!("[Sync] mDNS daemon created successfully");
@@ -446,7 +451,10 @@ pub fn start_sync(app: AppHandle) -> Arc<SyncState> {
     };
     if let Some(mdns) = mdns.as_ref() {
         let properties: [(&str, &str); 2] = [("v", "1"), ("name", device_name.as_str())];
-        eprintln!("[Sync] Registering mDNS service type={} instance={}", SERVICE_TYPE, device_id);
+        eprintln!(
+            "[Sync] Registering mDNS service type={} instance={}",
+            SERVICE_TYPE, device_id
+        );
         match ServiceInfo::new(
             SERVICE_TYPE,
             &device_id,
@@ -503,11 +511,17 @@ fn enable_runtime(app: AppHandle, sync: Arc<SyncState>) {
     let mut trusted_peers = Vec::new();
     let mut addrs = HashMap::new();
     for (device_id, display_name, last_addr) in peers_with_addrs {
-        eprintln!("[Sync]   - peer: {} ({}) addr={:?}", display_name, device_id, last_addr);
+        eprintln!(
+            "[Sync]   - peer: {} ({}) addr={:?}",
+            display_name, device_id, last_addr
+        );
         if let Some(addr) = last_addr {
             addrs.insert(device_id.clone(), addr);
         }
-        trusted_peers.push(TrustedPeer { device_id, display_name });
+        trusted_peers.push(TrustedPeer {
+            device_id,
+            display_name,
+        });
     }
     {
         let app_clone = app.clone();
@@ -551,7 +565,10 @@ async fn run_server(app: AppHandle, sync: Arc<SyncState>, generation: u64) {
                 tokio::time::sleep(Duration::from_millis(400)).await;
             }
             Err(error) => {
-                eprintln!("[Sync] Failed to bind TCP server on {}: {}", SYNC_PORT, error);
+                eprintln!(
+                    "[Sync] Failed to bind TCP server on {}: {}",
+                    SYNC_PORT, error
+                );
                 return;
             }
         }
@@ -596,7 +613,10 @@ async fn run_browser(
     }
 
     let browse_rx = if let Some(mdns) = sync._mdns.as_ref() {
-        eprintln!("[Sync] Starting mDNS browse for service type: {}", SERVICE_TYPE);
+        eprintln!(
+            "[Sync] Starting mDNS browse for service type: {}",
+            SERVICE_TYPE
+        );
         match mdns.browse(SERVICE_TYPE) {
             Ok(rx) => {
                 eprintln!("[Sync] mDNS browse started successfully");
@@ -617,7 +637,10 @@ async fn run_browser(
         let app_clone = app.clone();
         let sync_clone = sync.clone();
         let peer_id = peer.device_id.clone();
-        eprintln!("[Sync] Starting reconnect loop for trusted peer: {}", peer_id);
+        eprintln!(
+            "[Sync] Starting reconnect loop for trusted peer: {}",
+            peer_id
+        );
         tauri::async_runtime::spawn(async move {
             reconnect_loop(app_clone, sync_clone, peer_id, generation).await;
         });
@@ -659,95 +682,91 @@ async fn run_browser(
 
         if let Some(event) = maybe_event {
             match event {
-            ServiceEvent::ServiceResolved(info) => {
-                let full = info.get_fullname().to_string();
-                let mut peer_id = extract_peer_id(&full);
+                ServiceEvent::ServiceResolved(info) => {
+                    let full = info.get_fullname().to_string();
+                    let mut peer_id = extract_peer_id(&full);
 
-                if peer_id.is_empty() {
-                    if let Some(name) = info.get_property_val_str("id") {
-                        peer_id = name.to_string();
+                    if peer_id.is_empty() {
+                        if let Some(name) = info.get_property_val_str("id") {
+                            peer_id = name.to_string();
+                        }
                     }
-                }
 
-                if peer_id.is_empty() || peer_id == sync.device_id {
-                    continue;
-                }
-
-                let best_ip = info
-                    .get_addresses()
-                    .iter()
-                    .copied()
-                    .max_by_key(|ip| addr_quality(*ip));
-
-                let Some(ip) = best_ip else {
-                    continue;
-                };
-
-                let candidate_addr = SocketAddr::new(ip, info.get_port());
-                let peer_addr = {
-                    let mut known = sync.known_addrs.write().await;
-                    let existing = known.get(&peer_id).copied();
-                    let chosen = prefer_addr(existing, candidate_addr);
-                    known.insert(peer_id.clone(), chosen);
-                    chosen
-                };
-
-                let trusted = is_trusted_peer(&app, &peer_id).unwrap_or(false);
-                eprintln!(
-                    "[Sync] mDNS resolved peer={} addr={} trusted={}",
-                    peer_id, peer_addr, trusted
-                );
-                if trusted {
-                    let _ = update_peer_address(&app, &peer_id, peer_addr);
-                    if !auto_connect_enabled(&app) {
-                        eprintln!("[Sync] Auto-connect disabled; not dialing {}", peer_id);
+                    if peer_id.is_empty() || peer_id == sync.device_id {
                         continue;
                     }
-                    let is_connected = sync.connected_peers().await.contains(&peer_id);
-                    if !is_connected {
-                        let app_clone = app.clone();
-                        let sync_clone = sync.clone();
-                        let peer_id_clone = peer_id.clone();
-                        tauri::async_runtime::spawn(async move {
-                            connect_to_peer(app_clone, sync_clone, peer_id_clone, peer_addr).await;
-                        });
-                    }
-                } else {
-                    let display_name = info
-                        .get_property_val_str("name")
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| peer_id.clone());
-                    let payload = DiscoveredPeer {
-                        device_id: peer_id,
-                        display_name,
-                        addr: peer_addr.to_string(),
+
+                    let best_ip = info
+                        .get_addresses()
+                        .iter()
+                        .copied()
+                        .max_by_key(|ip| addr_quality(*ip));
+
+                    let Some(ip) = best_ip else {
+                        continue;
                     };
-                    sync.discovered
-                        .write()
-                        .await
-                        .insert(payload.device_id.clone(), payload.clone());
-                    let _ = app.emit("sync:discovered", payload);
+
+                    let candidate_addr = SocketAddr::new(ip, info.get_port());
+                    let peer_addr = {
+                        let mut known = sync.known_addrs.write().await;
+                        let existing = known.get(&peer_id).copied();
+                        let chosen = prefer_addr(existing, candidate_addr);
+                        known.insert(peer_id.clone(), chosen);
+                        chosen
+                    };
+
+                    let trusted = is_trusted_peer(&app, &peer_id).unwrap_or(false);
+                    eprintln!(
+                        "[Sync] mDNS resolved peer={} addr={} trusted={}",
+                        peer_id, peer_addr, trusted
+                    );
+                    if trusted {
+                        let _ = update_peer_address(&app, &peer_id, peer_addr);
+                        if !auto_connect_enabled(&app) {
+                            eprintln!("[Sync] Auto-connect disabled; not dialing {}", peer_id);
+                            continue;
+                        }
+                        let is_connected = sync.connected_peers().await.contains(&peer_id);
+                        if !is_connected {
+                            let app_clone = app.clone();
+                            let sync_clone = sync.clone();
+                            let peer_id_clone = peer_id.clone();
+                            tauri::async_runtime::spawn(async move {
+                                connect_to_peer(app_clone, sync_clone, peer_id_clone, peer_addr)
+                                    .await;
+                            });
+                        }
+                    } else {
+                        let display_name = info
+                            .get_property_val_str("name")
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| peer_id.clone());
+                        let payload = DiscoveredPeer {
+                            device_id: peer_id,
+                            display_name,
+                            addr: peer_addr.to_string(),
+                        };
+                        sync.discovered
+                            .write()
+                            .await
+                            .insert(payload.device_id.clone(), payload.clone());
+                        let _ = app.emit("sync:discovered", payload);
+                    }
                 }
-            }
-            ServiceEvent::ServiceRemoved(_, fullname) => {
-                let peer_id = extract_peer_id(&fullname);
-                if !peer_id.is_empty() {
-                    eprintln!("[Sync] mDNS removed peer={}", peer_id);
-                    sync.discovered.write().await.remove(&peer_id);
+                ServiceEvent::ServiceRemoved(_, fullname) => {
+                    let peer_id = extract_peer_id(&fullname);
+                    if !peer_id.is_empty() {
+                        eprintln!("[Sync] mDNS removed peer={}", peer_id);
+                        sync.discovered.write().await.remove(&peer_id);
+                    }
                 }
-            }
-            _ => {}
+                _ => {}
             }
         }
     }
 }
 
-async fn reconnect_loop(
-    app: AppHandle,
-    sync: Arc<SyncState>,
-    peer_id: String,
-    generation: u64,
-) {
+async fn reconnect_loop(app: AppHandle, sync: Arc<SyncState>, peer_id: String, generation: u64) {
     loop {
         if !sync.is_enabled() || sync.current_generation() != generation {
             break;
@@ -764,7 +783,10 @@ async fn reconnect_loop(
 
         let target_addr = sync.known_addrs.read().await.get(&peer_id).copied();
         if let Some(target_addr) = target_addr {
-            eprintln!("[Sync] Reconnect attempt peer={} addr={}", peer_id, target_addr);
+            eprintln!(
+                "[Sync] Reconnect attempt peer={} addr={}",
+                peer_id, target_addr
+            );
             connect_to_peer(app.clone(), sync.clone(), peer_id.clone(), target_addr).await;
             tokio::time::sleep(RECONNECT_BACKOFF).await;
         } else {
@@ -775,7 +797,10 @@ async fn reconnect_loop(
 
 async fn connect_to_peer(app: AppHandle, sync: Arc<SyncState>, peer_id: String, addr: SocketAddr) {
     if !sync.is_enabled() {
-        eprintln!("[Sync] connect_to_peer: sync disabled, not connecting to {}", peer_id);
+        eprintln!(
+            "[Sync] connect_to_peer: sync disabled, not connecting to {}",
+            peer_id
+        );
         return;
     }
     if !sync.try_begin_connect(&peer_id).await {
@@ -788,7 +813,10 @@ async fn connect_to_peer(app: AppHandle, sync: Arc<SyncState>, peer_id: String, 
             stream
         }
         Ok(Err(error)) => {
-            eprintln!("[Sync] Failed to connect to {} at {}: {}", peer_id, addr, error);
+            eprintln!(
+                "[Sync] Failed to connect to {} at {}: {}",
+                peer_id, addr, error
+            );
             sync.end_connect(&peer_id).await;
             return;
         }
@@ -879,7 +907,10 @@ async fn run_session(
             public_key,
         } => {
             if sync.verify_pin(&pin) {
-                eprintln!("[Sync] Pair request accepted from {} ({})", device_name, device_id);
+                eprintln!(
+                    "[Sync] Pair request accepted from {} ({})",
+                    device_name, device_id
+                );
                 save_trusted_peer_with_key(&app, &device_id, &device_name, Some(&public_key))?;
                 if let Some(addr) = peer_addr {
                     let _ = update_peer_address(&app, &device_id, addr);
@@ -901,7 +932,10 @@ async fn run_session(
                 );
                 return Ok(());
             } else {
-                eprintln!("[Sync] Pair request rejected from {} ({})", device_name, device_id);
+                eprintln!(
+                    "[Sync] Pair request rejected from {} ({})",
+                    device_name, device_id
+                );
                 raw_writer
                     .send(&Msg::PairReject {
                         reason: "Invalid or expired PIN".to_string(),
@@ -914,7 +948,9 @@ async fn run_session(
             device_id,
             session_seed,
         } => {
-            let seed = B64.decode(session_seed).context("decode peer session seed")?;
+            let seed = B64
+                .decode(session_seed)
+                .context("decode peer session seed")?;
             if seed.len() != 16 {
                 return Err(anyhow!("invalid peer session seed length"));
             }
@@ -1015,7 +1051,10 @@ async fn run_session(
             protocol_version,
             cursors,
         } => {
-            eprintln!("[Sync] Received hello_ack from {} ({})", device_name, device_id);
+            eprintln!(
+                "[Sync] Received hello_ack from {} ({})",
+                device_name, device_id
+            );
             if !initiator {
                 return Err(anyhow!("received hello_ack as non-initiator"));
             }
@@ -1042,12 +1081,19 @@ async fn run_session(
     }
 
     if sync.connected_peers().await.contains(&peer_id) {
-        eprintln!("[Sync] Duplicate session for peer={}, closing duplicate", peer_id);
+        eprintln!(
+            "[Sync] Duplicate session for peer={}, closing duplicate",
+            peer_id
+        );
         return Ok(());
     }
 
-    sync.register_peer(peer_id.clone(), secure_writer.clone()).await;
-    eprintln!("[Sync] Session connected peer={} name={} (now registered)", peer_id, peer_name);
+    sync.register_peer(peer_id.clone(), secure_writer.clone())
+        .await;
+    eprintln!(
+        "[Sync] Session connected peer={} name={} (now registered)",
+        peer_id, peer_name
+    );
 
     // Save the peer address for cross-platform reconnection (mDNS workaround)
     if let Some(addr) = peer_addr {
@@ -1071,9 +1117,17 @@ async fn run_session(
     );
 
     let peer_cursor = peer_cursors.get(&sync.device_id).copied().unwrap_or(0);
-    eprintln!("[Sync] Peer {} has cursor {} for our device {}", peer_id, peer_cursor, sync.device_id);
+    eprintln!(
+        "[Sync] Peer {} has cursor {} for our device {}",
+        peer_id, peer_cursor, sync.device_id
+    );
     let delta = get_clips_since(&app, &sync.device_id, peer_cursor)?;
-    eprintln!("[Sync] Sending {} clips to peer {} (since cursor {})", delta.len(), peer_id, peer_cursor);
+    eprintln!(
+        "[Sync] Sending {} clips to peer {} (since cursor {})",
+        delta.len(),
+        peer_id,
+        peer_cursor
+    );
     if !delta.is_empty() {
         secure_writer.send(&Msg::ClipBatch { clips: delta }).await?;
         eprintln!("[Sync] Sent clip batch to peer {}", peer_id);
@@ -1124,7 +1178,10 @@ async fn run_session(
     };
 
     sync.unregister_peer(&peer_id).await;
-    eprintln!("[Sync] Session disconnected peer={} name={}", peer_id, peer_name);
+    eprintln!(
+        "[Sync] Session disconnected peer={} name={}",
+        peer_id, peer_name
+    );
     let _ = app.emit(
         "sync:disconnected",
         PairedEvent {
@@ -1187,7 +1244,11 @@ async fn receive_clips(
     writer: &SecureSender,
     clips: Vec<WireClip>,
 ) -> Result<()> {
-    eprintln!("[Sync] Receiving {} clips from peer {}", clips.len(), peer_id);
+    eprintln!(
+        "[Sync] Receiving {} clips from peer {}",
+        clips.len(),
+        peer_id
+    );
     if !sync.is_enabled() {
         eprintln!("[Sync] Sync disabled, ignoring incoming clips");
         return Ok(());
@@ -1198,11 +1259,17 @@ async fn receive_clips(
 
     for clip in clips {
         if clip.source_device.is_empty() || clip.source_device == sync.device_id {
-            eprintln!("[Sync] Skipping clip from self or empty source: hash={}", clip.hash);
+            eprintln!(
+                "[Sync] Skipping clip from self or empty source: hash={}",
+                clip.hash
+            );
             continue;
         }
 
-        eprintln!("[Sync] Processing clip: hash={} kind={} source={}", clip.hash, clip.kind, clip.source_device);
+        eprintln!(
+            "[Sync] Processing clip: hash={} kind={} source={}",
+            clip.hash, clip.kind, clip.source_device
+        );
 
         max_by_source
             .entry(clip.source_device.clone())
@@ -1348,7 +1415,10 @@ async fn receive_clips(
     }
 
     if inserted_any {
-        eprintln!("[Sync] Applied {} incoming clips from peer {} and emitted new-clip", insert_count, peer_id);
+        eprintln!(
+            "[Sync] Applied {} incoming clips from peer {} and emitted new-clip",
+            insert_count, peer_id
+        );
         let _ = app.emit("new-clip", ());
     } else {
         eprintln!("[Sync] No new clips inserted from peer {}", peer_id);
@@ -1406,7 +1476,11 @@ fn save_image_blob_if_missing(app: &AppHandle, hash: &str, bytes: &[u8]) -> Resu
     }
 }
 
-fn store_embedding_for_clip_id(conn: &rusqlite::Connection, clip_id: i64, embedding: &[u8]) -> Result<()> {
+fn store_embedding_for_clip_id(
+    conn: &rusqlite::Connection,
+    clip_id: i64,
+    embedding: &[u8],
+) -> Result<()> {
     // 384 float32 values
     if embedding.len() != 384 * 4 {
         return Ok(());
@@ -1529,7 +1603,10 @@ pub fn is_trusted_peer(app: &AppHandle, device_id: &str) -> Result<bool> {
         )
         .optional()?;
     let is_trusted = exists.is_some();
-    eprintln!("[Sync] is_trusted_peer device_id={} result={}", device_id, is_trusted);
+    eprintln!(
+        "[Sync] is_trusted_peer device_id={} result={}",
+        device_id, is_trusted
+    );
     Ok(is_trusted)
 }
 
@@ -1539,7 +1616,10 @@ pub fn save_trusted_peer_with_key(
     display_name: &str,
     public_key: Option<&str>,
 ) -> Result<()> {
-    eprintln!("[Sync] Saving trusted peer: device_id={} display_name={}", device_id, display_name);
+    eprintln!(
+        "[Sync] Saving trusted peer: device_id={} display_name={}",
+        device_id, display_name
+    );
     let state = app.state::<AppState>();
     let conn = state
         .db_write
@@ -1595,19 +1675,23 @@ pub fn update_peer_address(app: &AppHandle, device_id: &str, addr: SocketAddr) -
         rusqlite::params![addr_str, now_ts(), device_id],
     )?;
     if rows > 0 {
-        eprintln!("[Sync] Updated peer address: device_id={} addr={}", device_id, addr_str);
+        eprintln!(
+            "[Sync] Updated peer address: device_id={} addr={}",
+            device_id, addr_str
+        );
     }
     Ok(())
 }
 
 /// Get trusted peers with their stored addresses (for cross-platform reconnection)
-pub fn get_trusted_peers_with_addrs(app: &AppHandle) -> Result<Vec<(String, String, Option<SocketAddr>)>> {
+pub fn get_trusted_peers_with_addrs(
+    app: &AppHandle,
+) -> Result<Vec<(String, String, Option<SocketAddr>)>> {
     let state = app.state::<AppState>();
     let conn = state.db_read_pool.get().context("db read pool")?;
 
-    let mut stmt = conn.prepare(
-        "SELECT device_id, display_name, last_addr, public_key FROM sync_peers",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT device_id, display_name, last_addr, public_key FROM sync_peers")?;
 
     let rows = stmt.query_map([], |row| {
         let device_id: String = row.get(0)?;
@@ -1620,7 +1704,11 @@ pub fn get_trusted_peers_with_addrs(app: &AppHandle) -> Result<Vec<(String, Stri
     let mut peers = Vec::new();
     for row in rows {
         let (device_id, display_name, last_addr, public_key) = row?;
-        if public_key.as_deref().map(|v| v.trim().is_empty()).unwrap_or(true) {
+        if public_key
+            .as_deref()
+            .map(|v| v.trim().is_empty())
+            .unwrap_or(true)
+        {
             continue;
         }
         let addr = last_addr.and_then(|s| s.parse::<SocketAddr>().ok());
@@ -1653,7 +1741,9 @@ pub fn build_cursor_map(app: &AppHandle, our_device_id: &str) -> Result<HashMap<
 
     {
         let mut stmt = conn.prepare("SELECT device_id, last_received_ts FROM sync_cursors")?;
-        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
         for row in rows {
             let (device_id, ts) = row?;
             cursors.insert(device_id, ts);
@@ -1763,15 +1853,15 @@ pub fn get_clips_since(app: &AppHandle, our_device_id: &str, since: i64) -> Resu
             None
         };
 
-        let encoded_file_data = if is_file != 0 && file_size > 0 && file_size <= FILE_AUTO_SYNC_MAX_BYTES
-        {
-            file_data
-                .as_ref()
-                .filter(|bytes| !bytes.is_empty())
-                .map(|bytes| B64.encode(bytes))
-        } else {
-            None
-        };
+        let encoded_file_data =
+            if is_file != 0 && file_size > 0 && file_size <= FILE_AUTO_SYNC_MAX_BYTES {
+                file_data
+                    .as_ref()
+                    .filter(|bytes| !bytes.is_empty())
+                    .map(|bytes| B64.encode(bytes))
+            } else {
+                None
+            };
 
         let embedding_encoded = embedding
             .as_ref()
@@ -1983,14 +2073,15 @@ async fn lookup_clip_for_push(
             embedding,
         )) = row
         {
-            let encoded_file_data = if is_file != 0 && file_size > 0 && file_size <= FILE_AUTO_SYNC_MAX_BYTES {
-                file_data
-                    .as_ref()
-                    .filter(|bytes| !bytes.is_empty())
-                    .map(|bytes| B64.encode(bytes))
-            } else {
-                None
-            };
+            let encoded_file_data =
+                if is_file != 0 && file_size > 0 && file_size <= FILE_AUTO_SYNC_MAX_BYTES {
+                    file_data
+                        .as_ref()
+                        .filter(|bytes| !bytes.is_empty())
+                        .map(|bytes| B64.encode(bytes))
+                } else {
+                    None
+                };
 
             let embedding_encoded = embedding
                 .as_ref()
@@ -2022,11 +2113,7 @@ async fn lookup_clip_for_push(
                 content_highlighted,
                 language,
                 pinned: pinned != 0,
-                image_hash: if kind == "image" {
-                    Some(hash)
-                } else {
-                    None
-                },
+                image_hash: if kind == "image" { Some(hash) } else { None },
                 embedding_model: embedding_encoded
                     .as_ref()
                     .map(|_| crate::embed::EMBEDDING_MODEL_SIGNATURE.to_string()),
@@ -2247,10 +2334,7 @@ pub async fn sync_pair_with(
 }
 
 #[tauri::command]
-pub async fn sync_remove_peer(
-    app: AppHandle,
-    device_id: String,
-) -> Result<(), String> {
+pub async fn sync_remove_peer(app: AppHandle, device_id: String) -> Result<(), String> {
     remove_trusted_peer(&app, &device_id).map_err(|e| e.to_string())?;
     if let Some(sync) = app.state::<AppState>().sync.get() {
         sync.unregister_peer(&device_id).await;
@@ -2335,7 +2419,10 @@ pub fn apply_config_change(
     previous: Option<&crate::settings::CopiConfig>,
     next: &crate::settings::CopiConfig,
 ) {
-    let Some(sync) = app.try_state::<AppState>().and_then(|state| state.sync.get().cloned()) else {
+    let Some(sync) = app
+        .try_state::<AppState>()
+        .and_then(|state| state.sync.get().cloned())
+    else {
         return;
     };
 

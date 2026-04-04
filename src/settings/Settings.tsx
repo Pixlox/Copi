@@ -455,7 +455,7 @@ function DataSection({
         </SettingRow>
       </SettingCard>
 
-      <div className="settings-attribution">Made with {"<3"} by Pixlox</div>
+      <div className="settings-attribution">Made with {"<3"} by Megumi Labs</div>
     </>
   );
 }
