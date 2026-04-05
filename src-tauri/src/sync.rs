@@ -1406,6 +1406,8 @@ async fn receive_clips(
     let mut last_inserted_clip_for_mirror: Option<WireClip> = None;
     let mut last_processed_clip_for_mirror: Option<WireClip> = None;
     let mut max_incoming_sync_version = 0_i64;
+    let mut metadata_changed_any = false;
+    let mut collection_membership_changed_any = false;
 
     for clip in clips {
         if clip.sync_version > max_incoming_sync_version {
@@ -1464,12 +1466,28 @@ async fn receive_clips(
             .and_then(|data| B64.decode(data).ok());
         let has_remote_embedding = clip.embedding.is_some()
             && clip.embedding_model.as_deref() == Some(crate::embed::EMBEDDING_MODEL_SIGNATURE);
-        let should_request_blob = {
+        let (should_request_blob, metadata_changed_this_clip, collection_membership_changed_this_clip) = {
             let state = app.state::<AppState>();
             let conn = state
                 .db_write
                 .lock()
                 .map_err(|e| anyhow!("lock poisoned: {}", e))?;
+
+            let prior_metadata: Option<(i64, String, i64)> = if apply_metadata_from_peer {
+                conn.query_row(
+                    "SELECT COALESCE(pinned, 0),
+                            COALESCE(collection_sync_id, ''),
+                            COALESCE(sync_version, 0)
+                     FROM clips
+                     WHERE content_hash = ?1
+                     LIMIT 1",
+                    [clip.hash.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?
+            } else {
+                None
+            };
 
             let existing_clip_id: Option<i64> = conn
                 .query_row(
@@ -1600,27 +1618,6 @@ async fn receive_clips(
                 }
             } else {
                 eprintln!("[Sync] Clip exists, merged metadata: hash={}", clip.hash);
-                if apply_metadata_from_peer {
-                    let merged: Option<(i64, Option<String>, i64)> = conn
-                        .query_row(
-                            "SELECT COALESCE(pinned, 0), collection_sync_id, COALESCE(sync_version, 0)
-                             FROM clips
-                             WHERE content_hash = ?1
-                             LIMIT 1",
-                            [clip.hash.as_str()],
-                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                        )
-                        .optional()?;
-                    if let Some((merged_pinned, merged_coll, merged_sync_version)) = merged {
-                        eprintln!(
-                            "[Sync][meta] merged hash={} pinned={} coll={:?} sync_version={}",
-                            clip.hash,
-                            merged_pinned != 0,
-                            merged_coll,
-                            merged_sync_version
-                        );
-                    }
-                }
             }
 
             if has_remote_embedding {
@@ -1631,7 +1628,46 @@ async fn receive_clips(
                 }
             }
 
-            if clip.kind == "image" && !clip.is_file {
+            let mut metadata_changed = false;
+            let mut collection_membership_changed = false;
+            if apply_metadata_from_peer {
+                let merged: Option<(i64, String, i64)> = conn
+                    .query_row(
+                        "SELECT COALESCE(pinned, 0),
+                                COALESCE(collection_sync_id, ''),
+                                COALESCE(sync_version, 0)
+                         FROM clips
+                         WHERE content_hash = ?1
+                         LIMIT 1",
+                        [clip.hash.as_str()],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .optional()?;
+
+                if let Some((merged_pinned, merged_coll, merged_sync_version)) = merged.as_ref() {
+                    eprintln!(
+                        "[Sync][meta] merged hash={} pinned={} coll={:?} sync_version={}",
+                        clip.hash,
+                        *merged_pinned != 0,
+                        merged_coll,
+                        merged_sync_version
+                    );
+                }
+
+                if let Some((after_pinned, after_coll, after_sync_version)) = merged {
+                    if let Some((before_pinned, before_coll, before_sync_version)) = prior_metadata {
+                        metadata_changed = before_pinned != after_pinned
+                            || before_coll != after_coll
+                            || before_sync_version != after_sync_version;
+                        collection_membership_changed = before_coll != after_coll;
+                    } else {
+                        metadata_changed = after_pinned != 0 || !after_coll.is_empty();
+                        collection_membership_changed = !after_coll.is_empty();
+                    }
+                }
+            }
+
+            let needs_blob = if clip.kind == "image" && !clip.is_file {
                 if let Some(image_hash) = clip.image_hash.clone() {
                     let needs_blob: Option<i64> = conn
                         .query_row(
@@ -1650,8 +1686,17 @@ async fn receive_clips(
                 }
             } else {
                 false
-            }
+            };
+
+            (needs_blob, metadata_changed, collection_membership_changed)
         };
+
+        if metadata_changed_this_clip {
+            metadata_changed_any = true;
+        }
+        if collection_membership_changed_this_clip {
+            collection_membership_changed_any = true;
+        }
 
         if should_request_blob {
             if let Some(hash) = clip.image_hash {
@@ -1700,6 +1745,13 @@ async fn receive_clips(
                 }
             }
         }
+    }
+
+    if metadata_changed_any {
+        let _ = app.emit("clips-changed", ());
+    }
+    if collection_membership_changed_any {
+        let _ = app.emit("collections-changed", ());
     }
 
     Ok(())
