@@ -275,16 +275,17 @@ async fn dispatch(app: &AppHandle, request: QaRequest) -> Result<QaResponse> {
 }
 
 async fn delete_clip_by_content(app: AppHandle, content: &str) -> Result<bool, String> {
+    let target_hash = sha256_text(content);
     let clip_id: Option<i64> = {
         let state = app.state::<AppState>();
         let conn = state.db_write.lock().map_err(|e| e.to_string())?;
         conn.query_row(
             "SELECT id
              FROM clips
-             WHERE content = ?1 AND deleted = 0
+             WHERE (content = ?1 OR content_hash = ?2) AND deleted = 0
              ORDER BY created_at DESC, id DESC
              LIMIT 1",
-            [content],
+            rusqlite::params![content, target_hash],
             |row| row.get(0),
         )
         .optional()
@@ -724,6 +725,7 @@ async fn collect_state(app: &AppHandle) -> Result<QaState> {
 
     let mut clips = Vec::new();
     for content in [QA_CLIP_1, QA_CLIP_2, QA_DELETE_RECOPY_TEXT] {
+        let target_hash = sha256_text(content);
         let row = conn
             .query_row(
                 "SELECT id,
@@ -735,10 +737,10 @@ async fn collect_state(app: &AppHandle) -> Result<QaState> {
                         COALESCE(sync_version, 0),
                         COALESCE(source_device, '')
                  FROM clips
-                 WHERE content = ?1
+                 WHERE content = ?1 OR content_hash = ?2
                  ORDER BY id DESC
                  LIMIT 1",
-                [content],
+                rusqlite::params![content, target_hash],
                 |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
