@@ -2983,7 +2983,8 @@ fn receive_collections(
         );
         let _ = conn.execute(
             "UPDATE clips
-             SET collection_id = NULL
+             SET collection_id = NULL,
+                 collection_sync_id = NULL
              WHERE collection_sync_id IS NOT NULL
                AND collection_sync_id IN (
                    SELECT sync_id FROM collections WHERE deleted = 1
