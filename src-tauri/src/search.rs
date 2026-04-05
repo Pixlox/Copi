@@ -178,12 +178,20 @@ pub async fn delete_clip(app: tauri::AppHandle, clip_id: i64) -> Result<(), Stri
     let state = app.state::<AppState>();
     let conn = state.db_write.lock().map_err(|e| e.to_string())?;
     let sync_version = sync::next_sync_version_from_conn(&conn);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     conn.execute("DELETE FROM clip_embeddings WHERE rowid = ?", [clip_id])
         .ok();
     let updated = conn
         .execute(
-            "UPDATE clips SET deleted = 1, sync_version = ?1 WHERE id = ?2 AND deleted = 0",
-            rusqlite::params![sync_version, clip_id],
+            "UPDATE clips
+             SET deleted = 1,
+                 sync_version = ?1,
+                 created_at = CASE WHEN created_at < ?2 THEN ?2 ELSE created_at END
+             WHERE id = ?3 AND deleted = 0",
+            rusqlite::params![sync_version, now, clip_id],
         )
         .map_err(|e| e.to_string())?;
     let sync_key = if updated > 0 {

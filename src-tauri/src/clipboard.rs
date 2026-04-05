@@ -28,6 +28,23 @@ struct ClipboardFilePayload {
 
 const FILE_AUTO_SYNC_MAX_BYTES: i64 = crate::sync::FILE_AUTO_SYNC_MAX_BYTES;
 
+fn can_skip_text_hash(app: &tauri::AppHandle, hash: &str) -> bool {
+    let state = app.state::<AppState>();
+    let conn = match state.db_read_pool.get() {
+        Ok(conn) => conn,
+        Err(_) => return false,
+    };
+    match conn.query_row(
+        "SELECT 1 FROM clips WHERE content_hash = ?1 AND deleted = 0 LIMIT 1",
+        [hash],
+        |row| row.get::<_, i64>(0),
+    ) {
+        Ok(_) => true,
+        Err(rusqlite::Error::QueryReturnedNoRows) => false,
+        Err(_) => false,
+    }
+}
+
 // ─── Watch Clipboard ──────────────────────────────────────────────
 
 pub async fn watch_clipboard(app: &tauri::AppHandle) {
@@ -165,15 +182,22 @@ pub async fn watch_clipboard(app: &tauri::AppHandle) {
             }
 
             let hash = compute_hash(&text);
-            if hash != last_text_hash && !text.trim().is_empty() {
-                last_text_hash = hash.clone();
+            if !text.trim().is_empty() {
+                let should_capture = if hash == last_text_hash {
+                    !can_skip_text_hash(app, &hash)
+                } else {
+                    true
+                };
+                if should_capture {
+                    last_text_hash = hash.clone();
 
-                if !crate::privacy::should_capture(&text, app) {
-                    tokio::time::sleep(std::time::Duration::from_millis(140)).await;
-                    continue;
+                    if !crate::privacy::should_capture(&text, app) {
+                        tokio::time::sleep(std::time::Duration::from_millis(140)).await;
+                        continue;
+                    }
+
+                    queue_text_capture(app, text, hash, source_app.clone());
                 }
-
-                queue_text_capture(app, text, hash, source_app.clone());
             }
         }
 

@@ -130,6 +130,8 @@ pub struct WireClip {
     pub embedding_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embedding: Option<String>,
+    #[serde(default)]
+    pub deleted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,7 +222,12 @@ fn looks_like_raw_secure_payload(line: &str) -> bool {
         return false;
     }
     line.as_bytes().iter().all(|b| {
-        b.is_ascii_alphanumeric() || *b == b'+' || *b == b'/' || *b == b'=' || *b == b'-' || *b == b'_'
+        b.is_ascii_alphanumeric()
+            || *b == b'+'
+            || *b == b'/'
+            || *b == b'='
+            || *b == b'-'
+            || *b == b'_'
     })
 }
 
@@ -364,13 +371,7 @@ impl SyncState {
         let mut guard = self.live.write().await;
         let token = self.live_token.fetch_add(1, Ordering::SeqCst) + 1;
         let replaced = guard
-            .insert(
-                device_id,
-                LivePeer {
-                    token,
-                    writer,
-                },
-            )
+            .insert(device_id, LivePeer { token, writer })
             .is_some();
         (token, replaced)
     }
@@ -1162,8 +1163,9 @@ async fn run_session(
         }
     }
 
-    let (session_token, replaced_existing) =
-        sync.register_peer(peer_id.clone(), secure_writer.clone()).await;
+    let (session_token, replaced_existing) = sync
+        .register_peer(peer_id.clone(), secure_writer.clone())
+        .await;
     if replaced_existing {
         eprintln!(
             "[Sync] Replaced existing session for peer={}, using latest",
@@ -1226,7 +1228,10 @@ async fn run_session(
             peer_cursor
         );
         if !delta.is_empty() {
-            if let Err(error) = writer_bootstrap.send(&Msg::ClipBatch { clips: delta }).await {
+            if let Err(error) = writer_bootstrap
+                .send(&Msg::ClipBatch { clips: delta })
+                .await
+            {
                 eprintln!(
                     "[Sync] Failed to send initial clip batch to peer {}: {}",
                     peer_bootstrap, error
@@ -1237,8 +1242,13 @@ async fn run_session(
         }
 
         if metadata_sync_enabled {
-            if let Err(error) = send_full_collection_snapshot_to_peer(&app_bootstrap, &writer_bootstrap).await {
-                eprintln!("[Sync] Failed to send metadata collection snapshot: {}", error);
+            if let Err(error) =
+                send_full_collection_snapshot_to_peer(&app_bootstrap, &writer_bootstrap).await
+            {
+                eprintln!(
+                    "[Sync] Failed to send metadata collection snapshot: {}",
+                    error
+                );
             }
         }
     });
@@ -1316,7 +1326,8 @@ async fn run_session(
         }
     };
 
-    sync.unregister_peer_if_current(&peer_id, session_token).await;
+    sync.unregister_peer_if_current(&peer_id, session_token)
+        .await;
     eprintln!(
         "[Sync] Session disconnected peer={} name={}",
         peer_id, peer_name
@@ -1408,6 +1419,7 @@ async fn receive_clips(
     let mut max_incoming_sync_version = 0_i64;
     let mut metadata_changed_any = false;
     let mut collection_membership_changed_any = false;
+    let mut clip_state_changed_any = false;
 
     for clip in clips {
         if clip.sync_version > max_incoming_sync_version {
@@ -1422,7 +1434,7 @@ async fn receive_clips(
             continue;
         }
 
-        if clip.is_file && clip.file_data.is_none() {
+        if !clip.deleted && clip.is_file && clip.file_data.is_none() {
             eprintln!(
                 "[Sync] Skipping unsendable file clip (missing bytes): hash={}",
                 clip.hash
@@ -1448,11 +1460,7 @@ async fn receive_clips(
         if apply_metadata_from_peer {
             eprintln!(
                 "[Sync][meta] incoming hash={} pinned={} coll={:?} sync_version={} from={}",
-                clip.hash,
-                clip.pinned,
-                clip.collection_sync_id,
-                clip.sync_version,
-                peer_id
+                clip.hash, clip.pinned, clip.collection_sync_id, clip.sync_version, peer_id
             );
         }
 
@@ -1466,12 +1474,28 @@ async fn receive_clips(
             .and_then(|data| B64.decode(data).ok());
         let has_remote_embedding = clip.embedding.is_some()
             && clip.embedding_model.as_deref() == Some(crate::embed::EMBEDDING_MODEL_SIGNATURE);
-        let (should_request_blob, metadata_changed_this_clip, collection_membership_changed_this_clip) = {
+        let (
+            should_request_blob,
+            metadata_changed_this_clip,
+            collection_membership_changed_this_clip,
+            clip_state_changed_this_clip,
+        ) = {
             let state = app.state::<AppState>();
             let conn = state
                 .db_write
                 .lock()
                 .map_err(|e| anyhow!("lock poisoned: {}", e))?;
+
+            let prior_deleted: Option<i64> = conn
+                .query_row(
+                    "SELECT COALESCE(deleted, 0)
+                     FROM clips
+                     WHERE content_hash = ?1
+                     LIMIT 1",
+                    [clip.hash.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?;
 
             let prior_metadata: Option<(i64, String, i64)> = if apply_metadata_from_peer {
                 conn.query_row(
@@ -1491,7 +1515,7 @@ async fn receive_clips(
 
             let existing_clip_id: Option<i64> = conn
                 .query_row(
-                    "SELECT id FROM clips WHERE content_hash = ?1 AND deleted = 0 LIMIT 1",
+                    "SELECT id FROM clips WHERE content_hash = ?1 LIMIT 1",
                     [clip.hash.as_str()],
                     |row| row.get(0),
                 )
@@ -1505,7 +1529,7 @@ async fn receive_clips(
 
             conn.execute(
                 "INSERT INTO clips (content, content_hash, content_type, source_app, source_app_icon, content_highlighted, ocr_text, language, created_at, pinned, collection_sync_id, image_data, source_device, sync_version, deleted, is_file, file_name, file_size, file_data, file_path)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12, ?18, 0, ?13, ?14, ?15, ?16, ?17)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12, ?18, ?20, ?13, ?14, ?15, ?16, ?17)
                  ON CONFLICT(content_hash) DO UPDATE SET
                     source_app = CASE
                         WHEN clips.source_device = excluded.source_device AND excluded.source_app <> '' THEN excluded.source_app
@@ -1546,7 +1570,10 @@ async fn receive_clips(
                     file_size = CASE WHEN excluded.file_size > 0 THEN excluded.file_size ELSE clips.file_size END,
                     file_data = COALESCE(excluded.file_data, clips.file_data),
                     file_path = COALESCE(excluded.file_path, clips.file_path),
-                    deleted = 0",
+                    deleted = CASE
+                        WHEN excluded.sync_version > clips.sync_version THEN excluded.deleted
+                        ELSE clips.deleted
+                    END",
                 rusqlite::params![
                     clip.content,
                     clip.hash,
@@ -1567,6 +1594,7 @@ async fn receive_clips(
                     clip.file_path,
                     clip.sync_version,
                     if apply_metadata_from_peer { 1 } else { 0 },
+                    if clip.deleted { 1 } else { 0 },
                 ],
             )?;
 
@@ -1582,7 +1610,11 @@ async fn receive_clips(
                          WHERE content_hash = ?2
                            AND COALESCE(sync_version, 0) = ?3
                            AND COALESCE(collection_sync_id, '') = ?1",
-                        rusqlite::params![collection_sync_id, clip.hash.as_str(), clip.sync_version],
+                        rusqlite::params![
+                            collection_sync_id,
+                            clip.hash.as_str(),
+                            clip.sync_version
+                        ],
                     );
                 } else {
                     let _ = conn.execute(
@@ -1594,7 +1626,6 @@ async fn receive_clips(
                         rusqlite::params![clip.hash.as_str(), clip.sync_version],
                     );
                 }
-
             }
 
             let clip_id: i64 = if let Some(id) = existing_clip_id {
@@ -1603,7 +1634,11 @@ async fn receive_clips(
                 conn.last_insert_rowid()
             };
 
-            if existing_clip_id.is_none() {
+            if clip.deleted {
+                let _ = conn.execute("DELETE FROM clip_embeddings WHERE rowid = ?1", [clip_id]);
+            }
+
+            if existing_clip_id.is_none() && !clip.deleted {
                 inserted_any = true;
                 insert_count += 1;
                 last_inserted_clip_for_mirror = Some(clip.clone());
@@ -1630,6 +1665,7 @@ async fn receive_clips(
 
             let mut metadata_changed = false;
             let mut collection_membership_changed = false;
+            let mut clip_state_changed = false;
             if apply_metadata_from_peer {
                 let merged: Option<(i64, String, i64)> = conn
                     .query_row(
@@ -1655,7 +1691,8 @@ async fn receive_clips(
                 }
 
                 if let Some((after_pinned, after_coll, after_sync_version)) = merged {
-                    if let Some((before_pinned, before_coll, before_sync_version)) = prior_metadata {
+                    if let Some((before_pinned, before_coll, before_sync_version)) = prior_metadata
+                    {
                         metadata_changed = before_pinned != after_pinned
                             || before_coll != after_coll
                             || before_sync_version != after_sync_version;
@@ -1667,8 +1704,27 @@ async fn receive_clips(
                 }
             }
 
+            let merged_deleted: Option<i64> = conn
+                .query_row(
+                    "SELECT COALESCE(deleted, 0)
+                     FROM clips
+                     WHERE content_hash = ?1
+                     LIMIT 1",
+                    [clip.hash.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(after_deleted) = merged_deleted {
+                clip_state_changed = match prior_deleted {
+                    Some(before_deleted) => before_deleted != after_deleted,
+                    None => after_deleted != 0,
+                };
+            }
+
             let needs_blob = if clip.kind == "image" && !clip.is_file {
-                if let Some(image_hash) = clip.image_hash.clone() {
+                if clip.deleted {
+                    false
+                } else if let Some(image_hash) = clip.image_hash.clone() {
                     let needs_blob: Option<i64> = conn
                         .query_row(
                             "SELECT id FROM clips
@@ -1688,7 +1744,12 @@ async fn receive_clips(
                 false
             };
 
-            (needs_blob, metadata_changed, collection_membership_changed)
+            (
+                needs_blob,
+                metadata_changed,
+                collection_membership_changed,
+                clip_state_changed,
+            )
         };
 
         if metadata_changed_this_clip {
@@ -1696,6 +1757,9 @@ async fn receive_clips(
         }
         if collection_membership_changed_this_clip {
             collection_membership_changed_any = true;
+        }
+        if clip_state_changed_this_clip {
+            clip_state_changed_any = true;
         }
 
         if should_request_blob {
@@ -1725,11 +1789,13 @@ async fn receive_clips(
         let _ = app.emit("new-clip", ());
         if mirror_last_clip_to_local_clipboard {
             if let Some(clip) = last_inserted_clip_for_mirror {
-                if let Err(error) = crate::clipboard::write_wire_clip_to_clipboard(app, &clip) {
-                    eprintln!(
-                        "[Sync] Failed to mirror remote clip to local clipboard: {}",
-                        error
-                    );
+                if !clip.deleted {
+                    if let Err(error) = crate::clipboard::write_wire_clip_to_clipboard(app, &clip) {
+                        eprintln!(
+                            "[Sync] Failed to mirror remote clip to local clipboard: {}",
+                            error
+                        );
+                    }
                 }
             }
         }
@@ -1737,17 +1803,19 @@ async fn receive_clips(
         eprintln!("[Sync] No new clips inserted from peer {}", peer_id);
         if mirror_last_clip_to_local_clipboard {
             if let Some(clip) = last_processed_clip_for_mirror {
-                if let Err(error) = crate::clipboard::write_wire_clip_to_clipboard(app, &clip) {
-                    eprintln!(
-                        "[Sync] Failed to mirror existing remote clip to local clipboard: {}",
-                        error
-                    );
+                if !clip.deleted {
+                    if let Err(error) = crate::clipboard::write_wire_clip_to_clipboard(app, &clip) {
+                        eprintln!(
+                            "[Sync] Failed to mirror existing remote clip to local clipboard: {}",
+                            error
+                        );
+                    }
                 }
             }
         }
     }
 
-    if metadata_changed_any {
+    if metadata_changed_any || clip_state_changed_any {
         let _ = app.emit("clips-changed", ());
     }
     if collection_membership_changed_any {
@@ -2083,8 +2151,7 @@ pub fn build_cursor_map(app: &AppHandle, our_device_id: &str) -> Result<HashMap<
     let own_max: i64 = conn.query_row(
         "SELECT COALESCE(MAX(created_at), 0)
          FROM clips
-         WHERE deleted = 0
-           AND (source_device = '' OR source_device = ?1)",
+         WHERE source_device = '' OR source_device = ?1",
         [our_device_id],
         |row| row.get(0),
     )?;
@@ -2121,13 +2188,14 @@ pub fn get_clips_since(app: &AppHandle, our_device_id: &str, since: i64) -> Resu
                 COALESCE(file_size, 0),
                 file_data,
                 file_path,
-                (SELECT embedding FROM clip_embeddings WHERE rowid = clips.id)
+                (SELECT embedding FROM clip_embeddings WHERE rowid = clips.id),
+                COALESCE(deleted, 0)
          FROM clips
-         WHERE deleted = 0
-           AND created_at > ?1
-           AND (source_device = '' OR source_device = ?2)
-           AND (
-                COALESCE(is_file, 0) = 0
+         WHERE created_at > ?1
+            AND (source_device = '' OR source_device = ?2)
+            AND (
+                COALESCE(deleted, 0) = 1
+                OR COALESCE(is_file, 0) = 0
                 OR (
                     COALESCE(file_size, 0) > 0
                     AND COALESCE(file_size, 0) <= ?3
@@ -2161,6 +2229,7 @@ pub fn get_clips_since(app: &AppHandle, our_device_id: &str, since: i64) -> Resu
                 row.get::<_, Option<Vec<u8>>>(16)?,
                 row.get::<_, Option<String>>(17)?,
                 row.get::<_, Option<Vec<u8>>>(18)?,
+                row.get::<_, i64>(19)?,
             ))
         },
     )?;
@@ -2187,6 +2256,7 @@ pub fn get_clips_since(app: &AppHandle, our_device_id: &str, since: i64) -> Resu
             file_data,
             _file_path,
             embedding,
+            deleted,
         ) = row?;
 
         let send_source = if source_device.is_empty() {
@@ -2249,6 +2319,7 @@ pub fn get_clips_since(app: &AppHandle, our_device_id: &str, since: i64) -> Resu
                 .as_ref()
                 .map(|_| crate::embed::EMBEDDING_MODEL_SIGNATURE.to_string()),
             embedding: embedding_encoded,
+            deleted: deleted != 0,
         });
     }
 
@@ -2419,6 +2490,7 @@ async fn lookup_clip_for_push(
                     row.get::<_, Option<Vec<u8>>>(17)?,
                     row.get::<_, Option<String>>(18)?,
                     row.get::<_, Option<Vec<u8>>>(19)?,
+                    row.get::<_, i64>(20)?,
                 ))
             })
             .optional()?;
@@ -2444,6 +2516,7 @@ async fn lookup_clip_for_push(
             file_data,
             file_path,
             embedding,
+            deleted,
         )) = row
         {
             let encoded_file_data =
@@ -2496,6 +2569,7 @@ async fn lookup_clip_for_push(
                     .as_ref()
                     .map(|_| crate::embed::EMBEDDING_MODEL_SIGNATURE.to_string()),
                 embedding: embedding_encoded,
+                deleted: deleted != 0,
             };
             return Ok(Some((wire, image_data)));
         }
@@ -2523,10 +2597,10 @@ async fn lookup_clip_for_push(
                 COALESCE(file_size, 0),
                 file_data,
                 file_path,
-                (SELECT embedding FROM clip_embeddings WHERE rowid = clips.id)
+                (SELECT embedding FROM clip_embeddings WHERE rowid = clips.id),
+                COALESCE(deleted, 0)
          FROM clips
          WHERE content_hash = ?1
-           AND deleted = 0
          ORDER BY created_at DESC
          LIMIT 1",
     )?;
@@ -2554,10 +2628,10 @@ async fn lookup_clip_for_push(
                 COALESCE(file_size, 0),
                 file_data,
                 file_path,
-                (SELECT embedding FROM clip_embeddings WHERE rowid = clips.id)
+                (SELECT embedding FROM clip_embeddings WHERE rowid = clips.id),
+                COALESCE(deleted, 0)
          FROM clips
          WHERE sync_id = ?1
-           AND deleted = 0
          ORDER BY created_at DESC
          LIMIT 1",
     )
@@ -2742,7 +2816,7 @@ pub async fn on_local_clip_saved(app: &AppHandle, content_hash: &str) {
     };
 
     let (wire_clip, image_data) = clip;
-    if wire_clip.is_file && wire_clip.file_data.is_none() {
+    if !wire_clip.deleted && wire_clip.is_file && wire_clip.file_data.is_none() {
         return;
     }
     let image_hash = wire_clip.image_hash.clone();
@@ -2790,9 +2864,11 @@ pub fn next_sync_version_from_conn(conn: &rusqlite::Connection) -> i64 {
         .unwrap_or(0);
 
     let max_clip_sync_version: i64 = conn
-        .query_row("SELECT COALESCE(MAX(sync_version), 0) FROM clips", [], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT COALESCE(MAX(sync_version), 0) FROM clips",
+            [],
+            |row| row.get(0),
+        )
         .unwrap_or(0);
 
     let max_collection_sync_version: i64 = conn
@@ -2830,7 +2906,9 @@ pub fn next_sync_version_from_conn(conn: &rusqlite::Connection) -> i64 {
 
 fn sync_version_slot_from_conn(conn: &rusqlite::Connection) -> i64 {
     let device_id: Option<String> = conn
-        .query_row("SELECT device_id FROM device_info LIMIT 1", [], |row| row.get(0))
+        .query_row("SELECT device_id FROM device_info LIMIT 1", [], |row| {
+            row.get(0)
+        })
         .optional()
         .ok()
         .flatten()
