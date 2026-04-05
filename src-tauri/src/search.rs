@@ -71,6 +71,18 @@ fn row_to_clip(r: &rusqlite::Row) -> rusqlite::Result<ClipResult> {
     })
 }
 
+fn clip_push_key_by_id(conn: &rusqlite::Connection, clip_id: i64) -> Option<String> {
+    conn.query_row(
+        "SELECT COALESCE(NULLIF(sync_id, ''), content_hash)
+         FROM clips
+         WHERE id = ?1",
+        [clip_id],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .filter(|key| !key.is_empty())
+}
+
 #[tauri::command]
 pub async fn search_clips(
     app: tauri::AppHandle,
@@ -145,16 +157,11 @@ pub async fn toggle_pin(app: tauri::AppHandle, clip_id: i64) -> Result<(), Strin
         rusqlite::params![sync_version, clip_id],
     )
     .map_err(|e| e.to_string())?;
-    let mut sync_key: Option<String> = None;
-    if updated > 0 {
-        if let Ok(sync_id) =
-            conn.query_row("SELECT sync_id FROM clips WHERE id = ?1", [clip_id], |r| {
-                r.get::<_, String>(0)
-            })
-        {
-            sync_key = Some(sync_id);
-        }
-    }
+    let sync_key = if updated > 0 {
+        clip_push_key_by_id(&conn, clip_id)
+    } else {
+        None
+    };
     drop(conn);
     if let Some(sync_key) = sync_key {
         let app_clone = app.clone();
@@ -179,16 +186,11 @@ pub async fn delete_clip(app: tauri::AppHandle, clip_id: i64) -> Result<(), Stri
             rusqlite::params![sync_version, clip_id],
         )
         .map_err(|e| e.to_string())?;
-    let mut sync_key: Option<String> = None;
-    if updated > 0 {
-        if let Ok(sync_id) =
-            conn.query_row("SELECT sync_id FROM clips WHERE id = ?1", [clip_id], |r| {
-                r.get::<_, String>(0)
-            })
-        {
-            sync_key = Some(sync_id);
-        }
-    }
+    let sync_key = if updated > 0 {
+        clip_push_key_by_id(&conn, clip_id)
+    } else {
+        None
+    };
     drop(conn);
     if let Some(sync_key) = sync_key {
         let app_clone = app.clone();
@@ -241,16 +243,11 @@ pub async fn update_clip_content(
         ],
     )
     .map_err(|e| e.to_string())?;
-    let mut sync_key: Option<String> = None;
-    if updated > 0 {
-        if let Ok(sync_id) =
-            conn.query_row("SELECT sync_id FROM clips WHERE id = ?1", [clip_id], |r| {
-                r.get::<_, String>(0)
-            })
-        {
-            sync_key = Some(sync_id);
-        }
-    }
+    let sync_key = if updated > 0 {
+        clip_push_key_by_id(&conn, clip_id)
+    } else {
+        None
+    };
     drop(conn);
     if let Some(sync_key) = sync_key {
         let app_clone = app.clone();
@@ -1188,6 +1185,7 @@ mod tests {
                 content_hash TEXT NOT NULL,
                 content_type TEXT NOT NULL,
                 source_app TEXT DEFAULT '',
+                source_device TEXT NOT NULL DEFAULT '',
                 source_app_icon BLOB,
                 content_highlighted TEXT,
                 ocr_text TEXT,
@@ -1195,12 +1193,14 @@ mod tests {
                 image_thumbnail BLOB,
                 image_width INTEGER DEFAULT 0,
                 image_height INTEGER DEFAULT 0,
+                is_file INTEGER DEFAULT 0,
                 created_at INTEGER NOT NULL,
                 pinned INTEGER DEFAULT 0,
                 collection_id INTEGER,
                 language TEXT,
                 copy_count INTEGER DEFAULT 0,
                 deleted INTEGER DEFAULT 0,
+                sync_id TEXT,
                 sync_version INTEGER DEFAULT 0
             );
             CREATE VIRTUAL TABLE clips_fts USING fts5(content, ocr_text);
@@ -1269,6 +1269,34 @@ mod tests {
             rusqlite::params![id, content, ocr_text.unwrap_or("")],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn clip_push_key_prefers_sync_id_then_hash() {
+        let conn = setup_test_db();
+        insert_clip(
+            &conn,
+            1,
+            "sync key test",
+            "text",
+            "Notes",
+            1_710_000_000,
+            None,
+        );
+
+        conn.execute("UPDATE clips SET sync_id = 'sync-key-1' WHERE id = 1", [])
+            .unwrap();
+        assert_eq!(
+            super::clip_push_key_by_id(&conn, 1),
+            Some("sync-key-1".to_string())
+        );
+
+        conn.execute("UPDATE clips SET sync_id = '' WHERE id = 1", [])
+            .unwrap();
+        assert_eq!(
+            super::clip_push_key_by_id(&conn, 1),
+            Some("hash-1".to_string())
+        );
     }
 
     #[test]

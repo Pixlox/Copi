@@ -4,6 +4,18 @@ use tauri::{Emitter, Manager};
 use crate::sync;
 use crate::AppState;
 
+fn clip_push_key_by_id(conn: &rusqlite::Connection, clip_id: i64) -> Option<String> {
+    conn.query_row(
+        "SELECT COALESCE(NULLIF(sync_id, ''), content_hash)
+         FROM clips
+         WHERE id = ?1",
+        [clip_id],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .filter(|key| !key.is_empty())
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CollectionInfo {
     pub id: i64,
@@ -55,12 +67,15 @@ pub fn delete_collection(app: tauri::AppHandle, id: i64) -> Result<(), String> {
 
     let clip_sync_ids: Vec<String> = {
         let mut stmt = conn
-            .prepare("SELECT sync_id FROM clips WHERE collection_id = ?1 AND deleted = 0")
+            .prepare("SELECT id FROM clips WHERE collection_id = ?1 AND deleted = 0")
             .map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map([id], |row| row.get::<_, Option<String>>(0))
+            .query_map([id], |row| row.get::<_, i64>(0))
             .map_err(|e| e.to_string())?;
-        rows.filter_map(|r| r.ok().flatten()).collect()
+        rows
+            .filter_map(|r| r.ok())
+            .filter_map(|clip_id| clip_push_key_by_id(&conn, clip_id))
+            .collect()
     };
 
     conn.execute(
@@ -197,13 +212,7 @@ pub fn move_clip_to_collection(
         .map_err(|e| e.to_string())?;
 
     let clip_sync_id: Option<String> = if updated > 0 {
-        conn.query_row(
-            "SELECT sync_id FROM clips WHERE id = ?1",
-            [clip_id],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .ok()
-        .flatten()
+        clip_push_key_by_id(&conn, clip_id)
     } else {
         None
     };

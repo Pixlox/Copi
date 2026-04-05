@@ -1455,16 +1455,6 @@ async fn receive_clips(
                 conn.last_insert_rowid()
             };
 
-            if metadata_sync_enabled {
-                let _ = conn.execute(
-                    "UPDATE clips
-                     SET source_device = ?1
-                     WHERE id = ?2
-                       AND (source_device = '' OR source_device = ?1)",
-                    rusqlite::params![clip.source_device, clip_id],
-                );
-            }
-
             if existing_clip_id.is_none() {
                 inserted_any = true;
                 insert_count += 1;
@@ -2217,7 +2207,7 @@ async fn lookup_clip_for_push(
         if let Some((
             hash,
             created_at,
-            source_device,
+            _source_device,
             kind,
             content,
             source_app,
@@ -2254,11 +2244,9 @@ async fn lookup_clip_for_push(
             let wire = WireClip {
                 hash: hash.clone(),
                 created_at,
-                source_device: if source_device.is_empty() {
-                    our_device_id.to_string()
-                } else {
-                    source_device
-                },
+                // For live push updates, stamp sender device so the origin device
+                // does not treat the frame as self-origin and skip metadata changes.
+                source_device: our_device_id.to_string(),
                 kind: kind.clone(),
                 content: if kind == "image" {
                     "[Image]".to_string()
