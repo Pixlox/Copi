@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::TryLockError;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -22,6 +22,9 @@ struct QaRequest {
     cmd: String,
     phase: Option<u8>,
     enabled: Option<bool>,
+    suffix: Option<String>,
+    name: Option<String>,
+    color: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -39,15 +42,18 @@ struct QaState {
     connected_peers: usize,
     collection: Option<QaCollectionState>,
     clips: Vec<QaClipState>,
+    collections: Vec<QaCollectionState>,
 }
 
 #[derive(Debug, Serialize)]
 struct QaCollectionState {
     id: i64,
     name: String,
+    color: String,
     sync_id: String,
     deleted: bool,
     sync_version: i64,
+    clip_count: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -212,8 +218,67 @@ async fn dispatch(app: &AppHandle, request: QaRequest) -> Result<QaResponse> {
                 state: None,
             })
         }
+        "make_collection" => {
+            let suffix = request
+                .suffix
+                .ok_or_else(|| anyhow!("suffix is required"))?;
+            let name = request.name.unwrap_or_else(|| format!("QA_SYNC_{}", suffix));
+            let color = request.color.unwrap_or_else(|| "#0A84FF".to_string());
+            let sync_id = upsert_named_collection(app, &suffix, &name, &color)?;
+            Ok(QaResponse {
+                ok: true,
+                message: format!("collection upserted: {}", sync_id),
+                state: None,
+            })
+        }
         _ => Err(anyhow!("unknown command: {}", request.cmd)),
     }
+}
+
+fn qa_collection_sync_id(suffix: &str) -> String {
+    format!("qa-sync-extra-{}", suffix)
+}
+
+fn upsert_named_collection(app: &AppHandle, suffix: &str, name: &str, color: &str) -> Result<String> {
+    let sync_id = qa_collection_sync_id(suffix);
+    let state = app.state::<AppState>();
+    let conn = lock_db_write(&state)?;
+    let sync_version = sync::next_sync_version_from_conn(&conn);
+    let origin_device_id: Option<String> = conn
+        .query_row("SELECT device_id FROM device_info LIMIT 1", [], |row| row.get(0))
+        .optional()?;
+
+    let existing_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM collections WHERE sync_id = ?1 LIMIT 1",
+            [sync_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    if let Some(id) = existing_id {
+        conn.execute(
+            "UPDATE collections
+             SET name = ?1,
+                 color = ?2,
+                 deleted = 0,
+                 sync_version = ?3,
+                 origin_device_id = COALESCE(origin_device_id, ?4)
+             WHERE id = ?5",
+            rusqlite::params![name, color, sync_version, origin_device_id, id],
+        )?;
+    } else {
+        conn.execute(
+            "INSERT INTO collections(name, color, created_at, sync_id, sync_version, deleted, origin_device_id)
+             VALUES(?1, ?2, ?3, ?4, ?5, 0, ?6)",
+            rusqlite::params![name, color, now_ts(), sync_id, sync_version, origin_device_id],
+        )?;
+    }
+
+    drop(conn);
+    sync::on_collection_changed(app);
+    let _ = app.emit("collections-changed", ());
+    Ok(sync_id)
 }
 
 fn enqueue_pushes(app: &AppHandle, seed: &SeedData) {
@@ -519,23 +584,59 @@ async fn collect_state(app: &AppHandle) -> Result<QaState> {
 
     let collection = conn
         .query_row(
-            "SELECT id, name, COALESCE(sync_id, ''), COALESCE(deleted, 0), COALESCE(sync_version, 0)
-             FROM collections
-             WHERE sync_id = ?1
-             ORDER BY id DESC
+            "SELECT c.id,
+                    c.name,
+                    COALESCE(c.color, '#0A84FF'),
+                    COALESCE(c.sync_id, ''),
+                    COALESCE(c.deleted, 0),
+                    COALESCE(c.sync_version, 0),
+                    (SELECT COUNT(*) FROM clips WHERE deleted = 0 AND collection_id = c.id)
+             FROM collections c
+             WHERE c.sync_id = ?1
+             ORDER BY c.id DESC
              LIMIT 1",
             [QA_COLLECTION_SYNC_ID],
             |row| {
                 Ok(QaCollectionState {
                     id: row.get(0)?,
                     name: row.get(1)?,
-                    sync_id: row.get(2)?,
-                    deleted: row.get::<_, i64>(3)? != 0,
-                    sync_version: row.get(4)?,
+                    color: row.get(2)?,
+                    sync_id: row.get(3)?,
+                    deleted: row.get::<_, i64>(4)? != 0,
+                    sync_version: row.get(5)?,
+                    clip_count: row.get(6)?,
                 })
             },
         )
         .optional()?;
+
+    let mut collections = Vec::new();
+    let mut stmt = conn.prepare(
+        "SELECT c.id,
+                c.name,
+                COALESCE(c.color, '#0A84FF'),
+                COALESCE(c.sync_id, ''),
+                COALESCE(c.deleted, 0),
+                COALESCE(c.sync_version, 0),
+                (SELECT COUNT(*) FROM clips WHERE deleted = 0 AND collection_id = c.id)
+         FROM collections c
+         WHERE c.sync_id IS NOT NULL
+         ORDER BY c.id ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(QaCollectionState {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            color: row.get(2)?,
+            sync_id: row.get(3)?,
+            deleted: row.get::<_, i64>(4)? != 0,
+            sync_version: row.get(5)?,
+            clip_count: row.get(6)?,
+        })
+    })?;
+    for row in rows {
+        collections.push(row?);
+    }
 
     let collection_is_active = collection.as_ref().map(|value| !value.deleted).unwrap_or(false);
 
@@ -625,6 +726,7 @@ async fn collect_state(app: &AppHandle) -> Result<QaState> {
         connected_peers,
         collection,
         clips,
+        collections,
     })
 }
 

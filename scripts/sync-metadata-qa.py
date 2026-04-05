@@ -65,10 +65,26 @@ def state_to_map(state: dict):
             "source_device": clip.get("source_device"),
         }
 
+    collections = []
+    for collection in state.get("collections", []):
+        sync_id = collection.get("sync_id") or ""
+        collections.append(
+            {
+                "id": collection.get("id"),
+                "name": collection.get("name") or "",
+                "color": (collection.get("color") or "").upper(),
+                "sync_id": sync_id,
+                "deleted": bool(collection.get("deleted")),
+                "sync_version": int(collection.get("sync_version") or 0),
+                "clip_count": int(collection.get("clip_count") or 0),
+            }
+        )
+
     return {
         "collection_sync_id": collection_sync_id,
         "collection_deleted": collection_deleted,
         "clips": clips,
+        "collections": collections,
         "metadata_enabled": bool(state.get("metadata_enabled")),
         "sync_enabled": bool(state.get("sync_enabled")),
         "connected_peers": int(state.get("connected_peers") or 0),
@@ -160,6 +176,84 @@ def print_state(label: str, state_map: dict):
             f"[{label}] {content}: exists={clip.get('exists')} pinned={clip.get('pinned')} in_collection={clip.get('in_collection')}"
             f" sync_version={clip.get('sync_version')} collection_sync_id={clip.get('collection_sync_id')} source_device={clip.get('source_device')}"
         )
+    for collection in state_map.get("collections", []):
+        print(
+            f"[{label}] coll sync_id={collection.get('sync_id')} name={collection.get('name')}"
+            f" color={collection.get('color')} deleted={collection.get('deleted')} sync_version={collection.get('sync_version')} clip_count={collection.get('clip_count')}"
+        )
+
+
+def wait_for_collection_state(
+    host: str,
+    port: int,
+    sync_id: str,
+    timeout_s: float,
+    *,
+    expected_name: str | None = None,
+    expected_color: str | None = None,
+    expected_deleted: bool | None = None,
+) -> tuple[bool, dict, list[str]]:
+    start = time.time()
+    last_map = {}
+    errors = []
+    while time.time() - start < timeout_s:
+        try:
+            resp = send_cmd(host, port, {"cmd": "state"}, timeout=max(2.0, min(8.0, timeout_s / 3.0)))
+        except Exception as exc:
+            errors = [f"state command exception: {exc}"]
+            time.sleep(0.2)
+            continue
+
+        if not resp.get("ok"):
+            errors = [f"state command failed: {resp.get('message')}"]
+            time.sleep(0.2)
+            continue
+
+        last_map = state_to_map(resp.get("state") or {})
+        target = None
+        for coll in last_map.get("collections", []):
+            if coll.get("sync_id") == sync_id:
+                target = coll
+                break
+
+        local_errors = []
+        if target is None:
+            local_errors.append(f"missing collection sync_id={sync_id}")
+        else:
+            if expected_name is not None and target.get("name") != expected_name:
+                local_errors.append(
+                    f"name={target.get('name')} expected={expected_name}"
+                )
+            if expected_color is not None and (target.get("color") or "").upper() != expected_color.upper():
+                local_errors.append(
+                    f"color={target.get('color')} expected={expected_color.upper()}"
+                )
+            if expected_deleted is not None and bool(target.get("deleted")) is not expected_deleted:
+                local_errors.append(
+                    f"deleted={target.get('deleted')} expected={expected_deleted}"
+                )
+
+        if not local_errors:
+            return True, last_map, []
+
+        errors = local_errors
+        time.sleep(0.2)
+
+    return False, last_map, errors
+
+
+def expect_collection_count(state_map: dict, sync_id: str, expected_count: int) -> tuple[bool, list[str]]:
+    target = None
+    for coll in state_map.get("collections", []):
+        if coll.get("sync_id") == sync_id:
+            target = coll
+            break
+    if target is None:
+        return False, [f"missing collection sync_id={sync_id}"]
+    actual_count = int(target.get("clip_count") or 0)
+    if actual_count != expected_count:
+        return False, [f"clip_count={actual_count} expected={expected_count}"]
+    return True, []
 
 
 def ensure_seed_and_toggle(host: str, port: int):
@@ -267,6 +361,85 @@ def main():
             for e in delete_errors:
                 print(f"  - {e}")
             failures.append(("delete", "mac->win", None, delete_errors, last_map))
+
+    # collection create/rename and count propagation checks
+    extra_sync_id = "qa-sync-extra-propagation"
+    create_resp = send_cmd(
+        mac[0],
+        mac[1],
+        {
+            "cmd": "make_collection",
+            "suffix": "propagation",
+            "name": "QA Propagation One",
+            "color": "#34C759",
+        },
+        timeout=max(20.0, args.timeout),
+    )
+    if not create_resp.get("ok"):
+        failures.append(("create", "mac->win", None, [f"create failed: {create_resp.get('message')}"], {}))
+    else:
+        ok, state_map, errors = wait_for_collection_state(
+            win[0], win[1], extra_sync_id, args.timeout, expected_name="QA Propagation One", expected_color="#34C759", expected_deleted=False
+        )
+        if ok:
+            print("COLLECTION CREATE mac->win: PASS")
+        else:
+            print("COLLECTION CREATE mac->win: FAIL")
+            print_state("WIN:create-fail", state_map)
+            for e in errors:
+                print(f"  - {e}")
+            failures.append(("create", "mac->win", None, errors, state_map))
+
+    rename_resp = send_cmd(
+        win[0],
+        win[1],
+        {
+            "cmd": "make_collection",
+            "suffix": "propagation",
+            "name": "QA Propagation Renamed",
+            "color": "#FF9500",
+        },
+        timeout=max(20.0, args.timeout),
+    )
+    if not rename_resp.get("ok"):
+        failures.append(("rename", "win->mac", None, [f"rename failed: {rename_resp.get('message')}"], {}))
+    else:
+        ok, state_map, errors = wait_for_collection_state(
+            mac[0], mac[1], extra_sync_id, args.timeout, expected_name="QA Propagation Renamed", expected_color="#FF9500", expected_deleted=False
+        )
+        if ok:
+            print("COLLECTION RENAME/COLOR win->mac: PASS")
+        else:
+            print("COLLECTION RENAME/COLOR win->mac: FAIL")
+            print_state("MAC:rename-fail", state_map)
+            for e in errors:
+                print(f"  - {e}")
+            failures.append(("rename", "win->mac", None, errors, state_map))
+
+    # ensure clip_count propagation for collection sidebar badge
+    phase_resp = send_cmd(mac[0], mac[1], {"cmd": "phase", "phase": 2}, timeout=max(20.0, args.timeout))
+    if not phase_resp.get("ok"):
+        failures.append(("count-phase", "mac->win", None, [f"phase apply failed: {phase_resp.get('message')}"], {}))
+    else:
+        ok, state_map, errors = wait_for_collection_state(
+            win[0], win[1], QA_COLLECTION_SYNC_ID, args.timeout, expected_deleted=False
+        )
+        if ok:
+            count_ok, count_errors = expect_collection_count(state_map, QA_COLLECTION_SYNC_ID, 1)
+            if count_ok:
+                print("COLLECTION COUNT mac->win phase=2: PASS")
+            else:
+                print("COLLECTION COUNT mac->win phase=2: FAIL")
+                print_state("WIN:count-fail", state_map)
+                for e in count_errors:
+                    print(f"  - {e}")
+                failures.append(("count-phase", "mac->win", 2, count_errors, state_map))
+        else:
+            print("COLLECTION COUNT mac->win phase=2: FAIL")
+            print_state("WIN:count-fail", state_map)
+            for e in errors:
+                print(f"  - {e}")
+            failures.append(("count-phase", "mac->win", 2, errors, state_map))
 
     if failures:
         print(f"QA RESULT: FAIL ({len(failures)} failure(s))")
