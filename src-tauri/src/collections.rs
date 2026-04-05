@@ -64,13 +64,31 @@ pub fn delete_collection(app: tauri::AppHandle, id: i64) -> Result<(), String> {
     let conn = state.db_write.lock().map_err(|e| e.to_string())?;
 
     let sync_version = sync::next_sync_version_from_conn(&conn);
+    let collection_sync_id: Option<String> = conn
+        .query_row(
+            "SELECT sync_id FROM collections WHERE id = ?1 LIMIT 1",
+            [id],
+            |row| row.get(0),
+        )
+        .ok();
 
     let clip_sync_ids: Vec<String> = {
         let mut stmt = conn
-            .prepare("SELECT id FROM clips WHERE collection_id = ?1 AND deleted = 0")
+            .prepare(
+                "SELECT id
+                 FROM clips
+                 WHERE deleted = 0
+                   AND (
+                       collection_id = ?1
+                       OR (?2 IS NOT NULL AND collection_sync_id = ?2)
+                   )",
+            )
             .map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map([id], |row| row.get::<_, i64>(0))
+            .query_map(
+                rusqlite::params![id, collection_sync_id.as_deref()],
+                |row| row.get::<_, i64>(0),
+            )
             .map_err(|e| e.to_string())?;
         rows
             .filter_map(|r| r.ok())
@@ -79,8 +97,16 @@ pub fn delete_collection(app: tauri::AppHandle, id: i64) -> Result<(), String> {
     };
 
     conn.execute(
-        "UPDATE clips SET collection_id = NULL, collection_sync_id = NULL, sync_version = ?1 WHERE collection_id = ?2 AND deleted = 0",
-        rusqlite::params![sync_version, id],
+        "UPDATE clips
+         SET collection_id = NULL,
+             collection_sync_id = NULL,
+             sync_version = ?1
+         WHERE deleted = 0
+           AND (
+               collection_id = ?2
+               OR (?3 IS NOT NULL AND collection_sync_id = ?3)
+           )",
+        rusqlite::params![sync_version, id, collection_sync_id.as_deref()],
     )
     .map_err(|e| e.to_string())?;
 
