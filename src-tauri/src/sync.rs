@@ -1502,11 +1502,11 @@ async fn receive_clips(
                     ocr_text = COALESCE(excluded.ocr_text, clips.ocr_text),
                     language = COALESCE(excluded.language, clips.language),
                     pinned = CASE
-                        WHEN ?19 = 1 AND excluded.sync_version >= clips.sync_version THEN excluded.pinned
+                        WHEN ?19 = 1 AND excluded.sync_version > clips.sync_version THEN excluded.pinned
                         ELSE clips.pinned
                     END,
                     collection_sync_id = CASE
-                        WHEN ?19 = 1 AND excluded.sync_version >= clips.sync_version THEN excluded.collection_sync_id
+                        WHEN ?19 = 1 AND excluded.sync_version > clips.sync_version THEN excluded.collection_sync_id
                         ELSE clips.collection_sync_id
                     END,
                     sync_version = CASE
@@ -1561,7 +1561,8 @@ async fn receive_clips(
                                AND c.deleted = 0
                          )
                          WHERE content_hash = ?2
-                           AND COALESCE(sync_version, 0) = ?3",
+                           AND COALESCE(sync_version, 0) = ?3
+                           AND COALESCE(collection_sync_id, '') = ?1",
                         rusqlite::params![collection_sync_id, clip.hash.as_str(), clip.sync_version],
                     );
                 } else {
@@ -1569,33 +1570,12 @@ async fn receive_clips(
                         "UPDATE clips
                          SET collection_id = NULL
                          WHERE content_hash = ?1
-                           AND COALESCE(sync_version, 0) = ?2",
+                           AND COALESCE(sync_version, 0) = ?2
+                           AND COALESCE(collection_sync_id, '') = ''",
                         rusqlite::params![clip.hash.as_str(), clip.sync_version],
                     );
                 }
 
-                if clip.hash == "94b1e93080d7ece5d52f248418ab195a77ba26644d3ef53f60de07853f34056d"
-                    || clip.hash == "709d08d16ae5003d92cc46179db0d55ada46330a6d525d28ed4cfa71049f4cb6"
-                {
-                    let current: Option<(i64, Option<String>, i64)> = conn
-                        .query_row(
-                            "SELECT COALESCE(pinned, 0), collection_sync_id, COALESCE(sync_version, 0)
-                             FROM clips
-                             WHERE content_hash = ?1
-                             LIMIT 1",
-                            [clip.hash.as_str()],
-                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                        )
-                        .optional()?;
-                    eprintln!(
-                        "[Sync][meta][qa] after-upsert hash={} incoming(pinned={}, coll={:?}, v={}) db={:?}",
-                        clip.hash,
-                        clip.pinned,
-                        remote_collection_sync_id,
-                        clip.sync_version,
-                        current
-                    );
-                }
             }
 
             let clip_id: i64 = if let Some(id) = existing_clip_id {
@@ -2904,13 +2884,13 @@ fn receive_collections(
                          ELSE collections.created_at
                      END,
                      sync_version = CASE
-                         WHEN ?5 > collections.sync_version THEN ?5
-                         ELSE collections.sync_version
-                     END,
-                     deleted = CASE
-                         WHEN ?5 >= collections.sync_version THEN ?6
-                         ELSE collections.deleted
-                     END,
+                          WHEN ?5 > collections.sync_version THEN ?5
+                          ELSE collections.sync_version
+                      END,
+                      deleted = CASE
+                          WHEN ?5 > collections.sync_version THEN ?6
+                          ELSE collections.deleted
+                      END,
                      origin_device_id = COALESCE(collections.origin_device_id, ?7)
                  WHERE id = ?4",
                 rusqlite::params![
