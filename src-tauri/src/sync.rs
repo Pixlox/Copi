@@ -1236,12 +1236,6 @@ async fn run_session(
         }
 
         if metadata_sync_enabled {
-            if let Err(error) =
-                send_full_clip_snapshot_to_peer(&app_bootstrap, &sync_bootstrap, &writer_bootstrap)
-                    .await
-            {
-                eprintln!("[Sync] Failed to send metadata clip snapshot: {}", error);
-            }
             if let Err(error) = send_full_collection_snapshot_to_peer(&app_bootstrap, &writer_bootstrap).await {
                 eprintln!("[Sync] Failed to send metadata collection snapshot: {}", error);
             }
@@ -2928,29 +2922,9 @@ fn sync_existing_metadata_now(app: &AppHandle, sync: Arc<SyncState>) {
             guard.values().map(|peer| peer.writer.clone()).collect()
         };
         for peer in peers {
-            let _ = send_full_clip_snapshot_to_peer(&app_handle, &sync, &peer).await;
             let _ = send_full_collection_snapshot_to_peer(&app_handle, &peer).await;
         }
     });
-}
-
-async fn send_full_clip_snapshot_to_peer(
-    app: &AppHandle,
-    sync: &Arc<SyncState>,
-    peer: &SecureSender,
-) -> Result<()> {
-    let mut since = 0_i64;
-    loop {
-        let batch = get_clips_since(app, &sync.device_id, since)?;
-        if batch.is_empty() {
-            break;
-        }
-        if let Some(last) = batch.last() {
-            since = last.created_at;
-        }
-        peer.send(&Msg::ClipBatch { clips: batch }).await?;
-    }
-    Ok(())
 }
 
 async fn send_full_collection_snapshot_to_peer(app: &AppHandle, peer: &SecureSender) -> Result<()> {
