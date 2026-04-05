@@ -2709,6 +2709,47 @@ pub async fn sync_list_discovered(app: AppHandle) -> Result<Vec<DiscoveredPeer>,
 }
 
 pub fn next_sync_version_from_conn(conn: &rusqlite::Connection) -> i64 {
+    let current_setting: i64 = conn
+        .query_row(
+            "SELECT COALESCE(value, '0') FROM settings WHERE key = 'sync_version'",
+            [],
+            |row| {
+                let value: String = row.get(0)?;
+                Ok(value.parse::<i64>().unwrap_or(0))
+            },
+        )
+        .unwrap_or(0);
+
+    let max_clip_sync_version: i64 = conn
+        .query_row("SELECT COALESCE(MAX(sync_version), 0) FROM clips", [], |row| {
+            row.get(0)
+        })
+        .unwrap_or(0);
+
+    let max_collection_sync_version: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(sync_version), 0) FROM collections",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    let next = current_setting
+        .max(max_clip_sync_version)
+        .max(max_collection_sync_version)
+        + 1;
+    let _ = conn.execute(
+        "INSERT OR REPLACE INTO settings(key, value) VALUES ('sync_version', ?1)",
+        [next.to_string()],
+    );
+    next
+}
+
+pub fn ensure_sync_version_floor(conn: &rusqlite::Connection, floor: i64) {
+    if floor <= 0 {
+        return;
+    }
+
     let current: i64 = conn
         .query_row(
             "SELECT COALESCE(value, '0') FROM settings WHERE key = 'sync_version'",
@@ -2719,12 +2760,13 @@ pub fn next_sync_version_from_conn(conn: &rusqlite::Connection) -> i64 {
             },
         )
         .unwrap_or(0);
-    let next = current + 1;
-    let _ = conn.execute(
-        "INSERT OR REPLACE INTO settings(key, value) VALUES ('sync_version', ?1)",
-        [next.to_string()],
-    );
-    next
+
+    if current < floor {
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO settings(key, value) VALUES ('sync_version', ?1)",
+            [floor.to_string()],
+        );
+    }
 }
 
 fn get_collections_since(app: &AppHandle, since_sync_version: i64) -> Result<Vec<WireCollection>> {
@@ -2796,7 +2838,12 @@ fn receive_collections(
 
     let mut changed = false;
     let received_count = collections.len();
+    let mut max_incoming_sync_version = 0_i64;
     for collection in collections {
+        if collection.sync_version > max_incoming_sync_version {
+            max_incoming_sync_version = collection.sync_version;
+        }
+
         let existing_id: Option<i64> = conn
             .query_row(
                 "SELECT id FROM collections WHERE sync_id = ?1 LIMIT 1",
@@ -2808,8 +2855,14 @@ fn receive_collections(
         let affected = if let Some(id) = existing_id {
             conn.execute(
                 "UPDATE collections
-                 SET name = ?1,
-                     color = ?2,
+                 SET name = CASE
+                         WHEN ?5 >= collections.sync_version THEN ?1
+                         ELSE collections.name
+                     END,
+                     color = CASE
+                         WHEN ?5 >= collections.sync_version THEN ?2
+                         ELSE collections.color
+                     END,
                      created_at = CASE
                          WHEN ?3 > collections.created_at THEN ?3
                          ELSE collections.created_at
@@ -2853,6 +2906,8 @@ fn receive_collections(
             changed = true;
         }
     }
+
+    ensure_sync_version_floor(&conn, max_incoming_sync_version);
 
     if changed {
         let _ = conn.execute(
