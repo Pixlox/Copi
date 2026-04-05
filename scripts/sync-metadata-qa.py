@@ -97,7 +97,12 @@ def wait_for_expected(host: str, port: int, phase: int, timeout_s: float) -> tup
     errors = []
 
     while time.time() - start < timeout_s:
-        resp = send_cmd(host, port, {"cmd": "state"}, timeout=2.0)
+        try:
+            resp = send_cmd(host, port, {"cmd": "state"}, timeout=max(2.0, min(8.0, timeout_s / 3.0)))
+        except Exception as exc:
+            errors = [f"state command exception: {exc}"]
+            time.sleep(0.25)
+            continue
         if not resp.get("ok"):
             errors = [f"state command failed: {resp.get('message')}"]
             time.sleep(0.25)
@@ -133,7 +138,10 @@ def wait_for_expected(host: str, port: int, phase: int, timeout_s: float) -> tup
 
 
 def run_phase(apply_host: str, apply_port: int, verify_host: str, verify_port: int, phase: int, timeout_s: float) -> tuple[bool, dict, list[str], str]:
-    apply_resp = send_cmd(apply_host, apply_port, {"cmd": "phase", "phase": phase}, timeout=max(20.0, timeout_s))
+    try:
+        apply_resp = send_cmd(apply_host, apply_port, {"cmd": "phase", "phase": phase}, timeout=max(20.0, timeout_s))
+    except Exception as exc:
+        return False, {}, [f"apply phase {phase} exception: {exc}"], "apply"
     if not apply_resp.get("ok"):
         return False, {}, [f"apply phase {phase} failed: {apply_resp.get('message')}"], "apply"
 
@@ -229,7 +237,12 @@ def main():
         last_map = {}
         delete_errors = []
         while time.time() - start < args.timeout:
-            resp = send_cmd(win[0], win[1], {"cmd": "state"}, timeout=2.0)
+            try:
+                resp = send_cmd(win[0], win[1], {"cmd": "state"}, timeout=max(2.0, min(8.0, args.timeout / 3.0)))
+            except Exception as exc:
+                delete_errors = [f"state exception: {exc}"]
+                time.sleep(0.25)
+                continue
             if not resp.get("ok"):
                 delete_errors = [f"state failed: {resp.get('message')}"]
                 time.sleep(0.25)
