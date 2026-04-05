@@ -6,6 +6,7 @@ import sys
 import time
 
 QA_COLLECTION_SYNC_ID = "qa-sync-coll-v1"
+QA_DELETE_RECOPY_TEXT = "qa_delete_recopy_clip_text_v1"
 
 
 def send_cmd(host: str, port: int, payload: dict, timeout: float = 10.0) -> dict:
@@ -59,7 +60,8 @@ def state_to_map(state: dict):
         clip_collection_sync_id = clip.get("collection_sync_id") or ""
         in_collection = bool(clip_collection_sync_id and clip_collection_sync_id == collection_sync_id)
         clips[content] = {
-            "exists": clip.get("id") is not None,
+            "exists": clip.get("id") is not None and not bool(clip.get("deleted")),
+            "deleted": bool(clip.get("deleted")) if clip.get("deleted") is not None else None,
             "pinned": bool(clip.get("pinned")) if clip.get("pinned") is not None else None,
             "in_collection": in_collection,
             "collection_sync_id": clip_collection_sync_id,
@@ -151,6 +153,55 @@ def wait_for_expected(host: str, port: int, phase: int, timeout_s: float) -> tup
 
         errors = local_errors
         time.sleep(0.25)
+
+    return False, last_map, errors
+
+
+def wait_for_clip_state(
+    host: str,
+    port: int,
+    content: str,
+    timeout_s: float,
+    *,
+    expected_exists: bool | None = None,
+    expected_deleted: bool | None = None,
+) -> tuple[bool, dict, list[str]]:
+    start = time.time()
+    last_map = {}
+    errors = []
+
+    while time.time() - start < timeout_s:
+        try:
+            resp = send_cmd(host, port, {"cmd": "state"}, timeout=max(2.0, min(8.0, timeout_s / 3.0)))
+        except Exception as exc:
+            errors = [f"state command exception: {exc}"]
+            time.sleep(0.2)
+            continue
+
+        if not resp.get("ok"):
+            errors = [f"state command failed: {resp.get('message')}"]
+            time.sleep(0.2)
+            continue
+
+        last_map = state_to_map(resp.get("state") or {})
+        clip = last_map.get("clips", {}).get(content, {})
+        local_errors = []
+
+        if expected_exists is not None and bool(clip.get("exists")) is not expected_exists:
+            local_errors.append(
+                f"{content} exists={clip.get('exists')} expected={expected_exists}"
+            )
+
+        if expected_deleted is not None and bool(clip.get("deleted")) is not expected_deleted:
+            local_errors.append(
+                f"{content} deleted={clip.get('deleted')} expected={expected_deleted}"
+            )
+
+        if not local_errors:
+            return True, last_map, []
+
+        errors = local_errors
+        time.sleep(0.2)
 
     return False, last_map, errors
 
@@ -268,12 +319,88 @@ def ensure_seed_and_toggle(host: str, port: int):
         raise RuntimeError(f"seed failed on {host}:{port}: {resp.get('message')}")
 
 
+def run_delete_recopy_cycle(
+    apply_host: str,
+    apply_port: int,
+    verify_host: str,
+    verify_port: int,
+    timeout_s: float,
+    cycle_index: int,
+) -> tuple[bool, list[str]]:
+    errors = []
+
+    copy_resp = send_cmd(
+        apply_host,
+        apply_port,
+        {"cmd": "copy_text", "content": QA_DELETE_RECOPY_TEXT},
+        timeout=max(8.0, timeout_s),
+    )
+    if not copy_resp.get("ok"):
+        return False, [f"cycle {cycle_index}: copy_text failed: {copy_resp.get('message')}"]
+
+    ok_local_copy, _, local_copy_errors = wait_for_clip_state(
+        apply_host,
+        apply_port,
+        QA_DELETE_RECOPY_TEXT,
+        timeout_s,
+        expected_exists=True,
+        expected_deleted=False,
+    )
+    if not ok_local_copy:
+        return False, [f"cycle {cycle_index}: apply device did not capture clipboard"] + local_copy_errors
+
+    ok_remote_copy, _, remote_copy_errors = wait_for_clip_state(
+        verify_host,
+        verify_port,
+        QA_DELETE_RECOPY_TEXT,
+        timeout_s,
+        expected_exists=True,
+        expected_deleted=False,
+    )
+    if not ok_remote_copy:
+        return False, [f"cycle {cycle_index}: verify device did not receive copied clip"] + remote_copy_errors
+
+    delete_resp = send_cmd(
+        apply_host,
+        apply_port,
+        {"cmd": "delete_clip", "content": QA_DELETE_RECOPY_TEXT},
+        timeout=max(8.0, timeout_s),
+    )
+    if not delete_resp.get("ok"):
+        return False, [f"cycle {cycle_index}: delete_clip failed: {delete_resp.get('message')}"]
+
+    ok_local_delete, _, local_delete_errors = wait_for_clip_state(
+        apply_host,
+        apply_port,
+        QA_DELETE_RECOPY_TEXT,
+        timeout_s,
+        expected_exists=False,
+        expected_deleted=True,
+    )
+    if not ok_local_delete:
+        return False, [f"cycle {cycle_index}: apply device did not mark clip deleted"] + local_delete_errors
+
+    ok_remote_delete, _, remote_delete_errors = wait_for_clip_state(
+        verify_host,
+        verify_port,
+        QA_DELETE_RECOPY_TEXT,
+        timeout_s,
+        expected_exists=False,
+        expected_deleted=True,
+    )
+    if not ok_remote_delete:
+        return False, [f"cycle {cycle_index}: verify device did not receive delete tombstone"] + remote_delete_errors
+
+    return True, errors
+
+
 def main():
     parser = argparse.ArgumentParser(description="Rigorous cross-device metadata sync QA harness")
     parser.add_argument("--mac-port", type=int, default=51901)
     parser.add_argument("--win-port", type=int, default=51902)
     parser.add_argument("--timeout", type=float, default=25.0)
     parser.add_argument("--rounds", type=int, default=8)
+    parser.add_argument("--delete-recopy-rounds", type=int, default=12)
     args = parser.parse_args()
 
     mac = ("127.0.0.1", args.mac_port)
@@ -442,6 +569,40 @@ def main():
             for e in errors:
                 print(f"  - {e}")
             failures.append(("count-phase", "mac->win", 2, errors, state_map))
+
+    # clip delete propagation and identical recopy reliability checks
+    for i in range(1, args.delete_recopy_rounds + 1):
+        ok, errors = run_delete_recopy_cycle(
+            mac[0],
+            mac[1],
+            win[0],
+            win[1],
+            args.timeout,
+            i,
+        )
+        if ok:
+            print(f"DELETE/RECOPY ROUND {i} A mac->win: PASS")
+        else:
+            print(f"DELETE/RECOPY ROUND {i} A mac->win: FAIL")
+            for e in errors:
+                print(f"  - {e}")
+            failures.append(("delete-recopy", "mac->win", i, errors, {}))
+
+        ok, errors = run_delete_recopy_cycle(
+            win[0],
+            win[1],
+            mac[0],
+            mac[1],
+            args.timeout,
+            i,
+        )
+        if ok:
+            print(f"DELETE/RECOPY ROUND {i} B win->mac: PASS")
+        else:
+            print(f"DELETE/RECOPY ROUND {i} B win->mac: FAIL")
+            for e in errors:
+                print(f"  - {e}")
+            failures.append(("delete-recopy", "win->mac", i, errors, {}))
 
     if failures:
         print(f"QA RESULT: FAIL ({len(failures)} failure(s))")

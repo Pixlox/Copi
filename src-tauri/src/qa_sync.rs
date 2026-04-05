@@ -1,6 +1,7 @@
 #![cfg(debug_assertions)]
 
 use anyhow::{anyhow, Context, Result};
+use arboard::Clipboard;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -25,6 +26,7 @@ struct QaRequest {
     suffix: Option<String>,
     name: Option<String>,
     color: Option<String>,
+    content: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -65,6 +67,7 @@ struct QaClipState {
     pinned: Option<bool>,
     collection_sync_id: Option<String>,
     in_collection: Option<bool>,
+    deleted: Option<bool>,
     sync_version: Option<i64>,
     source_device: Option<String>,
 }
@@ -142,12 +145,17 @@ async fn handle_connection(app: AppHandle, stream: TcpStream) -> Result<()> {
 
     let mut encoded = serde_json::to_vec(&response).context("serialize response")?;
     encoded.push(b'\n');
-    write_half.write_all(&encoded).await.context("write response")?;
+    write_half
+        .write_all(&encoded)
+        .await
+        .context("write response")?;
     write_half.flush().await.context("flush response")?;
     Ok(())
 }
 
-fn lock_db_write<'a>(state: &'a AppState) -> Result<std::sync::MutexGuard<'a, rusqlite::Connection>> {
+fn lock_db_write<'a>(
+    state: &'a AppState,
+) -> Result<std::sync::MutexGuard<'a, rusqlite::Connection>> {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         match state.db_write.try_lock() {
@@ -222,7 +230,9 @@ async fn dispatch(app: &AppHandle, request: QaRequest) -> Result<QaResponse> {
             let suffix = request
                 .suffix
                 .ok_or_else(|| anyhow!("suffix is required"))?;
-            let name = request.name.unwrap_or_else(|| format!("QA_SYNC_{}", suffix));
+            let name = request
+                .name
+                .unwrap_or_else(|| format!("QA_SYNC_{}", suffix));
             let color = request.color.unwrap_or_else(|| "#0A84FF".to_string());
             let sync_id = upsert_named_collection(app, &suffix, &name, &color)?;
             Ok(QaResponse {
@@ -231,21 +241,89 @@ async fn dispatch(app: &AppHandle, request: QaRequest) -> Result<QaResponse> {
                 state: None,
             })
         }
+        "delete_clip" => {
+            let content = request
+                .content
+                .ok_or_else(|| anyhow!("content is required"))?;
+            let deleted = delete_clip_by_content(app.clone(), &content)
+                .await
+                .map_err(|e| anyhow!(e))?;
+            Ok(QaResponse {
+                ok: true,
+                message: if deleted {
+                    format!("deleted clip: {}", content)
+                } else {
+                    format!("clip not found: {}", content)
+                },
+                state: None,
+            })
+        }
+        "copy_text" => {
+            let content = request
+                .content
+                .ok_or_else(|| anyhow!("content is required"))?;
+            copy_text_to_clipboard(&content)?;
+            Ok(QaResponse {
+                ok: true,
+                message: "clipboard text set".to_string(),
+                state: None,
+            })
+        }
         _ => Err(anyhow!("unknown command: {}", request.cmd)),
     }
+}
+
+async fn delete_clip_by_content(app: AppHandle, content: &str) -> Result<bool, String> {
+    let clip_id: Option<i64> = {
+        let state = app.state::<AppState>();
+        let conn = state.db_write.lock().map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT id
+             FROM clips
+             WHERE content = ?1 AND deleted = 0
+             ORDER BY created_at DESC, id DESC
+             LIMIT 1",
+            [content],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+    };
+
+    let Some(clip_id) = clip_id else {
+        return Ok(false);
+    };
+
+    crate::search::delete_clip(app, clip_id).await?;
+    Ok(true)
+}
+
+fn copy_text_to_clipboard(content: &str) -> Result<()> {
+    let mut clipboard = Clipboard::new().context("init clipboard")?;
+    clipboard
+        .set_text(content.to_string())
+        .context("set clipboard text")?;
+    Ok(())
 }
 
 fn qa_collection_sync_id(suffix: &str) -> String {
     format!("qa-sync-extra-{}", suffix)
 }
 
-fn upsert_named_collection(app: &AppHandle, suffix: &str, name: &str, color: &str) -> Result<String> {
+fn upsert_named_collection(
+    app: &AppHandle,
+    suffix: &str,
+    name: &str,
+    color: &str,
+) -> Result<String> {
     let sync_id = qa_collection_sync_id(suffix);
     let state = app.state::<AppState>();
     let conn = lock_db_write(&state)?;
     let sync_version = sync::next_sync_version_from_conn(&conn);
     let origin_device_id: Option<String> = conn
-        .query_row("SELECT device_id FROM device_info LIMIT 1", [], |row| row.get(0))
+        .query_row("SELECT device_id FROM device_info LIMIT 1", [], |row| {
+            row.get(0)
+        })
         .optional()?;
 
     let existing_id: Option<i64> = conn
@@ -638,7 +716,10 @@ async fn collect_state(app: &AppHandle) -> Result<QaState> {
         collections.push(row?);
     }
 
-    let collection_is_active = collection.as_ref().map(|value| !value.deleted).unwrap_or(false);
+    let collection_is_active = collection
+        .as_ref()
+        .map(|value| !value.deleted)
+        .unwrap_or(false);
 
     let mut clips = Vec::new();
     for content in [QA_CLIP_1, QA_CLIP_2] {
@@ -649,11 +730,11 @@ async fn collect_state(app: &AppHandle) -> Result<QaState> {
                         COALESCE(content_hash, ''),
                         COALESCE(pinned, 0),
                         COALESCE(collection_sync_id, ''),
+                        COALESCE(deleted, 0),
                         COALESCE(sync_version, 0),
                         COALESCE(source_device, '')
                  FROM clips
                  WHERE content = ?1
-                   AND deleted = 0
                  ORDER BY id DESC
                  LIMIT 1",
                 [content],
@@ -665,13 +746,23 @@ async fn collect_state(app: &AppHandle) -> Result<QaState> {
                         row.get::<_, i64>(3)?,
                         row.get::<_, String>(4)?,
                         row.get::<_, i64>(5)?,
-                        row.get::<_, String>(6)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, String>(7)?,
                     ))
                 },
             )
             .optional()?;
 
-        if let Some((id, sync_id, content_hash, pinned, clip_collection_sync_id, sync_version, source_device)) = row
+        if let Some((
+            id,
+            sync_id,
+            content_hash,
+            pinned,
+            clip_collection_sync_id,
+            deleted,
+            sync_version,
+            source_device,
+        )) = row
         {
             let clip_collection_sync_id = if clip_collection_sync_id.is_empty() {
                 None
@@ -696,6 +787,7 @@ async fn collect_state(app: &AppHandle) -> Result<QaState> {
                     collection_is_active
                         && clip_collection_sync_id.as_deref() == Some(QA_COLLECTION_SYNC_ID),
                 ),
+                deleted: Some(deleted != 0),
                 collection_sync_id: clip_collection_sync_id,
                 sync_version: Some(sync_version),
                 source_device: if source_device.is_empty() {
@@ -712,6 +804,7 @@ async fn collect_state(app: &AppHandle) -> Result<QaState> {
                 content_hash: None,
                 pinned: None,
                 in_collection: None,
+                deleted: None,
                 collection_sync_id: None,
                 sync_version: None,
                 source_device: None,
