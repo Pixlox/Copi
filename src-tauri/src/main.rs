@@ -19,8 +19,6 @@ mod macos;
 mod model_setup;
 mod ocr;
 mod privacy;
-#[cfg(debug_assertions)]
-mod qa_sync;
 mod query_parser;
 mod search;
 mod settings;
@@ -568,8 +566,6 @@ fn main() {
                 log_startup_line("setup window shown (model missing)");
             }
 
-            #[cfg(debug_assertions)]
-            qa_sync::start_server_if_enabled(handle.clone());
             eprintln!("[Copi] Ready. Press hotkey to open overlay.");
             #[cfg(target_os = "windows")]
             log_startup_line("setup completed successfully");
