@@ -5,6 +5,8 @@ import socket
 import sys
 import time
 
+QA_COLLECTION_SYNC_ID = "qa-sync-coll-v1"
+
 
 def send_cmd(host: str, port: int, payload: dict, timeout: float = 10.0) -> dict:
     with socket.create_connection((host, port), timeout=timeout) as s:

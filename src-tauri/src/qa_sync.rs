@@ -170,7 +170,7 @@ async fn dispatch(app: &AppHandle, request: QaRequest) -> Result<QaResponse> {
         "ping" => Ok(QaResponse {
             ok: true,
             message: "pong".to_string(),
-            state: Some(collect_state(app).await?),
+            state: None,
         }),
         "state" => Ok(QaResponse {
             ok: true,
