@@ -17,6 +17,7 @@ const QA_COLLECTION_NAME: &str = "QA_SYNC_LOCAL_COLL";
 const QA_COLLECTION_SYNC_ID: &str = "qa-sync-coll-v1";
 const QA_CLIP_1: &str = "qa_pin_sync_clip_v1";
 const QA_CLIP_2: &str = "qa_pin_sync_clip_v2";
+const QA_DELETE_RECOPY_TEXT: &str = "qa_delete_recopy_clip_text_v1";
 
 #[derive(Debug, Deserialize)]
 struct QaRequest {
@@ -722,7 +723,7 @@ async fn collect_state(app: &AppHandle) -> Result<QaState> {
         .unwrap_or(false);
 
     let mut clips = Vec::new();
-    for content in [QA_CLIP_1, QA_CLIP_2] {
+    for content in [QA_CLIP_1, QA_CLIP_2, QA_DELETE_RECOPY_TEXT] {
         let row = conn
             .query_row(
                 "SELECT id,
