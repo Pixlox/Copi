@@ -190,7 +190,6 @@ impl SecureReceiver {
         if nonce < self.next_nonce {
             return Err(anyhow!("replayed secure frame nonce={}", nonce));
         }
-        self.next_nonce = nonce + 1;
 
         let ciphertext = B64.decode(payload_b64).context("decode secure payload")?;
         let nonce_bytes = nonce_to_bytes(nonce);
@@ -198,7 +197,9 @@ impl SecureReceiver {
             .cipher
             .decrypt(Nonce::from_slice(&nonce_bytes), ciphertext.as_ref())
             .context("decrypt secure payload")?;
-        serde_json::from_slice(&plaintext).context("parse secure payload")
+        let msg = serde_json::from_slice(&plaintext).context("parse secure payload")?;
+        self.next_nonce = nonce + 1;
+        Ok(msg)
     }
 }
 
@@ -268,12 +269,19 @@ pub struct SyncState {
     identity_public_b64: String,
     enabled: AtomicBool,
     generation: AtomicU64,
-    live: RwLock<HashMap<String, SecureSender>>,
+    live: RwLock<HashMap<String, LivePeer>>,
+    live_token: AtomicU64,
     connecting: RwLock<HashSet<String>>,
     known_addrs: RwLock<HashMap<String, SocketAddr>>,
     discovered: RwLock<HashMap<String, DiscoveredPeer>>,
     pairing_pin: Mutex<Option<(String, Instant)>>,
     _mdns: Option<ServiceDaemon>,
+}
+
+#[derive(Clone)]
+struct LivePeer {
+    token: u64,
+    writer: SecureSender,
 }
 
 impl SyncState {
@@ -310,7 +318,7 @@ impl SyncState {
             let guard = self.live.read().await;
             guard
                 .iter()
-                .map(|(id, writer)| (id.clone(), writer.clone()))
+                .map(|(id, peer)| (id.clone(), peer.writer.clone()))
                 .collect()
         };
 
@@ -331,8 +339,19 @@ impl SyncState {
         Ok(())
     }
 
-    async fn register_peer(&self, device_id: String, writer: SecureSender) {
-        self.live.write().await.insert(device_id, writer);
+    async fn register_peer(&self, device_id: String, writer: SecureSender) -> (u64, bool) {
+        let mut guard = self.live.write().await;
+        let token = self.live_token.fetch_add(1, Ordering::SeqCst) + 1;
+        let replaced = guard
+            .insert(
+                device_id,
+                LivePeer {
+                    token,
+                    writer,
+                },
+            )
+            .is_some();
+        (token, replaced)
     }
 
     async fn try_begin_connect(&self, device_id: &str) -> bool {
@@ -350,6 +369,17 @@ impl SyncState {
 
     pub async fn unregister_peer(&self, device_id: &str) {
         self.live.write().await.remove(device_id);
+    }
+
+    async fn unregister_peer_if_current(&self, device_id: &str, token: u64) {
+        let mut guard = self.live.write().await;
+        let should_remove = guard
+            .get(device_id)
+            .map(|peer| peer.token == token)
+            .unwrap_or(false);
+        if should_remove {
+            guard.remove(device_id);
+        }
     }
 
     pub async fn connected_peers(&self) -> Vec<String> {
@@ -506,6 +536,7 @@ pub fn start_sync(app: AppHandle) -> Arc<SyncState> {
         enabled: AtomicBool::new(false),
         generation: AtomicU64::new(0),
         live: RwLock::new(HashMap::new()),
+        live_token: AtomicU64::new(0),
         connecting: RwLock::new(HashSet::new()),
         known_addrs: RwLock::new(HashMap::new()),
         discovered: RwLock::new(HashMap::new()),
@@ -1110,16 +1141,14 @@ async fn run_session(
         }
     }
 
-    if sync.connected_peers().await.contains(&peer_id) {
+    let (session_token, replaced_existing) =
+        sync.register_peer(peer_id.clone(), secure_writer.clone()).await;
+    if replaced_existing {
         eprintln!(
-            "[Sync] Duplicate session for peer={}, closing duplicate",
+            "[Sync] Replaced existing session for peer={}, using latest",
             peer_id
         );
-        return Ok(());
     }
-
-    sync.register_peer(peer_id.clone(), secure_writer.clone())
-        .await;
     eprintln!(
         "[Sync] Session connected peer={} name={} (now registered)",
         peer_id, peer_name
@@ -1151,26 +1180,53 @@ async fn run_session(
         "[Sync] Peer {} has cursor {} for our device {}",
         peer_id, peer_cursor, sync.device_id
     );
-    let delta = get_clips_since(&app, &sync.device_id, peer_cursor)?;
-    eprintln!(
-        "[Sync] Sending {} clips to peer {} (since cursor {})",
-        delta.len(),
-        peer_id,
-        peer_cursor
-    );
-    if !delta.is_empty() {
-        secure_writer.send(&Msg::ClipBatch { clips: delta }).await?;
-        eprintln!("[Sync] Sent clip batch to peer {}", peer_id);
-    }
 
-    if collections_and_pins_sync_enabled(&app) {
-        if let Err(error) = send_full_clip_snapshot_to_peer(&app, &sync, &secure_writer).await {
-            eprintln!("[Sync] Failed to send metadata clip snapshot: {}", error);
+    let app_bootstrap = app.clone();
+    let sync_bootstrap = sync.clone();
+    let writer_bootstrap = secure_writer.clone();
+    let peer_bootstrap = peer_id.clone();
+    let metadata_sync_enabled = collections_and_pins_sync_enabled(&app);
+    tauri::async_runtime::spawn(async move {
+        let delta = match get_clips_since(&app_bootstrap, &sync_bootstrap.device_id, peer_cursor) {
+            Ok(delta) => delta,
+            Err(error) => {
+                eprintln!(
+                    "[Sync] Failed to load initial clip delta for peer {}: {}",
+                    peer_bootstrap, error
+                );
+                return;
+            }
+        };
+
+        eprintln!(
+            "[Sync] Sending {} clips to peer {} (since cursor {})",
+            delta.len(),
+            peer_bootstrap,
+            peer_cursor
+        );
+        if !delta.is_empty() {
+            if let Err(error) = writer_bootstrap.send(&Msg::ClipBatch { clips: delta }).await {
+                eprintln!(
+                    "[Sync] Failed to send initial clip batch to peer {}: {}",
+                    peer_bootstrap, error
+                );
+                return;
+            }
+            eprintln!("[Sync] Sent clip batch to peer {}", peer_bootstrap);
         }
-        if let Err(error) = send_full_collection_snapshot_to_peer(&app, &secure_writer).await {
-            eprintln!("[Sync] Failed to send metadata collection snapshot: {}", error);
+
+        if metadata_sync_enabled {
+            if let Err(error) =
+                send_full_clip_snapshot_to_peer(&app_bootstrap, &sync_bootstrap, &writer_bootstrap)
+                    .await
+            {
+                eprintln!("[Sync] Failed to send metadata clip snapshot: {}", error);
+            }
+            if let Err(error) = send_full_collection_snapshot_to_peer(&app_bootstrap, &writer_bootstrap).await {
+                eprintln!("[Sync] Failed to send metadata collection snapshot: {}", error);
+            }
         }
-    }
+    });
 
     let mut ping = tokio::time::interval(PING_INTERVAL);
     let session_result = loop {
@@ -1183,7 +1239,16 @@ async fn run_session(
                         let outer: Msg = match serde_json::from_str(line.trim_end()) {
                             Ok(msg) => msg,
                             Err(error) => {
+                                let raw = line.trim_end();
+                                let prefix: String = raw.chars().take(80).collect();
+                                let bytes: Vec<u8> = raw.as_bytes().iter().take(24).copied().collect();
                                 eprintln!("[Sync] Failed to parse message from {}: {}", peer_id, error);
+                                eprintln!(
+                                    "[Sync] Parse raw prefix from {}: {:?} bytes={:02X?}",
+                                    peer_id,
+                                    prefix,
+                                    bytes
+                                );
                                 break Err(anyhow!("invalid message from peer"));
                             }
                         };
@@ -1216,7 +1281,7 @@ async fn run_session(
         }
     };
 
-    sync.unregister_peer(&peer_id).await;
+    sync.unregister_peer_if_current(&peer_id, session_token).await;
     eprintln!(
         "[Sync] Session disconnected peer={} name={}",
         peer_id, peer_name
@@ -2643,35 +2708,58 @@ fn receive_collections(
     let mut changed = false;
     let received_count = collections.len();
     for collection in collections {
-        let affected = conn.execute(
-            "INSERT INTO collections (name, color, created_at, sync_id, sync_version, deleted, origin_device_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(sync_id) DO UPDATE SET
-                 name = excluded.name,
-                 color = excluded.color,
-                 created_at = CASE
-                     WHEN excluded.created_at > collections.created_at THEN excluded.created_at
-                     ELSE collections.created_at
-                 END,
-                 sync_version = CASE
-                     WHEN excluded.sync_version > collections.sync_version THEN excluded.sync_version
-                     ELSE collections.sync_version
-                 END,
-                 deleted = CASE
-                     WHEN excluded.sync_version >= collections.sync_version THEN excluded.deleted
-                     ELSE collections.deleted
-                 END,
-                 origin_device_id = COALESCE(collections.origin_device_id, excluded.origin_device_id)",
-            rusqlite::params![
-                collection.name,
-                collection.color,
-                collection.created_at,
-                collection.sync_id,
-                collection.sync_version,
-                if collection.deleted { 1 } else { 0 },
-                collection.origin_device_id,
-            ],
-        )?;
+        let existing_id: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM collections WHERE sync_id = ?1 LIMIT 1",
+                [collection.sync_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        let affected = if let Some(id) = existing_id {
+            conn.execute(
+                "UPDATE collections
+                 SET name = ?1,
+                     color = ?2,
+                     created_at = CASE
+                         WHEN ?3 > collections.created_at THEN ?3
+                         ELSE collections.created_at
+                     END,
+                     sync_version = CASE
+                         WHEN ?5 > collections.sync_version THEN ?5
+                         ELSE collections.sync_version
+                     END,
+                     deleted = CASE
+                         WHEN ?5 >= collections.sync_version THEN ?6
+                         ELSE collections.deleted
+                     END,
+                     origin_device_id = COALESCE(collections.origin_device_id, ?7)
+                 WHERE id = ?4",
+                rusqlite::params![
+                    collection.name,
+                    collection.color,
+                    collection.created_at,
+                    id,
+                    collection.sync_version,
+                    if collection.deleted { 1 } else { 0 },
+                    collection.origin_device_id,
+                ],
+            )?
+        } else {
+            conn.execute(
+                "INSERT INTO collections (name, color, created_at, sync_id, sync_version, deleted, origin_device_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    collection.name,
+                    collection.color,
+                    collection.created_at,
+                    collection.sync_id,
+                    collection.sync_version,
+                    if collection.deleted { 1 } else { 0 },
+                    collection.origin_device_id,
+                ],
+            )?
+        };
         if affected > 0 {
             changed = true;
         }
@@ -2742,7 +2830,7 @@ fn sync_existing_metadata_now(app: &AppHandle, sync: Arc<SyncState>) {
     tauri::async_runtime::spawn(async move {
         let peers: Vec<SecureSender> = {
             let guard = sync.live.read().await;
-            guard.values().cloned().collect()
+            guard.values().map(|peer| peer.writer.clone()).collect()
         };
         for peer in peers {
             let _ = send_full_clip_snapshot_to_peer(&app_handle, &sync, &peer).await;

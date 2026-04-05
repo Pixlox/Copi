@@ -4,6 +4,8 @@ use anyhow::{anyhow, Context, Result};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::sync::TryLockError;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -11,6 +13,7 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::{settings, sync, AppState};
 
 const QA_COLLECTION_NAME: &str = "QA_SYNC_LOCAL_COLL";
+const QA_COLLECTION_SYNC_ID: &str = "qa-sync-coll-v1";
 const QA_CLIP_1: &str = "qa_pin_sync_clip_v1";
 const QA_CLIP_2: &str = "qa_pin_sync_clip_v2";
 
@@ -113,6 +116,9 @@ async fn handle_connection(app: AppHandle, stream: TcpStream) -> Result<()> {
     }
 
     let request: QaRequest = serde_json::from_str(line.trim_end()).context("parse request")?;
+    let cmd_name = request.cmd.clone();
+    let started = Instant::now();
+    eprintln!("[QA][sync] cmd={} start", cmd_name);
     let response = match dispatch(&app, request).await {
         Ok(response) => response,
         Err(error) => QaResponse {
@@ -121,12 +127,36 @@ async fn handle_connection(app: AppHandle, stream: TcpStream) -> Result<()> {
             state: None,
         },
     };
+    eprintln!(
+        "[QA][sync] cmd={} done ok={} elapsed_ms={}",
+        cmd_name,
+        response.ok,
+        started.elapsed().as_millis()
+    );
 
     let mut encoded = serde_json::to_vec(&response).context("serialize response")?;
     encoded.push(b'\n');
     write_half.write_all(&encoded).await.context("write response")?;
     write_half.flush().await.context("flush response")?;
     Ok(())
+}
+
+fn lock_db_write<'a>(state: &'a AppState) -> Result<std::sync::MutexGuard<'a, rusqlite::Connection>> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match state.db_write.try_lock() {
+            Ok(conn) => return Ok(conn),
+            Err(TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return Err(anyhow!("qa db_write busy"));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(TryLockError::Poisoned(error)) => {
+                return Err(anyhow!("db lock poisoned: {}", error));
+            }
+        }
+    }
 }
 
 async fn dispatch(app: &AppHandle, request: QaRequest) -> Result<QaResponse> {
@@ -151,45 +181,55 @@ async fn dispatch(app: &AppHandle, request: QaRequest) -> Result<QaResponse> {
             Ok(QaResponse {
                 ok: true,
                 message: format!("metadata sync set to {}", enabled),
-                state: Some(collect_state(app).await?),
+                state: None,
             })
         }
         "seed" => {
             let seed = ensure_seed_data(app)?;
-            push_keys(app, &seed).await;
+            enqueue_pushes(app, &seed);
             Ok(QaResponse {
                 ok: true,
                 message: "seed applied".to_string(),
-                state: Some(collect_state(app).await?),
+                state: None,
             })
         }
         "phase" => {
             let phase = request.phase.ok_or_else(|| anyhow!("phase is required"))?;
             let seed = apply_phase(app, phase)?;
-            push_keys(app, &seed).await;
+            enqueue_pushes(app, &seed);
             Ok(QaResponse {
                 ok: true,
                 message: format!("phase {} applied", phase),
-                state: Some(collect_state(app).await?),
+                state: None,
             })
         }
         "delete_collection" => {
             let seed = delete_collection(app)?;
-            push_keys(app, &seed).await;
+            enqueue_pushes(app, &seed);
             Ok(QaResponse {
                 ok: true,
                 message: "collection deleted".to_string(),
-                state: Some(collect_state(app).await?),
+                state: None,
             })
         }
         _ => Err(anyhow!("unknown command: {}", request.cmd)),
     }
 }
 
-async fn push_keys(app: &AppHandle, seed: &SeedData) {
+fn enqueue_pushes(app: &AppHandle, seed: &SeedData) {
     sync::on_collection_changed(app);
-    sync::on_local_clip_saved(app, &seed.clip1_key).await;
-    sync::on_local_clip_saved(app, &seed.clip2_key).await;
+
+    let app_clip1 = app.clone();
+    let clip1_key = seed.clip1_key.clone();
+    tauri::async_runtime::spawn(async move {
+        sync::on_local_clip_saved(&app_clip1, &clip1_key).await;
+    });
+
+    let app_clip2 = app.clone();
+    let clip2_key = seed.clip2_key.clone();
+    tauri::async_runtime::spawn(async move {
+        sync::on_local_clip_saved(&app_clip2, &clip2_key).await;
+    });
 }
 
 fn clip_push_key_by_id(conn: &rusqlite::Connection, clip_id: i64) -> Option<String> {
@@ -219,10 +259,7 @@ fn now_ts() -> i64 {
 
 fn ensure_seed_data(app: &AppHandle) -> Result<SeedData> {
     let state = app.state::<AppState>();
-    let conn = state
-        .db_write
-        .lock()
-        .map_err(|e| anyhow!("db lock poisoned: {}", e))?;
+    let conn = lock_db_write(&state)?;
 
     let our_device_id: Option<String> = conn
         .query_row(
@@ -234,62 +271,57 @@ fn ensure_seed_data(app: &AppHandle) -> Result<SeedData> {
 
     let collection = conn
         .query_row(
-            "SELECT id, COALESCE(sync_id, ''), COALESCE(deleted, 0)
+            "SELECT id, COALESCE(deleted, 0)
              FROM collections
-             WHERE name = ?1
+             WHERE sync_id = ?1
              ORDER BY id DESC
              LIMIT 1",
-            [QA_COLLECTION_NAME],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            },
+            [QA_COLLECTION_SYNC_ID],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
         )
         .optional()?;
 
-    let (collection_id, collection_sync_id) = if let Some((id, sync_id, deleted)) = collection {
-        let ensured_sync_id = if sync_id.trim().is_empty() {
-            let generated = uuid::Uuid::new_v4().to_string();
-            conn.execute(
-                "UPDATE collections SET sync_id = ?1 WHERE id = ?2",
-                rusqlite::params![generated, id],
-            )?;
-            generated
-        } else {
-            sync_id
-        };
-
+    let collection_id = if let Some((id, deleted)) = collection {
         if deleted != 0 {
             let sync_version = sync::next_sync_version_from_conn(&conn);
             conn.execute(
                 "UPDATE collections
-                 SET deleted = 0,
-                     sync_version = ?1
-                 WHERE id = ?2",
-                rusqlite::params![sync_version, id],
+                 SET name = ?1,
+                     color = '#0A84FF',
+                     deleted = 0,
+                     sync_version = ?2
+                 WHERE id = ?3",
+                rusqlite::params![QA_COLLECTION_NAME, sync_version, id],
             )?;
+        } else {
+            let _ = conn.execute(
+                "UPDATE collections
+                 SET name = ?1,
+                     color = CASE
+                         WHEN COALESCE(color, '') = '' THEN '#0A84FF'
+                         ELSE color
+                     END
+                 WHERE id = ?2",
+                rusqlite::params![QA_COLLECTION_NAME, id],
+            );
         }
-
-        (id, ensured_sync_id)
+        id
     } else {
         let sync_version = sync::next_sync_version_from_conn(&conn);
-        let sync_id = uuid::Uuid::new_v4().to_string();
         conn.execute(
             "INSERT INTO collections(name, color, created_at, sync_id, sync_version, deleted, origin_device_id)
              VALUES(?1, '#0A84FF', ?2, ?3, ?4, 0, ?5)",
             rusqlite::params![
                 QA_COLLECTION_NAME,
                 now_ts(),
-                sync_id,
+                QA_COLLECTION_SYNC_ID,
                 sync_version,
                 our_device_id
             ],
         )?;
-        (conn.last_insert_rowid(), sync_id)
+        conn.last_insert_rowid()
     };
+    let collection_sync_id = QA_COLLECTION_SYNC_ID.to_string();
 
     let clip1_id = ensure_clip_seed(&conn, QA_CLIP_1, our_device_id.as_deref())?;
     let clip2_id = ensure_clip_seed(&conn, QA_CLIP_2, our_device_id.as_deref())?;
@@ -380,10 +412,7 @@ fn apply_phase(app: &AppHandle, phase: u8) -> Result<SeedData> {
     let seed = ensure_seed_data(app)?;
 
     let state = app.state::<AppState>();
-    let conn = state
-        .db_write
-        .lock()
-        .map_err(|e| anyhow!("db lock poisoned: {}", e))?;
+    let conn = lock_db_write(&state)?;
 
     let (clip1_pinned, clip1_in_collection, clip2_pinned, clip2_in_collection) = if phase == 1 {
         (1_i64, true, 0_i64, true)
@@ -434,10 +463,7 @@ fn delete_collection(app: &AppHandle) -> Result<SeedData> {
     let seed = ensure_seed_data(app)?;
 
     let state = app.state::<AppState>();
-    let conn = state
-        .db_write
-        .lock()
-        .map_err(|e| anyhow!("db lock poisoned: {}", e))?;
+    let conn = lock_db_write(&state)?;
 
     let clip_sync_version = sync::next_sync_version_from_conn(&conn);
     conn.execute(
@@ -495,10 +521,10 @@ async fn collect_state(app: &AppHandle) -> Result<QaState> {
         .query_row(
             "SELECT id, name, COALESCE(sync_id, ''), COALESCE(deleted, 0), COALESCE(sync_version, 0)
              FROM collections
-             WHERE name = ?1
+             WHERE sync_id = ?1
              ORDER BY id DESC
              LIMIT 1",
-            [QA_COLLECTION_NAME],
+            [QA_COLLECTION_SYNC_ID],
             |row| {
                 Ok(QaCollectionState {
                     id: row.get(0)?,
@@ -511,11 +537,7 @@ async fn collect_state(app: &AppHandle) -> Result<QaState> {
         )
         .optional()?;
 
-    let collection_sync_id = collection
-        .as_ref()
-        .map(|value| value.sync_id.as_str())
-        .unwrap_or_default()
-        .to_string();
+    let collection_is_active = collection.as_ref().map(|value| !value.deleted).unwrap_or(false);
 
     let mut clips = Vec::new();
     for content in [QA_CLIP_1, QA_CLIP_2] {
@@ -569,7 +591,10 @@ async fn collect_state(app: &AppHandle) -> Result<QaState> {
                     Some(content_hash)
                 },
                 pinned: Some(pinned != 0),
-                in_collection: Some(!collection_sync_id.is_empty() && clip_collection_sync_id.as_deref() == Some(collection_sync_id.as_str())),
+                in_collection: Some(
+                    collection_is_active
+                        && clip_collection_sync_id.as_deref() == Some(QA_COLLECTION_SYNC_ID),
+                ),
                 collection_sync_id: clip_collection_sync_id,
                 sync_version: Some(sync_version),
                 source_device: if source_device.is_empty() {

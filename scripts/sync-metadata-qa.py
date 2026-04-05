@@ -6,7 +6,7 @@ import sys
 import time
 
 
-def send_cmd(host: str, port: int, payload: dict, timeout: float = 5.0) -> dict:
+def send_cmd(host: str, port: int, payload: dict, timeout: float = 10.0) -> dict:
     with socket.create_connection((host, port), timeout=timeout) as s:
         s.sendall((json.dumps(payload) + "\n").encode("utf-8"))
         chunks = []
@@ -21,6 +21,25 @@ def send_cmd(host: str, port: int, payload: dict, timeout: float = 5.0) -> dict:
     if not raw:
         return {"ok": False, "message": "empty response", "state": None}
     return json.loads(raw)
+
+
+def wait_for_connected(host: str, port: int, timeout_s: float) -> None:
+    start = time.time()
+    last_err = "unknown"
+    while time.time() - start < timeout_s:
+        try:
+            resp = send_cmd(host, port, {"cmd": "state"}, timeout=2.0)
+            if resp.get("ok"):
+                state = state_to_map(resp.get("state") or {})
+                if state.get("connected_peers", 0) > 0:
+                    return
+                last_err = "connected_peers=0"
+            else:
+                last_err = f"state not ok: {resp.get('message')}"
+        except Exception as exc:
+            last_err = str(exc)
+        time.sleep(0.25)
+    raise RuntimeError(f"peer connection did not become active on {host}:{port} ({last_err})")
 
 
 def state_to_map(state: dict):
@@ -78,7 +97,7 @@ def wait_for_expected(host: str, port: int, phase: int, timeout_s: float) -> tup
     errors = []
 
     while time.time() - start < timeout_s:
-        resp = send_cmd(host, port, {"cmd": "state"})
+        resp = send_cmd(host, port, {"cmd": "state"}, timeout=2.0)
         if not resp.get("ok"):
             errors = [f"state command failed: {resp.get('message')}"]
             time.sleep(0.25)
@@ -114,7 +133,7 @@ def wait_for_expected(host: str, port: int, phase: int, timeout_s: float) -> tup
 
 
 def run_phase(apply_host: str, apply_port: int, verify_host: str, verify_port: int, phase: int, timeout_s: float) -> tuple[bool, dict, list[str], str]:
-    apply_resp = send_cmd(apply_host, apply_port, {"cmd": "phase", "phase": phase})
+    apply_resp = send_cmd(apply_host, apply_port, {"cmd": "phase", "phase": phase}, timeout=max(20.0, timeout_s))
     if not apply_resp.get("ok"):
         return False, {}, [f"apply phase {phase} failed: {apply_resp.get('message')}"], "apply"
 
@@ -137,10 +156,10 @@ def print_state(label: str, state_map: dict):
 
 def ensure_seed_and_toggle(host: str, port: int):
     # force metadata toggle on in case config drifted
-    resp = send_cmd(host, port, {"cmd": "set_metadata_sync", "enabled": True})
+    resp = send_cmd(host, port, {"cmd": "set_metadata_sync", "enabled": True}, timeout=20.0)
     if not resp.get("ok"):
         raise RuntimeError(f"set_metadata_sync failed on {host}:{port}: {resp.get('message')}")
-    resp = send_cmd(host, port, {"cmd": "seed"})
+    resp = send_cmd(host, port, {"cmd": "seed"}, timeout=30.0)
     if not resp.get("ok"):
         raise RuntimeError(f"seed failed on {host}:{port}: {resp.get('message')}")
 
@@ -156,12 +175,17 @@ def main():
     mac = ("127.0.0.1", args.mac_port)
     win = ("127.0.0.1", args.win_port)
 
+    # Ensure sync session is active before mutation phases.
+    wait_for_connected(*mac, timeout_s=max(args.timeout * 2, 60.0))
+    wait_for_connected(*win, timeout_s=max(args.timeout * 2, 60.0))
+
+    time.sleep(1.0)
     ensure_seed_and_toggle(*mac)
     ensure_seed_and_toggle(*win)
 
     # Warm-up state prints
-    mac_state = send_cmd(*mac, {"cmd": "state"})
-    win_state = send_cmd(*win, {"cmd": "state"})
+    mac_state = send_cmd(*mac, {"cmd": "state"}, timeout=10.0)
+    win_state = send_cmd(*win, {"cmd": "state"}, timeout=10.0)
     if not mac_state.get("ok") or not win_state.get("ok"):
         print("Failed to read initial state from one or both QA servers", file=sys.stderr)
         sys.exit(2)
@@ -196,7 +220,7 @@ def main():
             failures.append((i, "win->mac", phase, errors, state_map))
 
     # collection deletion propagation check
-    delete_resp = send_cmd(mac[0], mac[1], {"cmd": "delete_collection"})
+    delete_resp = send_cmd(mac[0], mac[1], {"cmd": "delete_collection"}, timeout=max(20.0, args.timeout))
     if not delete_resp.get("ok"):
         failures.append(("delete", "mac->win", None, [f"delete apply failed: {delete_resp.get('message')}"], {}))
     else:
@@ -205,7 +229,7 @@ def main():
         last_map = {}
         delete_errors = []
         while time.time() - start < args.timeout:
-            resp = send_cmd(win[0], win[1], {"cmd": "state"})
+            resp = send_cmd(win[0], win[1], {"cmd": "state"}, timeout=2.0)
             if not resp.get("ok"):
                 delete_errors = [f"state failed: {resp.get('message')}"]
                 time.sleep(0.25)
