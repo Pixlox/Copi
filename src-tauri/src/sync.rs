@@ -1404,8 +1404,13 @@ async fn receive_clips(
     let metadata_sync_enabled = collections_and_pins_sync_enabled(app);
     let mut last_inserted_clip_for_mirror: Option<WireClip> = None;
     let mut last_processed_clip_for_mirror: Option<WireClip> = None;
+    let mut max_incoming_sync_version = 0_i64;
 
     for clip in clips {
+        if clip.sync_version > max_incoming_sync_version {
+            max_incoming_sync_version = clip.sync_version;
+        }
+
         if clip.source_device.is_empty() || clip.source_device == sync.device_id {
             eprintln!(
                 "[Sync] Skipping clip from self or empty source: hash={}",
@@ -1653,6 +1658,14 @@ async fn receive_clips(
 
     for (source_device, ts) in max_by_source {
         update_sync_cursor(app, &source_device, ts)?;
+    }
+
+    if max_incoming_sync_version > 0 {
+        let state = app.state::<AppState>();
+        let conn_result = state.db_write.lock();
+        if let Ok(conn_guard) = conn_result {
+            ensure_sync_version_floor(&conn_guard, max_incoming_sync_version);
+        }
     }
 
     if inserted_any {
