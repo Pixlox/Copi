@@ -1674,6 +1674,30 @@ input::placeholder {
   border-bottom: 0.5px solid var(--border-subtle);
 }
 
+.settings-content-header-spacer,
+.settings-content-header-controls {
+  display: none;
+}
+
+.platform-windows .settings-content-header {
+  min-height: 42px;
+  height: 42px;
+  padding-top: 0;
+  background: rgba(0, 0, 0, 0.12);
+}
+
+.platform-windows.light .settings-content-header {
+  background: rgba(255, 255, 255, 0.68);
+}
+
+.platform-windows .settings-content-header-spacer,
+.platform-windows .settings-content-header-controls {
+  display: block;
+  width: 138px;
+  min-width: 138px;
+  height: 100%;
+}
+
 .light .settings-content-header {
   border-bottom-color: rgba(0, 0, 0, 0.08);
 }
@@ -2084,9 +2108,38 @@ input::placeholder {
 }
 
 .settings-sync-pair-form {
-  padding: 10px 14px;
+  padding: 10px 12px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.settings-sync-pair-grid {
   display: grid;
-  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) 180px;
+  gap: 10px;
+}
+
+.settings-sync-pair-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.settings-sync-pair-field--pin .settings-sync-input {
+  text-align: center;
+  letter-spacing: 0.1em;
+}
+
+.settings-sync-pair-label {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  padding-left: 2px;
+}
+
+.settings-sync-pair-actions {
+  display: flex;
+  justify-content: flex-end;
 }
 
 .settings-sync-code-box {
@@ -2141,6 +2194,19 @@ input::placeholder {
 @media (max-width: 760px) {
   .settings-sync-metrics {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .settings-sync-pair-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .settings-sync-pair-actions {
+    justify-content: stretch;
+  }
+
+  .settings-sync-pair-actions .settings-btn {
+    width: 100%;
+    justify-content: center;
   }
 }
 

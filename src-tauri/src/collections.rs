@@ -53,8 +53,18 @@ pub fn delete_collection(app: tauri::AppHandle, id: i64) -> Result<(), String> {
 
     let sync_version = sync::next_sync_version_from_conn(&conn);
 
+    let clip_sync_ids: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT sync_id FROM clips WHERE collection_id = ?1 AND deleted = 0")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([id], |row| row.get::<_, Option<String>>(0))
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(|r| r.ok().flatten()).collect()
+    };
+
     conn.execute(
-        "UPDATE clips SET collection_id = NULL, sync_version = ?1 WHERE collection_id = ?2 AND deleted = 0",
+        "UPDATE clips SET collection_id = NULL, collection_sync_id = NULL, sync_version = ?1 WHERE collection_id = ?2 AND deleted = 0",
         rusqlite::params![sync_version, id],
     )
     .map_err(|e| e.to_string())?;
@@ -69,6 +79,12 @@ pub fn delete_collection(app: tauri::AppHandle, id: i64) -> Result<(), String> {
     drop(conn);
     if updated > 0 {
         sync::on_collection_changed(&app);
+    }
+    for sync_id in clip_sync_ids {
+        let app_clone = app.clone();
+        tauri::async_runtime::spawn(async move {
+            sync::on_local_clip_saved(&app_clone, &sync_id).await;
+        });
     }
     let _ = app.emit("collections-changed", ());
     Ok(())
@@ -168,14 +184,39 @@ pub fn move_clip_to_collection(
     let sync_version = sync::next_sync_version_from_conn(&conn);
     let updated = conn
         .execute(
-            "UPDATE clips SET collection_id = ?1, sync_version = ?2 WHERE id = ?3 AND deleted = 0",
+            "UPDATE clips
+             SET collection_id = ?1,
+                 collection_sync_id = CASE
+                     WHEN ?1 IS NULL THEN NULL
+                     ELSE (SELECT sync_id FROM collections WHERE id = ?1 AND deleted = 0)
+                 END,
+                 sync_version = ?2
+             WHERE id = ?3 AND deleted = 0",
             rusqlite::params![collection_id, sync_version, clip_id],
         )
         .map_err(|e| e.to_string())?;
 
+    let clip_sync_id: Option<String> = if updated > 0 {
+        conn.query_row(
+            "SELECT sync_id FROM clips WHERE id = ?1",
+            [clip_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+    } else {
+        None
+    };
+
     drop(conn);
     if updated > 0 {
         sync::on_collection_changed(&app);
+    }
+    if let Some(sync_id) = clip_sync_id {
+        let app_clone = app.clone();
+        tauri::async_runtime::spawn(async move {
+            sync::on_local_clip_saved(&app_clone, &sync_id).await;
+        });
     }
     let _ = app.emit("clips-changed", ());
     let _ = app.emit("collections-changed", ());

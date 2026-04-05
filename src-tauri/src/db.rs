@@ -102,6 +102,7 @@ pub fn init_db(app: &tauri::AppHandle) -> Result<DbConnections> {
             created_at INTEGER NOT NULL,
             pinned INTEGER DEFAULT 0,
             collection_id INTEGER REFERENCES collections(id),
+            collection_sync_id TEXT,
             -- Sync columns
             sync_id TEXT UNIQUE,
             sync_version INTEGER DEFAULT 0,
@@ -296,6 +297,7 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         ("pinned", "INTEGER DEFAULT 0"),
         ("language", "TEXT"),
         ("copy_count", "INTEGER DEFAULT 0"),
+        ("collection_sync_id", "TEXT"),
         // Sync columns
         ("sync_id", "TEXT"),
         ("sync_version", "INTEGER DEFAULT 0"),
@@ -372,6 +374,7 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_sync_queue_created ON sync_queue(created_at);
         CREATE INDEX IF NOT EXISTS idx_paired_devices_last_seen ON paired_devices(last_seen);
         CREATE INDEX IF NOT EXISTS idx_clips_source_device ON clips(source_device, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_clips_collection_sync_id ON clips(collection_sync_id);
         ",
     )?;
 

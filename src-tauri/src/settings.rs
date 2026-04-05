@@ -47,6 +47,8 @@ pub struct SyncConfig {
     pub auto_connect: bool,
     /// Sync embeddings along with clips (increases bandwidth but avoids regeneration)
     pub sync_embeddings: bool,
+    /// Sync pinned state and collections metadata across devices
+    pub sync_collections_and_pins: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -56,6 +58,7 @@ pub struct SyncConfigPayload {
     pub device_name: Option<String>,
     pub auto_connect: bool,
     pub sync_embeddings: bool,
+    pub sync_collections_and_pins: bool,
 }
 
 impl From<SyncConfig> for SyncConfigPayload {
@@ -65,6 +68,7 @@ impl From<SyncConfig> for SyncConfigPayload {
             device_name: value.device_name,
             auto_connect: value.auto_connect,
             sync_embeddings: value.sync_embeddings,
+            sync_collections_and_pins: value.sync_collections_and_pins,
         }
     }
 }
@@ -156,6 +160,7 @@ impl Default for SyncConfig {
             device_name: None,
             auto_connect: true,
             sync_embeddings: true,
+            sync_collections_and_pins: false,
         }
     }
 }
@@ -241,6 +246,7 @@ pub async fn set_config(app: tauri::AppHandle, config: CopiConfig) -> Result<(),
         SyncConfigPayload::from(config.sync.clone()),
     );
     crate::sync::apply_config_change(&app, existing.as_ref(), &config);
+    crate::sync::apply_metadata_sync_config_change(&app, existing.as_ref(), &config);
 
     if existing
         .as_ref()

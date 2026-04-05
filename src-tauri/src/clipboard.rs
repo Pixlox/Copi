@@ -1,4 +1,6 @@
 use arboard::{Clipboard, ImageData};
+use base64::Engine as _;
+use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -57,6 +59,50 @@ pub async fn watch_clipboard(app: &tauri::AppHandle) {
 
         // PERF 6: Only read clipboard when changeCount changes (zero CPU when idle)
         let current_change_count = crate::macos::get_pasteboard_change_count();
+        {
+            let state = app.state::<AppState>();
+            let suppress_next = state
+                .suppress_next_clipboard_capture
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let suppressed_change_count = state
+                .suppressed_clipboard_change_count
+                .load(std::sync::atomic::Ordering::SeqCst);
+
+            if suppress_next {
+                // Prefer sequence-based suppression when available.
+                if current_change_count >= 0
+                    && suppressed_change_count >= 0
+                    && current_change_count == suppressed_change_count
+                {
+                    state
+                        .suppressed_clipboard_change_count
+                        .store(i64::MIN, std::sync::atomic::Ordering::SeqCst);
+                    state
+                        .suppress_next_clipboard_capture
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                    last_change_count = Some(current_change_count);
+                    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+                    continue;
+                }
+
+                // Fallback for platforms/environments where change counts are unavailable.
+                if current_change_count < 0 || suppressed_change_count < 0 {
+                    state
+                        .suppressed_clipboard_change_count
+                        .store(i64::MIN, std::sync::atomic::Ordering::SeqCst);
+                    state
+                        .suppress_next_clipboard_capture
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                    last_change_count = Some(current_change_count);
+                    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+                    continue;
+                }
+
+                state
+                    .suppress_next_clipboard_capture
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
         if current_change_count >= 0 {
             if Some(current_change_count) == last_change_count {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -169,6 +215,112 @@ pub async fn watch_clipboard(app: &tauri::AppHandle) {
 
         tokio::time::sleep(std::time::Duration::from_millis(140)).await;
     }
+}
+
+pub fn write_wire_clip_to_clipboard(
+    app: &tauri::AppHandle,
+    clip: &crate::sync::WireClip,
+) -> Result<(), String> {
+    let before_change_count = crate::macos::get_pasteboard_change_count();
+    let mut clipboard = Clipboard::new().map_err(|e| e.to_string())?;
+
+    if clip.is_file {
+        if let Some(path) = clip
+            .file_path
+            .as_ref()
+            .filter(|p| !p.trim().is_empty())
+            .map(PathBuf::from)
+            .filter(|p| p.exists())
+        {
+            clipboard
+                .set()
+                .file_list(&[path])
+                .map_err(|e| format!("Failed to set file list: {}", e))?;
+        } else {
+            let file_data_b64 = clip
+                .file_data
+                .as_ref()
+                .ok_or_else(|| "Missing file payload".to_string())?;
+            let file_data = base64::engine::general_purpose::STANDARD
+                .decode(file_data_b64)
+                .map_err(|e| format!("Invalid file payload: {}", e))?;
+            if file_data.is_empty() {
+                return Err("Missing file payload".to_string());
+            }
+            let cache_root = app
+                .path()
+                .app_cache_dir()
+                .unwrap_or_else(|_| std::env::temp_dir().join("copi"));
+            let files_dir = cache_root.join("file-clips");
+            let _ = std::fs::create_dir_all(&files_dir);
+            let safe_name = clip
+                .file_name
+                .as_ref()
+                .filter(|n| !n.trim().is_empty())
+                .cloned()
+                .unwrap_or_else(|| "remote-file".to_string());
+            let target = files_dir.join(format!("sync-{}-{}", clip.hash, safe_name));
+            std::fs::write(&target, &file_data).map_err(|e| e.to_string())?;
+            clipboard
+                .set()
+                .file_list(&[target])
+                .map_err(|e| format!("Failed to set file list: {}", e))?;
+        }
+    } else if clip.kind == "image" {
+        let state = app.state::<AppState>();
+        let conn = state.db_read_pool.get().map_err(|e| e.to_string())?;
+        let image_hash = clip.image_hash.as_deref().unwrap_or(clip.hash.as_str());
+        let data: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT image_data FROM clips WHERE content_hash = ?1 AND deleted = 0 LIMIT 1",
+                [image_hash],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let image_data = data.ok_or_else(|| "Image bytes unavailable".to_string())?;
+        if let Some((raw, w, h)) = png_to_rgba(&image_data) {
+            clipboard
+                .set_image(ImageData {
+                    width: w,
+                    height: h,
+                    bytes: Cow::Owned(raw),
+                })
+                .map_err(|e| format!("Failed to set image: {}", e))?;
+        } else {
+            return Err("Failed to decode image".to_string());
+        }
+    } else {
+        clipboard
+            .set_text(&clip.content)
+            .map_err(|e| format!("Failed to set text: {}", e))?;
+    }
+
+    let state = app.state::<AppState>();
+    state
+        .suppress_next_clipboard_capture
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let mut after_change_count = crate::macos::get_pasteboard_change_count();
+    if before_change_count >= 0 && after_change_count <= before_change_count {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        after_change_count = crate::macos::get_pasteboard_change_count();
+    }
+    if before_change_count >= 0 && after_change_count <= before_change_count {
+        after_change_count = before_change_count + 1;
+    }
+
+    if after_change_count >= 0 {
+        state
+            .suppressed_clipboard_change_count
+            .store(after_change_count, std::sync::atomic::Ordering::SeqCst);
+    } else {
+        state
+            .suppressed_clipboard_change_count
+            .store(i64::MIN, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    Ok(())
 }
 
 // ─── Backfill Image Metadata ──────────────────────────────────────
@@ -1198,19 +1350,23 @@ fn insert_clip(
         .ok();
 
     let result = conn.execute(
-        "INSERT INTO clips (content, content_hash, content_type, source_app, source_app_icon, content_highlighted, language, created_at, sync_id, sync_version, deleted, origin_device_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11)
+        "INSERT INTO clips (content, content_hash, content_type, source_app, source_app_icon, content_highlighted, language, created_at, pinned, collection_sync_id, sync_id, sync_version, deleted, origin_device_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, NULL, ?9, ?10, 0, ?11)
          ON CONFLICT(content_hash) DO UPDATE SET
             source_app = CASE
-                WHEN excluded.source_app <> '' THEN excluded.source_app
+                WHEN clips.source_device = '' AND excluded.source_app <> '' THEN excluded.source_app
+                WHEN clips.source_app = '' AND excluded.source_app <> '' THEN excluded.source_app
                 ELSE clips.source_app
             END,
             source_app_icon = CASE
-                WHEN length(excluded.source_app_icon) > 0 THEN excluded.source_app_icon
+                WHEN clips.source_device = '' AND length(excluded.source_app_icon) > 0 THEN excluded.source_app_icon
+                WHEN length(clips.source_app_icon) = 0 AND length(excluded.source_app_icon) > 0 THEN excluded.source_app_icon
                 ELSE clips.source_app_icon
             END,
             content_highlighted = COALESCE(excluded.content_highlighted, clips.content_highlighted),
             created_at = excluded.created_at,
+            pinned = clips.pinned,
+            collection_sync_id = clips.collection_sync_id,
             sync_id = COALESCE(clips.sync_id, excluded.sync_id),
             sync_version = excluded.sync_version,
             deleted = 0,
@@ -1284,15 +1440,17 @@ fn insert_image_clip(
         })
         .ok();
     let result = conn.execute(
-        "INSERT INTO clips (content, content_hash, content_type, source_app, source_app_icon, ocr_text, language, image_data, image_thumbnail, image_width, image_height, created_at, sync_id, sync_version, deleted, origin_device_id)
-         VALUES ('[Image]', ?1, 'image', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0, ?13)
+        "INSERT INTO clips (content, content_hash, content_type, source_app, source_app_icon, ocr_text, language, image_data, image_thumbnail, image_width, image_height, created_at, pinned, collection_sync_id, sync_id, sync_version, deleted, origin_device_id)
+         VALUES ('[Image]', ?1, 'image', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, NULL, ?11, ?12, 0, ?13)
          ON CONFLICT(content_hash) DO UPDATE SET
             source_app = CASE
-                WHEN excluded.source_app <> '' THEN excluded.source_app
+                WHEN clips.source_device = '' AND excluded.source_app <> '' THEN excluded.source_app
+                WHEN clips.source_app = '' AND excluded.source_app <> '' THEN excluded.source_app
                 ELSE clips.source_app
             END,
             source_app_icon = CASE
-                WHEN length(excluded.source_app_icon) > 0 THEN excluded.source_app_icon
+                WHEN clips.source_device = '' AND length(excluded.source_app_icon) > 0 THEN excluded.source_app_icon
+                WHEN length(clips.source_app_icon) = 0 AND length(excluded.source_app_icon) > 0 THEN excluded.source_app_icon
                 ELSE clips.source_app_icon
             END,
             ocr_text = COALESCE(excluded.ocr_text, clips.ocr_text),
@@ -1311,6 +1469,8 @@ fn insert_image_clip(
                 ELSE clips.image_height
             END,
             created_at = excluded.created_at,
+            pinned = clips.pinned,
+            collection_sync_id = clips.collection_sync_id,
             sync_id = COALESCE(clips.sync_id, excluded.sync_id),
             sync_version = excluded.sync_version,
             deleted = 0,
@@ -1378,18 +1538,22 @@ fn insert_file_clip(
         .ok();
 
     let result = conn.execute(
-        "INSERT INTO clips (content, content_hash, content_type, source_app, source_app_icon, created_at, sync_id, sync_version, deleted, origin_device_id, is_file, file_name, file_size, file_data, file_path)
-         VALUES (?1, ?2, 'text', ?3, ?4, ?5, ?6, ?7, 0, ?8, 1, ?9, ?10, ?11, ?12)
+        "INSERT INTO clips (content, content_hash, content_type, source_app, source_app_icon, created_at, pinned, collection_sync_id, sync_id, sync_version, deleted, origin_device_id, is_file, file_name, file_size, file_data, file_path)
+         VALUES (?1, ?2, 'text', ?3, ?4, ?5, 0, NULL, ?6, ?7, 0, ?8, 1, ?9, ?10, ?11, ?12)
          ON CONFLICT(content_hash) DO UPDATE SET
             source_app = CASE
-                WHEN excluded.source_app <> '' THEN excluded.source_app
+                WHEN clips.source_device = '' AND excluded.source_app <> '' THEN excluded.source_app
+                WHEN clips.source_app = '' AND excluded.source_app <> '' THEN excluded.source_app
                 ELSE clips.source_app
             END,
             source_app_icon = CASE
-                WHEN length(excluded.source_app_icon) > 0 THEN excluded.source_app_icon
+                WHEN clips.source_device = '' AND length(excluded.source_app_icon) > 0 THEN excluded.source_app_icon
+                WHEN length(clips.source_app_icon) = 0 AND length(excluded.source_app_icon) > 0 THEN excluded.source_app_icon
                 ELSE clips.source_app_icon
             END,
             created_at = excluded.created_at,
+            pinned = clips.pinned,
+            collection_sync_id = clips.collection_sync_id,
             sync_id = COALESCE(clips.sync_id, excluded.sync_id),
             sync_version = excluded.sync_version,
             deleted = 0,

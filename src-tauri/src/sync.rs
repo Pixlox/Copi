@@ -69,6 +69,12 @@ enum Msg {
     ClipPush {
         clip: WireClip,
     },
+    CollectionBatch {
+        collections: Vec<WireCollection>,
+    },
+    CollectionPush {
+        collection: WireCollection,
+    },
     BlobRequest {
         hash: String,
     },
@@ -86,37 +92,53 @@ enum Msg {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireClip {
-    hash: String,
-    created_at: i64,
-    source_device: String,
-    kind: String,
-    content: String,
+    pub hash: String,
+    pub created_at: i64,
+    pub source_device: String,
+    pub kind: String,
+    pub content: String,
     #[serde(default)]
-    is_file: bool,
+    pub is_file: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    file_name: Option<String>,
+    pub file_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    file_size: Option<i64>,
+    pub file_size: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    file_data: Option<String>,
+    pub file_data: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    file_path: Option<String>,
-    source_app: String,
+    pub file_path: Option<String>,
+    pub source_app: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    source_app_icon: Option<String>,
+    pub source_app_icon: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    ocr_text: Option<String>,
+    pub ocr_text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    content_highlighted: Option<String>,
+    pub content_highlighted: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    language: Option<String>,
-    pinned: bool,
+    pub language: Option<String>,
+    #[serde(default)]
+    pub metadata_sync: bool,
+    pub pinned: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    image_hash: Option<String>,
+    pub collection_sync_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    embedding_model: Option<String>,
+    pub image_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    embedding: Option<String>,
+    pub embedding_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireCollection {
+    pub sync_id: String,
+    pub name: String,
+    pub color: String,
+    pub created_at: i64,
+    pub sync_version: i64,
+    pub deleted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_device_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1141,6 +1163,15 @@ async fn run_session(
         eprintln!("[Sync] Sent clip batch to peer {}", peer_id);
     }
 
+    if collections_and_pins_sync_enabled(&app) {
+        if let Err(error) = send_full_clip_snapshot_to_peer(&app, &sync, &secure_writer).await {
+            eprintln!("[Sync] Failed to send metadata clip snapshot: {}", error);
+        }
+        if let Err(error) = send_full_collection_snapshot_to_peer(&app, &secure_writer).await {
+            eprintln!("[Sync] Failed to send metadata collection snapshot: {}", error);
+        }
+    }
+
     let mut ping = tokio::time::interval(PING_INTERVAL);
     let session_result = loop {
         let mut line = String::new();
@@ -1209,8 +1240,14 @@ async fn handle_message(
     msg: Msg,
 ) -> Result<()> {
     match msg {
-        Msg::ClipBatch { clips } => receive_clips(app, sync, peer_id, writer, clips).await,
-        Msg::ClipPush { clip } => receive_clips(app, sync, peer_id, writer, vec![clip]).await,
+        Msg::ClipBatch { clips } => receive_clips(app, sync, peer_id, writer, clips, false).await,
+        Msg::ClipPush { clip } => receive_clips(app, sync, peer_id, writer, vec![clip], true).await,
+        Msg::CollectionBatch { collections } => {
+            receive_collections(app, sync, peer_id, collections)
+        }
+        Msg::CollectionPush { collection } => {
+            receive_collections(app, sync, peer_id, vec![collection])
+        }
         Msg::BlobRequest { hash } => {
             if let Some(bytes) = get_image_blob(app, &hash)? {
                 writer
@@ -1251,6 +1288,7 @@ async fn receive_clips(
     peer_id: &str,
     writer: &SecureSender,
     clips: Vec<WireClip>,
+    mirror_last_clip_to_local_clipboard: bool,
 ) -> Result<()> {
     eprintln!(
         "[Sync] Receiving {} clips from peer {}",
@@ -1264,6 +1302,9 @@ async fn receive_clips(
     let mut max_by_source: HashMap<String, i64> = HashMap::new();
     let mut inserted_any = false;
     let mut insert_count = 0;
+    let metadata_sync_enabled = collections_and_pins_sync_enabled(app);
+    let mut last_inserted_clip_for_mirror: Option<WireClip> = None;
+    let mut last_processed_clip_for_mirror: Option<WireClip> = None;
 
     for clip in clips {
         if clip.source_device.is_empty() || clip.source_device == sync.device_id {
@@ -1282,6 +1323,10 @@ async fn receive_clips(
             continue;
         }
 
+        if mirror_last_clip_to_local_clipboard {
+            last_processed_clip_for_mirror = Some(clip.clone());
+        }
+
         eprintln!(
             "[Sync] Processing clip: hash={} kind={} source={}",
             clip.hash, clip.kind, clip.source_device
@@ -1291,6 +1336,8 @@ async fn receive_clips(
             .entry(clip.source_device.clone())
             .and_modify(|ts| *ts = (*ts).max(clip.created_at))
             .or_insert(clip.created_at);
+
+        let apply_metadata_from_peer = metadata_sync_enabled && clip.metadata_sync;
 
         let source_icon = clip
             .source_app_icon
@@ -1317,27 +1364,40 @@ async fn receive_clips(
                 )
                 .optional()?;
 
+            let remote_collection_sync_id = if apply_metadata_from_peer {
+                clip.collection_sync_id.clone()
+            } else {
+                None
+            };
+
             conn.execute(
-                "INSERT INTO clips (content, content_hash, content_type, source_app, source_app_icon, content_highlighted, ocr_text, language, created_at, pinned, image_data, source_device, deleted, is_file, file_name, file_size, file_data, file_path)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11, 0, ?12, ?13, ?14, ?15, ?16)
+                "INSERT INTO clips (content, content_hash, content_type, source_app, source_app_icon, content_highlighted, ocr_text, language, created_at, pinned, collection_sync_id, image_data, source_device, deleted, is_file, file_name, file_size, file_data, file_path)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12, 0, ?13, ?14, ?15, ?16, ?17)
                  ON CONFLICT(content_hash) DO UPDATE SET
                     source_app = CASE
-                        WHEN excluded.source_app <> '' THEN excluded.source_app
+                        WHEN clips.source_device = excluded.source_device AND excluded.source_app <> '' THEN excluded.source_app
+                        WHEN clips.source_app = '' AND excluded.source_app <> '' THEN excluded.source_app
                         ELSE clips.source_app
                     END,
                     source_app_icon = CASE
-                        WHEN length(COALESCE(excluded.source_app_icon, X'')) > 0 THEN excluded.source_app_icon
+                        WHEN clips.source_device = excluded.source_device AND length(COALESCE(excluded.source_app_icon, X'')) > 0 THEN excluded.source_app_icon
+                        WHEN length(COALESCE(clips.source_app_icon, X'')) = 0 AND length(COALESCE(excluded.source_app_icon, X'')) > 0 THEN excluded.source_app_icon
                         ELSE clips.source_app_icon
                     END,
                     content_highlighted = COALESCE(excluded.content_highlighted, clips.content_highlighted),
                     ocr_text = COALESCE(excluded.ocr_text, clips.ocr_text),
                     language = COALESCE(excluded.language, clips.language),
-                    pinned = CASE WHEN excluded.pinned = 1 THEN 1 ELSE clips.pinned END,
+                    pinned = CASE WHEN ?18 = 1 THEN excluded.pinned ELSE clips.pinned END,
+                    collection_sync_id = CASE
+                        WHEN ?18 = 1 THEN excluded.collection_sync_id
+                        ELSE clips.collection_sync_id
+                    END,
                     created_at = CASE
                         WHEN excluded.created_at > clips.created_at THEN excluded.created_at
                         ELSE clips.created_at
                     END,
                     source_device = CASE
+                        WHEN ?18 = 1 THEN clips.source_device
                         WHEN clips.source_device = '' THEN excluded.source_device
                         ELSE clips.source_device
                     END,
@@ -1358,14 +1418,36 @@ async fn receive_clips(
                     clip.language,
                     clip.created_at,
                     if clip.pinned { 1 } else { 0 },
+                    remote_collection_sync_id,
                     clip.source_device,
                     if clip.is_file { 1 } else { 0 },
                     clip.file_name,
                     clip.file_size.unwrap_or(0),
                     decoded_file_data,
                     clip.file_path,
+                    if apply_metadata_from_peer { 1 } else { 0 },
                 ],
             )?;
+
+            if apply_metadata_from_peer {
+                if let Some(collection_sync_id) = remote_collection_sync_id.as_deref() {
+                    let _ = conn.execute(
+                        "UPDATE clips
+                         SET collection_id = (
+                             SELECT c.id FROM collections c
+                             WHERE c.sync_id = ?1
+                               AND c.deleted = 0
+                         )
+                         WHERE content_hash = ?2",
+                        rusqlite::params![collection_sync_id, clip.hash.as_str()],
+                    );
+                } else {
+                    let _ = conn.execute(
+                        "UPDATE clips SET collection_id = NULL WHERE content_hash = ?1",
+                        [clip.hash.as_str()],
+                    );
+                }
+            }
 
             let clip_id: i64 = if let Some(id) = existing_clip_id {
                 id
@@ -1373,9 +1455,20 @@ async fn receive_clips(
                 conn.last_insert_rowid()
             };
 
+            if metadata_sync_enabled {
+                let _ = conn.execute(
+                    "UPDATE clips
+                     SET source_device = ?1
+                     WHERE id = ?2
+                       AND (source_device = '' OR source_device = ?1)",
+                    rusqlite::params![clip.source_device, clip_id],
+                );
+            }
+
             if existing_clip_id.is_none() {
                 inserted_any = true;
                 insert_count += 1;
+                last_inserted_clip_for_mirror = Some(clip.clone());
                 eprintln!("[Sync] Inserted clip id={} hash={}", clip_id, clip.hash);
                 if !clip.is_file && !has_remote_embedding {
                     if let Err(error) = state.clip_tx.try_send(clip_id) {
@@ -1436,8 +1529,28 @@ async fn receive_clips(
             insert_count, peer_id
         );
         let _ = app.emit("new-clip", ());
+        if mirror_last_clip_to_local_clipboard {
+            if let Some(clip) = last_inserted_clip_for_mirror {
+                if let Err(error) = crate::clipboard::write_wire_clip_to_clipboard(app, &clip) {
+                    eprintln!(
+                        "[Sync] Failed to mirror remote clip to local clipboard: {}",
+                        error
+                    );
+                }
+            }
+        }
     } else {
         eprintln!("[Sync] No new clips inserted from peer {}", peer_id);
+        if mirror_last_clip_to_local_clipboard {
+            if let Some(clip) = last_processed_clip_for_mirror {
+                if let Err(error) = crate::clipboard::write_wire_clip_to_clipboard(app, &clip) {
+                    eprintln!(
+                        "[Sync] Failed to mirror existing remote clip to local clipboard: {}",
+                        error
+                    );
+                }
+            }
+        }
     }
 
     Ok(())
@@ -1786,6 +1899,7 @@ pub fn build_cursor_map(app: &AppHandle, our_device_id: &str) -> Result<HashMap<
 pub fn get_clips_since(app: &AppHandle, our_device_id: &str, since: i64) -> Result<Vec<WireClip>> {
     let state = app.state::<AppState>();
     let conn = state.db_read_pool.get().context("db read pool")?;
+    let metadata_sync_enabled = collections_and_pins_sync_enabled(app);
 
     let mut stmt = conn.prepare(
         "SELECT content_hash,
@@ -1799,6 +1913,7 @@ pub fn get_clips_since(app: &AppHandle, our_device_id: &str, since: i64) -> Resu
                 content_highlighted,
                 language,
                 pinned,
+                COALESCE(collection_sync_id, ''),
                 COALESCE(is_file, 0),
                 file_name,
                 COALESCE(file_size, 0),
@@ -1836,12 +1951,13 @@ pub fn get_clips_since(app: &AppHandle, our_device_id: &str, since: i64) -> Resu
                 row.get::<_, Option<String>>(8)?,
                 row.get::<_, Option<String>>(9)?,
                 row.get::<_, i64>(10)?,
-                row.get::<_, i64>(11)?,
-                row.get::<_, Option<String>>(12)?,
-                row.get::<_, i64>(13)?,
-                row.get::<_, Option<Vec<u8>>>(14)?,
-                row.get::<_, Option<String>>(15)?,
-                row.get::<_, Option<Vec<u8>>>(16)?,
+                row.get::<_, String>(11)?,
+                row.get::<_, i64>(12)?,
+                row.get::<_, Option<String>>(13)?,
+                row.get::<_, i64>(14)?,
+                row.get::<_, Option<Vec<u8>>>(15)?,
+                row.get::<_, Option<String>>(16)?,
+                row.get::<_, Option<Vec<u8>>>(17)?,
             ))
         },
     )?;
@@ -1860,6 +1976,7 @@ pub fn get_clips_since(app: &AppHandle, our_device_id: &str, since: i64) -> Resu
             content_highlighted,
             language,
             pinned,
+            collection_sync_id,
             is_file,
             file_name,
             file_size,
@@ -1915,7 +2032,13 @@ pub fn get_clips_since(app: &AppHandle, our_device_id: &str, since: i64) -> Resu
             ocr_text,
             content_highlighted,
             language,
-            pinned: pinned != 0,
+            metadata_sync: metadata_sync_enabled,
+            pinned: metadata_sync_enabled && pinned != 0,
+            collection_sync_id: if metadata_sync_enabled && !collection_sync_id.is_empty() {
+                Some(collection_sync_id)
+            } else {
+                None
+            },
             image_hash,
             embedding_model: embedding_encoded
                 .as_ref()
@@ -1949,6 +2072,12 @@ fn auto_connect_enabled(app: &AppHandle) -> bool {
     crate::settings::get_config_sync(app.clone())
         .map(|cfg| cfg.sync.enabled && cfg.sync.auto_connect)
         .unwrap_or(true)
+}
+
+pub fn collections_and_pins_sync_enabled(app: &AppHandle) -> bool {
+    crate::settings::get_config_sync(app.clone())
+        .map(|cfg| cfg.sync.enabled && cfg.sync.sync_collections_and_pins)
+        .unwrap_or(false)
 }
 
 fn addr_quality(ip: IpAddr) -> u8 {
@@ -2056,6 +2185,7 @@ async fn lookup_clip_for_push(
 ) -> Result<Option<(WireClip, Option<Vec<u8>>)>> {
     let state = app.state::<AppState>();
     let conn = state.db_read_pool.get().context("db read pool")?;
+    let metadata_sync_enabled = collections_and_pins_sync_enabled(app);
 
     let query_one = |sql: &str| -> Result<Option<(WireClip, Option<Vec<u8>>)>> {
         let row = conn
@@ -2072,13 +2202,14 @@ async fn lookup_clip_for_push(
                     row.get::<_, Option<String>>(8)?,
                     row.get::<_, Option<String>>(9)?,
                     row.get::<_, i64>(10)?,
-                    row.get::<_, Option<Vec<u8>>>(11)?,
-                    row.get::<_, i64>(12)?,
-                    row.get::<_, Option<String>>(13)?,
-                    row.get::<_, i64>(14)?,
-                    row.get::<_, Option<Vec<u8>>>(15)?,
-                    row.get::<_, Option<String>>(16)?,
-                    row.get::<_, Option<Vec<u8>>>(17)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, Option<Vec<u8>>>(12)?,
+                    row.get::<_, i64>(13)?,
+                    row.get::<_, Option<String>>(14)?,
+                    row.get::<_, i64>(15)?,
+                    row.get::<_, Option<Vec<u8>>>(16)?,
+                    row.get::<_, Option<String>>(17)?,
+                    row.get::<_, Option<Vec<u8>>>(18)?,
                 ))
             })
             .optional()?;
@@ -2095,6 +2226,7 @@ async fn lookup_clip_for_push(
             content_highlighted,
             language,
             pinned,
+            collection_sync_id,
             image_data,
             is_file,
             file_name,
@@ -2143,7 +2275,13 @@ async fn lookup_clip_for_push(
                 ocr_text,
                 content_highlighted,
                 language,
-                pinned: pinned != 0,
+                metadata_sync: metadata_sync_enabled,
+                pinned: metadata_sync_enabled && pinned != 0,
+                collection_sync_id: if metadata_sync_enabled && !collection_sync_id.is_empty() {
+                    Some(collection_sync_id)
+                } else {
+                    None
+                },
                 image_hash: if kind == "image" { Some(hash) } else { None },
                 embedding_model: embedding_encoded
                     .as_ref()
@@ -2168,6 +2306,7 @@ async fn lookup_clip_for_push(
                 content_highlighted,
                 language,
                 pinned,
+                COALESCE(collection_sync_id, ''),
                 image_data,
                 COALESCE(is_file, 0),
                 file_name,
@@ -2197,6 +2336,7 @@ async fn lookup_clip_for_push(
                 content_highlighted,
                 language,
                 pinned,
+                COALESCE(collection_sync_id, ''),
                 image_data,
                 COALESCE(is_file, 0),
                 file_name,
@@ -2445,6 +2585,211 @@ pub fn next_sync_version_from_conn(conn: &rusqlite::Connection) -> i64 {
     next
 }
 
+fn get_collections_since(app: &AppHandle, since_sync_version: i64) -> Result<Vec<WireCollection>> {
+    let state = app.state::<AppState>();
+    let conn = state.db_read_pool.get().context("db read pool")?;
+
+    let mut stmt = conn.prepare(
+        "SELECT sync_id,
+                name,
+                COALESCE(color, '#0A84FF'),
+                created_at,
+                COALESCE(sync_version, 0),
+                COALESCE(deleted, 0),
+                origin_device_id
+         FROM collections
+         WHERE sync_id IS NOT NULL
+           AND (?1 = 0 OR COALESCE(sync_version, 0) > ?1)
+         ORDER BY COALESCE(sync_version, 0) ASC
+         LIMIT 500",
+    )?;
+
+    let rows = stmt.query_map([since_sync_version], |row| {
+        Ok(WireCollection {
+            sync_id: row.get(0)?,
+            name: row.get(1)?,
+            color: row.get(2)?,
+            created_at: row.get(3)?,
+            sync_version: row.get(4)?,
+            deleted: row.get::<_, i64>(5)? != 0,
+            origin_device_id: row.get(6)?,
+        })
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+fn ensure_collections_synced_to_clips(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE clips
+         SET collection_sync_id = (
+             SELECT c.sync_id FROM collections c WHERE c.id = clips.collection_id
+         )
+         WHERE collection_id IS NOT NULL
+           AND COALESCE(collection_sync_id, '') = ''",
+        [],
+    )?;
+    Ok(())
+}
+
+fn receive_collections(
+    app: &AppHandle,
+    sync: &Arc<SyncState>,
+    peer_id: &str,
+    collections: Vec<WireCollection>,
+) -> Result<()> {
+    if !sync.is_enabled() || !collections_and_pins_sync_enabled(app) {
+        return Ok(());
+    }
+
+    let state = app.state::<AppState>();
+    let conn = state
+        .db_write
+        .lock()
+        .map_err(|e| anyhow!("lock poisoned: {}", e))?;
+
+    let mut changed = false;
+    let received_count = collections.len();
+    for collection in collections {
+        let affected = conn.execute(
+            "INSERT INTO collections (name, color, created_at, sync_id, sync_version, deleted, origin_device_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(sync_id) DO UPDATE SET
+                 name = excluded.name,
+                 color = excluded.color,
+                 created_at = CASE
+                     WHEN excluded.created_at > collections.created_at THEN excluded.created_at
+                     ELSE collections.created_at
+                 END,
+                 sync_version = CASE
+                     WHEN excluded.sync_version > collections.sync_version THEN excluded.sync_version
+                     ELSE collections.sync_version
+                 END,
+                 deleted = CASE
+                     WHEN excluded.sync_version >= collections.sync_version THEN excluded.deleted
+                     ELSE collections.deleted
+                 END,
+                 origin_device_id = COALESCE(collections.origin_device_id, excluded.origin_device_id)",
+            rusqlite::params![
+                collection.name,
+                collection.color,
+                collection.created_at,
+                collection.sync_id,
+                collection.sync_version,
+                if collection.deleted { 1 } else { 0 },
+                collection.origin_device_id,
+            ],
+        )?;
+        if affected > 0 {
+            changed = true;
+        }
+    }
+
+    if changed {
+        let _ = conn.execute(
+            "UPDATE clips
+             SET collection_id = (
+                 SELECT c.id FROM collections c
+                 WHERE c.sync_id = clips.collection_sync_id
+                   AND c.deleted = 0
+             )
+             WHERE collection_sync_id IS NOT NULL",
+            [],
+        );
+        let _ = conn.execute(
+            "UPDATE clips
+             SET collection_id = NULL
+             WHERE collection_sync_id IS NOT NULL
+               AND collection_sync_id IN (
+                   SELECT sync_id FROM collections WHERE deleted = 1
+               )",
+            [],
+        );
+        let _ = app.emit("collections-changed", ());
+        let _ = app.emit("clips-changed", ());
+        eprintln!(
+            "[Sync] Applied {} incoming collections from peer {}",
+            received_count, peer_id
+        );
+    }
+
+    Ok(())
+}
+
+fn backfill_collection_sync_ids(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let conn = match state.db_write.lock() {
+        Ok(conn) => conn,
+        Err(_) => return,
+    };
+
+    let mut stmt = match conn.prepare("SELECT id FROM collections WHERE sync_id IS NULL") {
+        Ok(stmt) => stmt,
+        Err(_) => return,
+    };
+    let rows = match stmt.query_map([], |row| row.get::<_, i64>(0)) {
+        Ok(rows) => rows,
+        Err(_) => return,
+    };
+    for row in rows.flatten() {
+        let _ = conn.execute(
+            "UPDATE collections SET sync_id = ?1 WHERE id = ?2 AND sync_id IS NULL",
+            rusqlite::params![uuid::Uuid::new_v4().to_string(), row],
+        );
+    }
+
+    let _ = ensure_collections_synced_to_clips(&conn);
+}
+
+fn sync_existing_metadata_now(app: &AppHandle, sync: Arc<SyncState>) {
+    if !collections_and_pins_sync_enabled(app) {
+        return;
+    }
+
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let peers: Vec<SecureSender> = {
+            let guard = sync.live.read().await;
+            guard.values().cloned().collect()
+        };
+        for peer in peers {
+            let _ = send_full_clip_snapshot_to_peer(&app_handle, &sync, &peer).await;
+            let _ = send_full_collection_snapshot_to_peer(&app_handle, &peer).await;
+        }
+    });
+}
+
+async fn send_full_clip_snapshot_to_peer(
+    app: &AppHandle,
+    sync: &Arc<SyncState>,
+    peer: &SecureSender,
+) -> Result<()> {
+    let mut since = 0_i64;
+    loop {
+        let batch = get_clips_since(app, &sync.device_id, since)?;
+        if batch.is_empty() {
+            break;
+        }
+        if let Some(last) = batch.last() {
+            since = last.created_at;
+        }
+        peer.send(&Msg::ClipBatch { clips: batch }).await?;
+    }
+    Ok(())
+}
+
+async fn send_full_collection_snapshot_to_peer(app: &AppHandle, peer: &SecureSender) -> Result<()> {
+    let collections = get_collections_since(app, 0)?;
+    if collections.is_empty() {
+        return Ok(());
+    }
+    peer.send(&Msg::CollectionBatch { collections }).await
+}
+
 pub fn apply_config_change(
     app: &AppHandle,
     previous: Option<&crate::settings::CopiConfig>,
@@ -2473,4 +2818,52 @@ pub fn apply_config_change(
     }
 }
 
-pub fn on_collection_changed(_app: &AppHandle) {}
+pub fn apply_metadata_sync_config_change(
+    app: &AppHandle,
+    previous: Option<&crate::settings::CopiConfig>,
+    next: &crate::settings::CopiConfig,
+) {
+    let was_enabled = previous
+        .map(|cfg| cfg.sync.enabled && cfg.sync.sync_collections_and_pins)
+        .unwrap_or(false);
+    let is_enabled = next.sync.enabled && next.sync.sync_collections_and_pins;
+    if was_enabled == is_enabled {
+        return;
+    }
+
+    if is_enabled {
+        backfill_collection_sync_ids(app);
+        if let Some(sync) = app
+            .try_state::<AppState>()
+            .and_then(|state| state.sync.get().cloned())
+        {
+            sync_existing_metadata_now(app, sync);
+        }
+    }
+}
+
+pub fn on_collection_changed(app: &AppHandle) {
+    if !collections_and_pins_sync_enabled(app) {
+        return;
+    }
+
+    backfill_collection_sync_ids(app);
+
+    let Some(sync) = app
+        .try_state::<AppState>()
+        .and_then(|state| state.sync.get().cloned())
+    else {
+        return;
+    };
+
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let collections = get_collections_since(&app_handle, 0).unwrap_or_default();
+        if collections.is_empty() {
+            return;
+        }
+        if let Err(error) = sync.broadcast(Msg::CollectionBatch { collections }).await {
+            eprintln!("[Sync] Failed to push collection batch: {}", error);
+        }
+    });
+}

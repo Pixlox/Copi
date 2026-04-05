@@ -2,7 +2,7 @@ import type { SearchStatus } from "../hooks/useSearch";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { formatShortcut, formatSymbolShortcut, isMacPlatform } from "../utils/platform";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 interface StatusBarProps {
   totalCount: number;
@@ -74,11 +74,35 @@ function StatusBar({
   canOpenActions,
   onToggleActions,
 }: StatusBarProps) {
-  const [syncConnected, setSyncConnected] = useState<number>(0);
   const [syncEnabled, setSyncEnabled] = useState<boolean>(false);
+  const [syncBadge, setSyncBadge] = useState<string | null>(null);
+  const syncStatusKeyRef = useRef<string | null>(null);
+  const syncReadyRef = useRef<boolean>(false);
+  const syncBadgeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     let alive = true;
+    const setSyncBadgeForTransition = (enabled: boolean, connectedCount: number) => {
+      if (!enabled) {
+        setSyncBadge(null);
+        if (syncBadgeTimerRef.current) {
+          clearTimeout(syncBadgeTimerRef.current);
+          syncBadgeTimerRef.current = null;
+        }
+        return;
+      }
+
+      const label = connectedCount > 0 ? `Sync online (${connectedCount})` : "Sync idle";
+      setSyncBadge(label);
+      if (syncBadgeTimerRef.current) {
+        clearTimeout(syncBadgeTimerRef.current);
+      }
+      syncBadgeTimerRef.current = setTimeout(() => {
+        setSyncBadge(null);
+        syncBadgeTimerRef.current = null;
+      }, 3000);
+    };
+
     const refresh = async () => {
       try {
         const [status, peers] = await Promise.all([
@@ -86,16 +110,32 @@ function StatusBar({
           invoke<Array<{ device_id: string; display_name: string; online: boolean }>>("sync_list_peers"),
         ]);
         if (!alive) return;
-        setSyncEnabled(Boolean(status?.enabled));
-        setSyncConnected(
+        const enabled = Boolean(status?.enabled);
+        const connected =
           peers.length > 0
             ? peers.filter((peer) => peer.online).length
-            : Number(status?.connectedCount ?? 0)
-        );
+            : Number(status?.connectedCount ?? 0);
+
+        setSyncEnabled(enabled);
+        const nextKey = `${enabled ? 1 : 0}:${connected}`;
+        const prevKey = syncStatusKeyRef.current;
+        syncStatusKeyRef.current = nextKey;
+        if (!syncReadyRef.current) {
+          syncReadyRef.current = true;
+          return;
+        }
+        if (prevKey !== nextKey) {
+          setSyncBadgeForTransition(enabled, connected);
+        }
       } catch {
         if (!alive) return;
+        const prevKey = syncStatusKeyRef.current;
+        syncStatusKeyRef.current = "0:0";
+        if (syncReadyRef.current && prevKey !== "0:0") {
+          setSyncBadgeForTransition(false, 0);
+        }
+        syncReadyRef.current = true;
         setSyncEnabled(false);
-        setSyncConnected(0);
       }
     };
 
@@ -114,6 +154,10 @@ function StatusBar({
     return () => {
       alive = false;
       clearInterval(timer);
+      if (syncBadgeTimerRef.current) {
+        clearTimeout(syncBadgeTimerRef.current);
+        syncBadgeTimerRef.current = null;
+      }
       unlistenPaired.then((fn) => fn());
       unlistenConnected.then((fn) => fn());
       unlistenDisconnected.then((fn) => fn());
@@ -138,8 +182,8 @@ function StatusBar({
         {statusLabel && (
           <span className="temporal-badge">{statusLabel}</span>
         )}
-        {syncEnabled && (
-          <span className="temporal-badge">Sync {syncConnected > 0 ? `online (${syncConnected})` : "idle"}</span>
+        {syncEnabled && syncBadge && (
+          <span className="temporal-badge">{syncBadge}</span>
         )}
         {filters.map((f) => (
           <span key={f} className="temporal-badge">{f}</span>

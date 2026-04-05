@@ -3,7 +3,7 @@
     windows_subsystem = "windows"
 )]
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
@@ -83,6 +83,8 @@ pub struct AppState {
     pub clip_tx: tokio::sync::mpsc::Sender<i64>,
     pub clip_rx: Mutex<Option<tokio::sync::mpsc::Receiver<i64>>>,
     pub clipboard_watcher_running: Mutex<bool>,
+    pub suppress_next_clipboard_capture: AtomicBool,
+    pub suppressed_clipboard_change_count: AtomicI64,
     pub previous_frontmost_app: Mutex<Option<String>>,
     pub previous_foreground_window: Mutex<Option<isize>>,
     pub overlay_drag_ignore_until_ms: AtomicU64,
@@ -310,6 +312,8 @@ fn main() {
                 clip_tx: clip_tx.clone(),
                 clip_rx: Mutex::new(Some(clip_rx)),
                 clipboard_watcher_running: Mutex::new(true),
+                suppress_next_clipboard_capture: AtomicBool::new(false),
+                suppressed_clipboard_change_count: AtomicI64::new(i64::MIN),
                 previous_frontmost_app: Mutex::new(None),
                 previous_foreground_window: Mutex::new(None),
                 overlay_drag_ignore_until_ms: AtomicU64::new(0),

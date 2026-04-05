@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback, useRef } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   Keyboard,
   Palette,
@@ -19,11 +20,13 @@ import {
   Pencil,
   Check,
   Laptop,
+  Minus,
+  Square,
 } from "lucide-react";
 import { useThemeContext } from "../contexts/ThemeContext";
 import Picker from "../components/Picker";
 import { checkForUpdates } from "../utils/updater";
-import { formatShortcut, isMacPlatform, platformName } from "../utils/platform";
+import { formatShortcut, isMacPlatform, isWindowsPlatform, platformName } from "../utils/platform";
 
 // ════════════════════════════════════════════════════════════════════════════
 // Types
@@ -50,6 +53,7 @@ interface CopiConfig {
     device_name: string | null;
     auto_connect: boolean;
     sync_embeddings: boolean;
+    sync_collections_and_pins: boolean;
   };
 }
 
@@ -680,6 +684,24 @@ function SyncSection() {
             }}
           />
         </SettingRow>
+        <SettingDivider />
+        <SettingRow
+          label="Sync Collections & Pins"
+          description="Share collection metadata and pinned state across paired devices"
+        >
+          <Toggle
+            checked={Boolean(config?.sync.sync_collections_and_pins ?? false)}
+            onChange={(value) => {
+              void saveSyncConfig((cfg) => ({
+                ...cfg,
+                sync: {
+                  ...cfg.sync,
+                  sync_collections_and_pins: value,
+                },
+              }));
+            }}
+          />
+        </SettingRow>
       </SettingCard>
 
       <SettingCard>
@@ -762,42 +784,52 @@ function SyncSection() {
         />
         <SettingDivider />
         {pairingError && <span className="settings-sync-error">{pairingError}</span>}
-        <div className="settings-sync-list">
-          <input
-            className="settings-sync-input"
-            placeholder="Peer address (example: 192.168.1.153 or 192.168.1.153:51827)"
-            value={manualTargetAddr}
-            onChange={(e) => setManualTargetAddr(e.target.value)}
-          />
-          <input
-            className="settings-sync-input"
-            placeholder="6-digit PIN"
-            value={manualPin}
-            onChange={(e) => setManualPin(e.target.value.replace(/[^0-9]/g, "").slice(0, 6))}
-          />
-          <button
-            className="settings-btn primary"
-            disabled={manualPairingBusy || manualPin.length !== 6 || manualTargetAddr.trim().length === 0}
-            onClick={async () => {
-              const targetAddr = manualTargetAddr.trim();
-              if (!targetAddr || manualPin.length !== 6) return;
-              setManualPairingBusy(true);
-              setPairingError(null);
-              try {
-                await invoke("sync_pair_with", { targetAddr, target_addr: targetAddr, pin: manualPin });
-                setManualPin("");
-                refreshStatus();
-                refreshPeers();
-                refreshDiscovered();
-              } catch (e) {
-                setPairingError(formatError(e));
-              } finally {
-                setManualPairingBusy(false);
-              }
-            }}
-          >
-            {manualPairingBusy ? "Pairing..." : "Pair by Address"}
-          </button>
+        <div className="settings-sync-pair-form">
+          <div className="settings-sync-pair-grid">
+            <div className="settings-sync-pair-field">
+              <span className="settings-sync-pair-label">Peer Address</span>
+              <input
+                className="settings-sync-input"
+                placeholder="192.168.1.153 or 192.168.1.153:51827"
+                value={manualTargetAddr}
+                onChange={(e) => setManualTargetAddr(e.target.value)}
+              />
+            </div>
+            <div className="settings-sync-pair-field settings-sync-pair-field--pin">
+              <span className="settings-sync-pair-label">PIN</span>
+              <input
+                className="settings-sync-input"
+                placeholder="6-digit PIN"
+                value={manualPin}
+                onChange={(e) => setManualPin(e.target.value.replace(/[^0-9]/g, "").slice(0, 6))}
+              />
+            </div>
+          </div>
+          <div className="settings-sync-pair-actions">
+            <button
+              className="settings-btn primary"
+              disabled={manualPairingBusy || manualPin.length !== 6 || manualTargetAddr.trim().length === 0}
+              onClick={async () => {
+                const targetAddr = manualTargetAddr.trim();
+                if (!targetAddr || manualPin.length !== 6) return;
+                setManualPairingBusy(true);
+                setPairingError(null);
+                try {
+                  await invoke("sync_pair_with", { targetAddr, target_addr: targetAddr, pin: manualPin });
+                  setManualPin("");
+                  refreshStatus();
+                  refreshPeers();
+                  refreshDiscovered();
+                } catch (e) {
+                  setPairingError(formatError(e));
+                } finally {
+                  setManualPairingBusy(false);
+                }
+              }}
+            >
+              {manualPairingBusy ? "Pairing…" : "Pair by Address"}
+            </button>
+          </div>
         </div>
       </SettingCard>
 
@@ -869,7 +901,7 @@ function SyncSection() {
                   }
                 }}
               >
-                {pairingBusyAddr === device.addr ? "Pairing..." : "Pair"}
+                {pairingBusyAddr === device.addr ? "Pairing…" : "Pair"}
               </button>
             </div>
           ))}
@@ -1153,6 +1185,7 @@ function CollectionsSection({
 // ════════════════════════════════════════════════════════════════════════════
 
 export default function Settings() {
+  const appWindow = getCurrentWindow();
   const [config, setConfig] = useState<CopiConfig | null>(null);
   const [activeSection, setActiveSection] = useState<Section>("general");
   const [dbSize, setDbSize] = useState(0);
@@ -1162,6 +1195,7 @@ export default function Settings() {
   const [confirmClear, setConfirmClear] = useState(false);
   const [clearError, setClearError] = useState<string | null>(null);
   const [clearing, setClearing] = useState(false);
+  const [isMaximized, setIsMaximized] = useState(false);
 
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const statsRefreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1202,6 +1236,26 @@ export default function Settings() {
     getVersion().then(setAppVersion).catch(() => {});
     fetchCollections();
   }, [fetchCollections, refreshStats]);
+
+  useEffect(() => {
+    if (!isWindowsPlatform) {
+      return;
+    }
+    appWindow
+      .isMaximized()
+      .then((value) => setIsMaximized(value))
+      .catch(() => {});
+    const unlistenResized = appWindow.onResized(async () => {
+      try {
+        setIsMaximized(await appWindow.isMaximized());
+      } catch {
+        // ignore
+      }
+    });
+    return () => {
+      unlistenResized.then((off) => off()).catch(() => {});
+    };
+  }, [appWindow]);
 
   // Listen to collections-changed event for real-time updates
   useEffect(() => {
@@ -1344,7 +1398,48 @@ export default function Settings() {
       {/* ── Content ─────────────────────────────────────────────────── */}
       <main className="settings-content">
         <header className="settings-content-header" data-tauri-drag-region>
+          {isWindowsPlatform && <div className="settings-content-header-spacer" data-tauri-drag-region />}
           <h1>{activeSectionData.label}</h1>
+          {isWindowsPlatform && (
+            <div className="settings-win-controls" data-no-drag>
+              <button
+                className="settings-win-btn"
+                onClick={() => {
+                  void appWindow.minimize();
+                }}
+                aria-label="Minimize"
+                title="Minimize"
+              >
+                <Minus size={14} />
+              </button>
+              <button
+                className="settings-win-btn"
+                onClick={() => {
+                  void appWindow.isMaximized().then((value) => {
+                    if (value) {
+                      void appWindow.unmaximize().then(() => setIsMaximized(false));
+                    } else {
+                      void appWindow.maximize().then(() => setIsMaximized(true));
+                    }
+                  });
+                }}
+                aria-label={isMaximized ? "Restore" : "Maximize"}
+                title={isMaximized ? "Restore" : "Maximize"}
+              >
+                <Square size={12} />
+              </button>
+              <button
+                className="settings-win-btn close"
+                onClick={() => {
+                  void appWindow.hide();
+                }}
+                aria-label="Close"
+                title="Close"
+              >
+                <X size={12} />
+              </button>
+            </div>
+          )}
         </header>
 
         <div className="settings-content-body">
