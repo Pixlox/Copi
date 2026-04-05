@@ -118,6 +118,8 @@ pub struct WireClip {
     pub language: Option<String>,
     #[serde(default)]
     pub metadata_sync: bool,
+    #[serde(default)]
+    pub sync_version: i64,
     pub pinned: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub collection_sync_id: Option<String>,
@@ -165,18 +167,22 @@ struct SecureSender {
 impl SecureSender {
     async fn send(&self, msg: &Msg) -> Result<()> {
         let payload = serde_json::to_vec(msg).context("serialize secure msg")?;
+        let mut writer = self.writer.0.lock().await;
         let nonce = self.nonce.fetch_add(1, Ordering::SeqCst);
         let nonce_bytes = nonce_to_bytes(nonce);
         let encrypted = self
             .cipher
             .encrypt(Nonce::from_slice(&nonce_bytes), payload.as_ref())
             .context("encrypt secure msg")?;
-        self.writer
-            .send(&Msg::Secure {
-                nonce,
-                payload: B64.encode(encrypted),
-            })
-            .await
+        let mut frame = serde_json::to_vec(&Msg::Secure {
+            nonce,
+            payload: B64.encode(encrypted),
+        })
+        .context("serialize msg")?;
+        frame.push(b'\n');
+        writer.write_all(&frame).await.context("write msg")?;
+        writer.flush().await.context("flush msg")?;
+        Ok(())
     }
 }
 
@@ -1403,6 +1409,16 @@ async fn receive_clips(
             .or_insert(clip.created_at);
 
         let apply_metadata_from_peer = metadata_sync_enabled && clip.metadata_sync;
+        if apply_metadata_from_peer {
+            eprintln!(
+                "[Sync][meta] incoming hash={} pinned={} coll={:?} sync_version={} from={}",
+                clip.hash,
+                clip.pinned,
+                clip.collection_sync_id,
+                clip.sync_version,
+                peer_id
+            );
+        }
 
         let source_icon = clip
             .source_app_icon
@@ -1436,8 +1452,8 @@ async fn receive_clips(
             };
 
             conn.execute(
-                "INSERT INTO clips (content, content_hash, content_type, source_app, source_app_icon, content_highlighted, ocr_text, language, created_at, pinned, collection_sync_id, image_data, source_device, deleted, is_file, file_name, file_size, file_data, file_path)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12, 0, ?13, ?14, ?15, ?16, ?17)
+                "INSERT INTO clips (content, content_hash, content_type, source_app, source_app_icon, content_highlighted, ocr_text, language, created_at, pinned, collection_sync_id, image_data, source_device, sync_version, deleted, is_file, file_name, file_size, file_data, file_path)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12, ?18, 0, ?13, ?14, ?15, ?16, ?17)
                  ON CONFLICT(content_hash) DO UPDATE SET
                     source_app = CASE
                         WHEN clips.source_device = excluded.source_device AND excluded.source_app <> '' THEN excluded.source_app
@@ -1452,17 +1468,24 @@ async fn receive_clips(
                     content_highlighted = COALESCE(excluded.content_highlighted, clips.content_highlighted),
                     ocr_text = COALESCE(excluded.ocr_text, clips.ocr_text),
                     language = COALESCE(excluded.language, clips.language),
-                    pinned = CASE WHEN ?18 = 1 THEN excluded.pinned ELSE clips.pinned END,
+                    pinned = CASE
+                        WHEN ?19 = 1 AND excluded.sync_version >= clips.sync_version THEN excluded.pinned
+                        ELSE clips.pinned
+                    END,
                     collection_sync_id = CASE
-                        WHEN ?18 = 1 THEN excluded.collection_sync_id
+                        WHEN ?19 = 1 AND excluded.sync_version >= clips.sync_version THEN excluded.collection_sync_id
                         ELSE clips.collection_sync_id
+                    END,
+                    sync_version = CASE
+                        WHEN excluded.sync_version > clips.sync_version THEN excluded.sync_version
+                        ELSE clips.sync_version
                     END,
                     created_at = CASE
                         WHEN excluded.created_at > clips.created_at THEN excluded.created_at
                         ELSE clips.created_at
                     END,
                     source_device = CASE
-                        WHEN ?18 = 1 THEN clips.source_device
+                        WHEN ?19 = 1 THEN clips.source_device
                         WHEN clips.source_device = '' THEN excluded.source_device
                         ELSE clips.source_device
                     END,
@@ -1490,6 +1513,7 @@ async fn receive_clips(
                     clip.file_size.unwrap_or(0),
                     decoded_file_data,
                     clip.file_path,
+                    clip.sync_version,
                     if apply_metadata_from_peer { 1 } else { 0 },
                 ],
             )?;
@@ -1503,13 +1527,17 @@ async fn receive_clips(
                              WHERE c.sync_id = ?1
                                AND c.deleted = 0
                          )
-                         WHERE content_hash = ?2",
-                        rusqlite::params![collection_sync_id, clip.hash.as_str()],
+                         WHERE content_hash = ?2
+                           AND COALESCE(sync_version, 0) = ?3",
+                        rusqlite::params![collection_sync_id, clip.hash.as_str(), clip.sync_version],
                     );
                 } else {
                     let _ = conn.execute(
-                        "UPDATE clips SET collection_id = NULL WHERE content_hash = ?1",
-                        [clip.hash.as_str()],
+                        "UPDATE clips
+                         SET collection_id = NULL
+                         WHERE content_hash = ?1
+                           AND COALESCE(sync_version, 0) = ?2",
+                        rusqlite::params![clip.hash.as_str(), clip.sync_version],
                     );
                 }
             }
@@ -1535,6 +1563,27 @@ async fn receive_clips(
                 }
             } else {
                 eprintln!("[Sync] Clip exists, merged metadata: hash={}", clip.hash);
+                if apply_metadata_from_peer {
+                    let merged: Option<(i64, Option<String>, i64)> = conn
+                        .query_row(
+                            "SELECT COALESCE(pinned, 0), collection_sync_id, COALESCE(sync_version, 0)
+                             FROM clips
+                             WHERE content_hash = ?1
+                             LIMIT 1",
+                            [clip.hash.as_str()],
+                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                        )
+                        .optional()?;
+                    if let Some((merged_pinned, merged_coll, merged_sync_version)) = merged {
+                        eprintln!(
+                            "[Sync][meta] merged hash={} pinned={} coll={:?} sync_version={}",
+                            clip.hash,
+                            merged_pinned != 0,
+                            merged_coll,
+                            merged_sync_version
+                        );
+                    }
+                }
             }
 
             if has_remote_embedding {
@@ -1969,6 +2018,7 @@ pub fn get_clips_since(app: &AppHandle, our_device_id: &str, since: i64) -> Resu
                 language,
                 pinned,
                 COALESCE(collection_sync_id, ''),
+                COALESCE(sync_version, 0),
                 COALESCE(is_file, 0),
                 file_name,
                 COALESCE(file_size, 0),
@@ -2008,11 +2058,12 @@ pub fn get_clips_since(app: &AppHandle, our_device_id: &str, since: i64) -> Resu
                 row.get::<_, i64>(10)?,
                 row.get::<_, String>(11)?,
                 row.get::<_, i64>(12)?,
-                row.get::<_, Option<String>>(13)?,
-                row.get::<_, i64>(14)?,
-                row.get::<_, Option<Vec<u8>>>(15)?,
-                row.get::<_, Option<String>>(16)?,
-                row.get::<_, Option<Vec<u8>>>(17)?,
+                row.get::<_, i64>(13)?,
+                row.get::<_, Option<String>>(14)?,
+                row.get::<_, i64>(15)?,
+                row.get::<_, Option<Vec<u8>>>(16)?,
+                row.get::<_, Option<String>>(17)?,
+                row.get::<_, Option<Vec<u8>>>(18)?,
             ))
         },
     )?;
@@ -2032,6 +2083,7 @@ pub fn get_clips_since(app: &AppHandle, our_device_id: &str, since: i64) -> Resu
             language,
             pinned,
             collection_sync_id,
+            sync_version,
             is_file,
             file_name,
             file_size,
@@ -2088,6 +2140,7 @@ pub fn get_clips_since(app: &AppHandle, our_device_id: &str, since: i64) -> Resu
             content_highlighted,
             language,
             metadata_sync: metadata_sync_enabled,
+            sync_version,
             pinned: metadata_sync_enabled && pinned != 0,
             collection_sync_id: if metadata_sync_enabled && !collection_sync_id.is_empty() {
                 Some(collection_sync_id)
@@ -2239,7 +2292,10 @@ async fn lookup_clip_for_push(
     key: &str,
 ) -> Result<Option<(WireClip, Option<Vec<u8>>)>> {
     let state = app.state::<AppState>();
-    let conn = state.db_read_pool.get().context("db read pool")?;
+    let conn = state
+        .db_write
+        .lock()
+        .map_err(|e| anyhow!("lock poisoned: {}", e))?;
     let metadata_sync_enabled = collections_and_pins_sync_enabled(app);
 
     let query_one = |sql: &str| -> Result<Option<(WireClip, Option<Vec<u8>>)>> {
@@ -2258,13 +2314,14 @@ async fn lookup_clip_for_push(
                     row.get::<_, Option<String>>(9)?,
                     row.get::<_, i64>(10)?,
                     row.get::<_, String>(11)?,
-                    row.get::<_, Option<Vec<u8>>>(12)?,
-                    row.get::<_, i64>(13)?,
-                    row.get::<_, Option<String>>(14)?,
-                    row.get::<_, i64>(15)?,
-                    row.get::<_, Option<Vec<u8>>>(16)?,
-                    row.get::<_, Option<String>>(17)?,
-                    row.get::<_, Option<Vec<u8>>>(18)?,
+                    row.get::<_, i64>(12)?,
+                    row.get::<_, Option<Vec<u8>>>(13)?,
+                    row.get::<_, i64>(14)?,
+                    row.get::<_, Option<String>>(15)?,
+                    row.get::<_, i64>(16)?,
+                    row.get::<_, Option<Vec<u8>>>(17)?,
+                    row.get::<_, Option<String>>(18)?,
+                    row.get::<_, Option<Vec<u8>>>(19)?,
                 ))
             })
             .optional()?;
@@ -2282,6 +2339,7 @@ async fn lookup_clip_for_push(
             language,
             pinned,
             collection_sync_id,
+            sync_version,
             image_data,
             is_file,
             file_name,
@@ -2329,6 +2387,7 @@ async fn lookup_clip_for_push(
                 content_highlighted,
                 language,
                 metadata_sync: metadata_sync_enabled,
+                sync_version,
                 pinned: metadata_sync_enabled && pinned != 0,
                 collection_sync_id: if metadata_sync_enabled && !collection_sync_id.is_empty() {
                     Some(collection_sync_id)
@@ -2360,6 +2419,7 @@ async fn lookup_clip_for_push(
                 language,
                 pinned,
                 COALESCE(collection_sync_id, ''),
+                COALESCE(sync_version, 0),
                 image_data,
                 COALESCE(is_file, 0),
                 file_name,
@@ -2390,6 +2450,7 @@ async fn lookup_clip_for_push(
                 language,
                 pinned,
                 COALESCE(collection_sync_id, ''),
+                COALESCE(sync_version, 0),
                 image_data,
                 COALESCE(is_file, 0),
                 file_name,
