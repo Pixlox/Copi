@@ -309,6 +309,40 @@ def expect_collection_count(state_map: dict, sync_id: str, expected_count: int) 
     return True, []
 
 
+def wait_for_collection_count(
+    host: str,
+    port: int,
+    sync_id: str,
+    expected_count: int,
+    timeout_s: float,
+) -> tuple[bool, dict, list[str]]:
+    start = time.time()
+    last_map = {}
+    errors = []
+    while time.time() - start < timeout_s:
+        try:
+            resp = send_cmd(host, port, {"cmd": "state"}, timeout=max(2.0, min(8.0, timeout_s / 3.0)))
+        except Exception as exc:
+            errors = [f"state command exception: {exc}"]
+            time.sleep(0.2)
+            continue
+
+        if not resp.get("ok"):
+            errors = [f"state command failed: {resp.get('message')}"]
+            time.sleep(0.2)
+            continue
+
+        last_map = state_to_map(resp.get("state") or {})
+        ok, count_errors = expect_collection_count(last_map, sync_id, expected_count)
+        if ok:
+            return True, last_map, []
+
+        errors = count_errors
+        time.sleep(0.2)
+
+    return False, last_map, errors
+
+
 def ensure_seed_and_toggle(host: str, port: int):
     # force metadata toggle on in case config drifted
     resp = send_cmd(host, port, {"cmd": "set_metadata_sync", "enabled": True}, timeout=20.0)
@@ -337,6 +371,8 @@ def run_delete_recopy_cycle(
     )
     if not copy_resp.get("ok"):
         return False, [f"cycle {cycle_index}: copy_text failed: {copy_resp.get('message')}"]
+
+    time.sleep(0.35)
 
     ok_local_copy, _, local_copy_errors = wait_for_clip_state(
         apply_host,
@@ -554,15 +590,21 @@ def main():
             win[0], win[1], QA_COLLECTION_SYNC_ID, args.timeout, expected_deleted=False
         )
         if ok:
-            count_ok, count_errors = expect_collection_count(state_map, QA_COLLECTION_SYNC_ID, 1)
+            count_ok, count_state_map, count_errors = wait_for_collection_count(
+                win[0],
+                win[1],
+                QA_COLLECTION_SYNC_ID,
+                1,
+                args.timeout,
+            )
             if count_ok:
                 print("COLLECTION COUNT mac->win phase=2: PASS")
             else:
                 print("COLLECTION COUNT mac->win phase=2: FAIL")
-                print_state("WIN:count-fail", state_map)
+                print_state("WIN:count-fail", count_state_map)
                 for e in count_errors:
                     print(f"  - {e}")
-                failures.append(("count-phase", "mac->win", 2, count_errors, state_map))
+                failures.append(("count-phase", "mac->win", 2, count_errors, count_state_map))
         else:
             print("COLLECTION COUNT mac->win phase=2: FAIL")
             print_state("WIN:count-fail", state_map)
