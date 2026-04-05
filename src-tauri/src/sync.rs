@@ -29,6 +29,7 @@ const RECONNECT_BACKOFF: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const PING_INTERVAL: Duration = Duration::from_secs(60);
 pub const FILE_AUTO_SYNC_MAX_BYTES: i64 = 10 * 1024 * 1024;
+const SYNC_VERSION_STRIDE: i64 = 1_i64 << 32;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
@@ -2750,15 +2751,59 @@ pub fn next_sync_version_from_conn(conn: &rusqlite::Connection) -> i64 {
         )
         .unwrap_or(0);
 
-    let next = current_setting
+    let max_seen = current_setting
         .max(max_clip_sync_version)
-        .max(max_collection_sync_version)
-        + 1;
+        .max(max_collection_sync_version);
+
+    let slot = sync_version_slot_from_conn(conn);
+    let base = max_seen.div_euclid(SYNC_VERSION_STRIDE);
+    let mut next = base
+        .saturating_mul(SYNC_VERSION_STRIDE)
+        .saturating_add(slot);
+
+    if next <= max_seen {
+        next = next.saturating_add(SYNC_VERSION_STRIDE);
+    }
+
+    if next <= max_seen {
+        next = max_seen.saturating_add(1);
+    }
+
     let _ = conn.execute(
         "INSERT OR REPLACE INTO settings(key, value) VALUES ('sync_version', ?1)",
         [next.to_string()],
     );
     next
+}
+
+fn sync_version_slot_from_conn(conn: &rusqlite::Connection) -> i64 {
+    let device_id: Option<String> = conn
+        .query_row("SELECT device_id FROM device_info LIMIT 1", [], |row| row.get(0))
+        .optional()
+        .ok()
+        .flatten()
+        .or_else(|| {
+            conn.query_row(
+                "SELECT value FROM settings WHERE key = 'sync_device_id' LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+        });
+
+    let Some(device_id) = device_id else {
+        return 1;
+    };
+
+    // Stable 32-bit FNV-1a hash.
+    let mut hash: u32 = 0x811C9DC5;
+    for byte in device_id.as_bytes() {
+        hash ^= *byte as u32;
+        hash = hash.wrapping_mul(0x01000193);
+    }
+    hash as i64
 }
 
 pub fn ensure_sync_version_floor(conn: &rusqlite::Connection, floor: i64) {
