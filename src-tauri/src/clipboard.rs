@@ -837,6 +837,30 @@ fn parse_file_uri_list(text: &str) -> Vec<PathBuf> {
 mod tests {
     use super::*;
 
+    fn file_uri_for_path(path: &std::path::Path) -> String {
+        let raw = path.to_string_lossy().replace('\\', "/");
+        #[cfg(target_os = "windows")]
+        {
+            format!("file:///{}", raw.trim_start_matches('/'))
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            format!("file://{}", raw)
+        }
+    }
+
+    fn localhost_file_uri_for_path(path: &std::path::Path) -> String {
+        let raw = path.to_string_lossy().replace('\\', "/");
+        #[cfg(target_os = "windows")]
+        {
+            format!("file://localhost/{}", raw.trim_start_matches('/'))
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            format!("file://localhost{}", raw)
+        }
+    }
+
     #[test]
     fn percent_decode_uri_decodes_spaces() {
         let decoded = percent_decode_uri("/tmp/my%20file.txt");
@@ -848,7 +872,7 @@ mod tests {
         let temp = std::env::temp_dir().join("copi_clipboard_uri_test_existing.txt");
         std::fs::write(&temp, b"ok").unwrap();
 
-        let existing_uri = format!("file://{}", temp.to_string_lossy());
+        let existing_uri = file_uri_for_path(&temp);
         let text = format!(
             "{}\nfile:///definitely-not-existing-copi-path",
             existing_uri
@@ -866,7 +890,7 @@ mod tests {
         let temp = std::env::temp_dir().join("copi_clipboard_uri_test_localhost.txt");
         std::fs::write(&temp, b"ok").unwrap();
 
-        let uri = format!("file://localhost{}", temp.to_string_lossy());
+        let uri = localhost_file_uri_for_path(&temp);
         let decoded = decode_file_uri_path(&uri).unwrap();
 
         assert_eq!(decoded, temp);
