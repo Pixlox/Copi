@@ -1616,57 +1616,61 @@ async fn run_session(
         }
     });
 
-    let mut ping = tokio::time::interval(PING_INTERVAL);
-    let session_result = loop {
-        tokio::select! {
-            read_result = read_frame(&mut reader) => {
-                match read_result {
-                    Ok(None) => break Ok(()),
-                    Ok(Some(frame)) => {
-                        let outer: Msg = match serde_json::from_slice(&frame) {
-                            Ok(msg) => msg,
-                            Err(error) => {
-                                let raw = String::from_utf8_lossy(&frame);
-                                let prefix: String = raw.chars().take(80).collect();
-                                let bytes: Vec<u8> = frame.iter().take(24).copied().collect();
-                                eprintln!("[Sync] Failed to parse message from {}: {}", peer_id, error);
-                                eprintln!(
-                                    "[Sync] Parse raw prefix from {}: {:?} bytes={:02X?}",
-                                    peer_id,
-                                    prefix,
-                                    bytes
-                                );
-                                break Err(anyhow!("invalid message from peer"));
-                            }
-                        };
-                        let msg = match outer {
-                            Msg::Secure { nonce, payload } => {
-                                match secure_receiver.decrypt_msg(nonce, &payload) {
-                                    Ok(msg) => msg,
-                                    Err(error) => {
-                                        eprintln!("[Sync] Failed to decrypt message from {}: {}", peer_id, error);
-                                        break Err(anyhow!("failed to decrypt message"));
-                                    }
-                                }
-                            }
-                            _ => {
-                                break Err(anyhow!("received unencrypted message from trusted peer"));
-                            }
-                        };
-                        if let Err(error) = handle_message(&app, &sync, &peer_id, &secure_writer, msg).await {
-                            break Err(error);
-                        }
-                    }
-                    Err(error) => break Err(anyhow!("read frame error: {}", error)),
-                }
+    let ping_writer = secure_writer.clone();
+    let ping_peer = peer_id.clone();
+    let ping_task = tauri::async_runtime::spawn(async move {
+        let mut ping = tokio::time::interval(PING_INTERVAL);
+        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ping.tick().await;
+            if let Err(error) = ping_writer.send(&Msg::Ping).await {
+                eprintln!("[Sync] Ping send failed to {}: {}", ping_peer, error);
+                break;
             }
-            _ = ping.tick() => {
-                if let Err(error) = secure_writer.send(&Msg::Ping).await {
+        }
+    });
+
+    let session_result = loop {
+        match read_frame(&mut reader).await {
+            Ok(None) => break Ok(()),
+            Ok(Some(frame)) => {
+                let outer: Msg = match serde_json::from_slice(&frame) {
+                    Ok(msg) => msg,
+                    Err(error) => {
+                        let raw = String::from_utf8_lossy(&frame);
+                        let prefix: String = raw.chars().take(80).collect();
+                        let bytes: Vec<u8> = frame.iter().take(24).copied().collect();
+                        eprintln!("[Sync] Failed to parse message from {}: {}", peer_id, error);
+                        eprintln!(
+                            "[Sync] Parse raw prefix from {}: {:?} bytes={:02X?}",
+                            peer_id,
+                            prefix,
+                            bytes
+                        );
+                        break Err(anyhow!("invalid message from peer"));
+                    }
+                };
+                let msg = match outer {
+                    Msg::Secure { nonce, payload } => match secure_receiver.decrypt_msg(nonce, &payload) {
+                        Ok(msg) => msg,
+                        Err(error) => {
+                            eprintln!("[Sync] Failed to decrypt message from {}: {}", peer_id, error);
+                            break Err(anyhow!("failed to decrypt message"));
+                        }
+                    },
+                    _ => {
+                        break Err(anyhow!("received unencrypted message from trusted peer"));
+                    }
+                };
+                if let Err(error) = handle_message(&app, &sync, &peer_id, &secure_writer, msg).await {
                     break Err(error);
                 }
             }
+            Err(error) => break Err(anyhow!("read frame error: {}", error)),
         }
     };
+
+    ping_task.abort();
 
     sync.unregister_peer_if_current(&peer_id, session_token)
         .await;
