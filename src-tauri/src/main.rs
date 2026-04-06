@@ -1044,10 +1044,35 @@ fn open_external_url(url: String) -> Result<(), String> {
 
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", trimmed])
-            .spawn()
-            .map_err(|e| e.to_string())?;
+        use std::ffi::OsStr;
+        use std::iter;
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+        let operation: Vec<u16> = OsStr::new("open")
+            .encode_wide()
+            .chain(iter::once(0))
+            .collect();
+        let target: Vec<u16> = OsStr::new(trimmed)
+            .encode_wide()
+            .chain(iter::once(0))
+            .collect();
+
+        let result = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                operation.as_ptr(),
+                target.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        } as isize;
+
+        if result <= 32 {
+            return Err(format!("failed to open url (ShellExecuteW code {})", result));
+        }
         return Ok(());
     }
 

@@ -300,6 +300,7 @@ pub struct SyncState {
     live: RwLock<HashMap<String, LivePeer>>,
     live_token: AtomicU64,
     connecting: RwLock<HashSet<String>>,
+    reconnect_loops: Mutex<HashMap<String, u64>>,
     known_addrs: RwLock<HashMap<String, SocketAddr>>,
     discovered: RwLock<HashMap<String, DiscoveredPeer>>,
     pairing_pin: Mutex<Option<(String, Instant)>>,
@@ -507,8 +508,6 @@ pub fn start_sync(app: AppHandle) -> Arc<SyncState> {
         }
     };
 
-    ensure_windows_firewall_rules(SYNC_PORT);
-
     eprintln!(
         "[Sync] Creating mDNS daemon for device_id={} device_name={}",
         device_id, device_name
@@ -560,6 +559,7 @@ pub fn start_sync(app: AppHandle) -> Arc<SyncState> {
         live: RwLock::new(HashMap::new()),
         live_token: AtomicU64::new(0),
         connecting: RwLock::new(HashSet::new()),
+        reconnect_loops: Mutex::new(HashMap::new()),
         known_addrs: RwLock::new(HashMap::new()),
         discovered: RwLock::new(HashMap::new()),
         pairing_pin: Mutex::new(None),
@@ -580,6 +580,7 @@ fn enable_runtime(app: AppHandle, sync: Arc<SyncState>) {
     sync.enabled.store(true, Ordering::SeqCst);
     let generation = sync.generation.fetch_add(1, Ordering::SeqCst) + 1;
     eprintln!("[Sync] Runtime enabled (generation={})", generation);
+    ensure_windows_firewall_rules(SYNC_PORT);
 
     let peers_with_addrs = get_trusted_peers_with_addrs(&app).unwrap_or_default();
     eprintln!("[Sync] Loaded {} trusted peers", peers_with_addrs.len());
@@ -620,9 +621,46 @@ async fn disable_runtime(sync: Arc<SyncState>) {
     sync.generation.fetch_add(1, Ordering::SeqCst);
     sync.live.write().await.clear();
     sync.connecting.write().await.clear();
+    if let Ok(mut guard) = sync.reconnect_loops.lock() {
+        guard.clear();
+    }
     sync.known_addrs.write().await.clear();
     sync.discovered.write().await.clear();
     eprintln!("[Sync] Runtime disabled");
+}
+
+fn ensure_reconnect_loop(app: AppHandle, sync: Arc<SyncState>, peer_id: String, generation: u64) {
+    if !sync.is_enabled() || sync.current_generation() != generation {
+        return;
+    }
+
+    {
+        let Ok(mut guard) = sync.reconnect_loops.lock() else {
+            return;
+        };
+
+        if guard.get(&peer_id).copied() == Some(generation) {
+            return;
+        }
+
+        guard.insert(peer_id.clone(), generation);
+    }
+
+    eprintln!(
+        "[Sync] Starting reconnect loop for trusted peer: {}",
+        peer_id
+    );
+
+    tauri::async_runtime::spawn(async move {
+        reconnect_loop(app, sync.clone(), peer_id.clone(), generation).await;
+
+        if let Ok(mut guard) = sync.reconnect_loops.lock() {
+            let should_remove = guard.get(&peer_id).copied() == Some(generation);
+            if should_remove {
+                guard.remove(&peer_id);
+            }
+        }
+    });
 }
 
 async fn run_server(app: AppHandle, sync: Arc<SyncState>, generation: u64) {
@@ -709,16 +747,7 @@ async fn run_browser(
 
     eprintln!("[Sync] {} trusted peers to reconnect", trusted_peers.len());
     for peer in &trusted_peers {
-        let app_clone = app.clone();
-        let sync_clone = sync.clone();
-        let peer_id = peer.device_id.clone();
-        eprintln!(
-            "[Sync] Starting reconnect loop for trusted peer: {}",
-            peer_id
-        );
-        tauri::async_runtime::spawn(async move {
-            reconnect_loop(app_clone, sync_clone, peer_id, generation).await;
-        });
+        ensure_reconnect_loop(app.clone(), sync.clone(), peer.device_id.clone(), generation);
     }
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -797,11 +826,14 @@ async fn run_browser(
                     );
                     if trusted {
                         let _ = update_peer_address(&app, &peer_id, peer_addr);
+                        ensure_reconnect_loop(
+                            app.clone(),
+                            sync.clone(),
+                            peer_id.clone(),
+                            generation,
+                        );
                         if !auto_connect_enabled(&app) {
                             eprintln!("[Sync] Auto-connect disabled; not dialing {}", peer_id);
-                            continue;
-                        }
-                        if !should_initiate_connection(&sync.device_id, &peer_id) {
                             continue;
                         }
                         let is_connected = sync.connected_peers().await.contains(&peer_id);
@@ -849,17 +881,32 @@ async fn reconnect_loop(app: AppHandle, sync: Arc<SyncState>, peer_id: String, g
         if !sync.is_enabled() || sync.current_generation() != generation {
             break;
         }
+
+        match is_trusted_peer(&app, &peer_id) {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!(
+                    "[Sync] Stopping reconnect loop for untrusted peer {}",
+                    peer_id
+                );
+                break;
+            }
+            Err(error) => {
+                eprintln!(
+                    "[Sync] Trusted-peer check failed for {}: {}",
+                    peer_id, error
+                );
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+        }
+
         if sync.connected_peers().await.contains(&peer_id) {
             tokio::time::sleep(Duration::from_secs(5)).await;
             continue;
         }
 
         if !auto_connect_enabled(&app) {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            continue;
-        }
-
-        if !should_initiate_connection(&sync.device_id, &peer_id) {
             tokio::time::sleep(Duration::from_secs(5)).await;
             continue;
         }
@@ -997,6 +1044,20 @@ async fn run_session(
                 save_trusted_peer_with_key(&app, &device_id, &device_name, Some(&public_key))?;
                 if let Some(addr) = peer_addr {
                     let _ = update_peer_address(&app, &device_id, addr);
+                    let mut known = sync.known_addrs.write().await;
+                    let existing = known.get(&device_id).copied();
+                    let chosen = prefer_addr(existing, addr);
+                    if existing != Some(chosen) {
+                        eprintln!(
+                            "[Sync] Peer {} address updated {} -> {}",
+                            device_id,
+                            existing
+                                .map(|value| value.to_string())
+                                .unwrap_or_else(|| "<none>".to_string()),
+                            chosen
+                        );
+                    }
+                    known.insert(device_id.clone(), chosen);
                 }
                 sync.clear_pin();
                 raw_writer
@@ -1009,9 +1070,15 @@ async fn run_session(
                 let _ = app.emit(
                     "sync:paired",
                     PairedEvent {
-                        device_id,
-                        display_name: device_name,
+                        device_id: device_id.clone(),
+                        display_name: device_name.clone(),
                     },
+                );
+                ensure_reconnect_loop(
+                    app.clone(),
+                    sync.clone(),
+                    device_id.clone(),
+                    sync.current_generation(),
                 );
                 return Ok(());
             } else {
@@ -2380,7 +2447,11 @@ fn addr_quality(ip: IpAddr) -> u8 {
 fn prefer_addr(existing: Option<SocketAddr>, candidate: SocketAddr) -> SocketAddr {
     match existing {
         Some(current) => {
-            if addr_quality(candidate.ip()) > addr_quality(current.ip()) {
+            let candidate_quality = addr_quality(candidate.ip());
+            let current_quality = addr_quality(current.ip());
+            if candidate_quality > current_quality {
+                candidate
+            } else if candidate_quality == current_quality && candidate != current {
                 candidate
             } else {
                 current
@@ -2408,13 +2479,12 @@ fn extract_peer_id(fullname: &str) -> String {
         .unwrap_or_default()
 }
 
-fn should_initiate_connection(our_device_id: &str, peer_device_id: &str) -> bool {
-    our_device_id < peer_device_id
-}
-
 #[cfg(target_os = "windows")]
 fn ensure_windows_firewall_rules(listen_port: u16) {
+    use std::os::windows::process::CommandExt;
     use std::process::Command;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     let tcp_rule = format!("Copi LAN Sync TCP {}", listen_port);
     let mdns_rule = "Copi mDNS UDP 5353";
@@ -2431,24 +2501,33 @@ fn ensure_windows_firewall_rules(listen_port: u16) {
         .collect();
     let b64 = B64.encode(&utf16_bytes);
 
-    if let Ok(output) = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-EncodedCommand",
-            &b64,
-        ])
-        .output()
-    {
-        if !output.status.success() {
-            eprintln!(
-                "[Sync] Firewall rule command failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+    std::thread::spawn(move || {
+        let output = Command::new("powershell.exe")
+            .creation_flags(CREATE_NO_WINDOW)
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-EncodedCommand",
+                &b64,
+            ])
+            .output();
+
+        match output {
+            Ok(output) => {
+                if !output.status.success() {
+                    eprintln!(
+                        "[Sync] Firewall rule command failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+            }
+            Err(error) => {
+                eprintln!("[Sync] Failed to run firewall rule command: {}", error);
+            }
         }
-    }
+    });
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -2766,6 +2845,16 @@ pub async fn sync_pair_with(
                 let mut known = sync.known_addrs.write().await;
                 let existing = known.get(&device_id).copied();
                 let chosen = prefer_addr(existing, peer_addr);
+                if existing != Some(chosen) {
+                    eprintln!(
+                        "[Sync] Peer {} address updated {} -> {}",
+                        device_id,
+                        existing
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "<none>".to_string()),
+                        chosen
+                    );
+                }
                 known.insert(device_id.clone(), chosen);
             }
             let _ = app.emit(
@@ -2774,6 +2863,12 @@ pub async fn sync_pair_with(
                     device_id: device_id.clone(),
                     display_name: device_name,
                 },
+            );
+            ensure_reconnect_loop(
+                app.clone(),
+                sync.clone(),
+                device_id.clone(),
+                sync.current_generation(),
             );
 
             let app_clone = app.clone();
@@ -2794,6 +2889,12 @@ pub async fn sync_remove_peer(app: AppHandle, device_id: String) -> Result<(), S
     remove_trusted_peer(&app, &device_id).map_err(|e| e.to_string())?;
     if let Some(sync) = app.state::<AppState>().sync.get() {
         sync.unregister_peer(&device_id).await;
+        sync.known_addrs.write().await.remove(&device_id);
+        sync.connecting.write().await.remove(&device_id);
+        sync.discovered.write().await.remove(&device_id);
+        if let Ok(mut guard) = sync.reconnect_loops.lock() {
+            guard.remove(&device_id);
+        }
     }
     Ok(())
 }
