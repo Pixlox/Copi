@@ -1,7 +1,8 @@
-import { useEffect, useState, useCallback, useRef } from "react";
+import { useEffect, useState, useCallback, useRef, type MouseEvent as ReactMouseEvent } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   Keyboard,
   Palette,
@@ -1333,6 +1334,17 @@ export default function Settings() {
     }
   };
 
+  const handleWindowDragStart = useCallback((event: ReactMouseEvent<HTMLElement>) => {
+    if (!isMacPlatform || event.button !== 0) return;
+
+    const target = event.target as HTMLElement;
+    if (target.closest("button, input, textarea, select, a, [role='button'], [data-no-drag]")) {
+      return;
+    }
+
+    void getCurrentWindow().startDragging();
+  }, []);
+
   if (!config) {
     return (
       <div className="settings-root settings-loading">
@@ -1346,7 +1358,8 @@ export default function Settings() {
   return (
     <div className="settings-root">
       {/* ── Sidebar ─────────────────────────────────────────────────── */}
-      <aside className="settings-sidebar">
+      <aside className="settings-sidebar" onMouseDown={handleWindowDragStart}>
+        {isMacPlatform && <div className="settings-sidebar-header" aria-hidden="true" />}
         <div className="settings-sidebar-brand">
           <Logo size={28} />
           <span>Copi</span>
@@ -1372,7 +1385,7 @@ export default function Settings() {
 
       {/* ── Content ─────────────────────────────────────────────────── */}
       <main className="settings-content">
-        <header className="settings-content-header">
+        <header className="settings-content-header" onMouseDown={handleWindowDragStart}>
           <h1>{activeSectionData.label}</h1>
         </header>
 
