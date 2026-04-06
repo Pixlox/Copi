@@ -3365,3 +3365,37 @@ pub fn on_collection_changed(app: &AppHandle) {
         }
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{extract_peer_id, parse_target_addr, prefer_addr, SYNC_PORT};
+    use std::net::SocketAddr;
+
+    #[test]
+    fn prefer_addr_uses_higher_quality_candidate() {
+        let existing: SocketAddr = "[fe80::1]:51827".parse().unwrap();
+        let candidate: SocketAddr = "192.168.1.44:51827".parse().unwrap();
+
+        assert_eq!(prefer_addr(Some(existing), candidate), candidate);
+    }
+
+    #[test]
+    fn prefer_addr_rotates_on_equal_quality() {
+        let existing: SocketAddr = "192.168.1.44:51827".parse().unwrap();
+        let candidate: SocketAddr = "192.168.1.52:51827".parse().unwrap();
+
+        assert_eq!(prefer_addr(Some(existing), candidate), candidate);
+    }
+
+    #[test]
+    fn parse_target_addr_defaults_to_sync_port() {
+        let parsed = parse_target_addr("192.168.1.120").unwrap();
+        assert_eq!(parsed, format!("192.168.1.120:{}", SYNC_PORT).parse().unwrap());
+    }
+
+    #[test]
+    fn extract_peer_id_from_mdns_fullname() {
+        let peer_id = extract_peer_id("device-123._copi._tcp.local.");
+        assert_eq!(peer_id, "device-123");
+    }
+}
