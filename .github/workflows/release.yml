@@ -43,6 +43,38 @@ jobs:
         if: runner.os == 'Windows'
         run: choco install wixtoolset --no-progress -y
 
+      - name: Configure WiX path
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $wixDir = $null
+          foreach ($root in @('C:\Program Files (x86)', 'C:\Program Files')) {
+            if (-not (Test-Path $root)) {
+              continue
+            }
+
+            $candidate = Get-ChildItem $root -Directory -Filter 'WiX Toolset*' -ErrorAction SilentlyContinue |
+              Where-Object { Test-Path (Join-Path $_.FullName 'bin\candle.exe') } |
+              Sort-Object FullName -Descending |
+              Select-Object -First 1
+
+            if ($candidate) {
+              $wixDir = $candidate.FullName
+              break
+            }
+          }
+
+          if (-not $wixDir) {
+            throw 'WiX toolset not found after installation.'
+          }
+
+          $wixBin = Join-Path $wixDir 'bin'
+          $wixBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "WIX=$wixDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          where.exe candle.exe
+          where.exe light.exe
+
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:

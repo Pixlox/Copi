@@ -72,14 +72,14 @@
     "windows": {
       "wix": {
         "fragmentPaths": [
-          "../../wix/firewall.wxs"
+          "../wix/firewall.wxs"
         ],
         "componentGroupRefs": [
           "CopiSyncFirewall"
         ]
       },
       "nsis": {
-        "installerHooks": "../../wix/firewall-hooks.nsh"
+        "installerHooks": "../wix/firewall-hooks.nsh"
       }
     },
     "icon": [
