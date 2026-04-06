@@ -597,50 +597,88 @@ fn main() {
                         }
                     }
 
-                    let explicit_test_file = std::env::var("COPI_WORMHOLE_TEST_FILE").ok();
-                    if let Some(path) = explicit_test_file {
-                        eprintln!(
-                            "[Wormhole Test] Offering explicit file from COPI_WORMHOLE_TEST_FILE: {}",
-                            path
-                        );
-                        match wormhole::wormhole_offer_file(path.clone(), test_handle.clone()).await {
-                            Ok(file) => {
-                                eprintln!(
-                                    "[Wormhole Test] Local offer OK: {} ({}, {} bytes)",
-                                    file.file_name, file.id, file.file_size
-                                );
-                                #[cfg(target_os = "windows")]
-                                log_startup_line("[Wormhole Test] local offer ok");
+                    let test_mode = std::env::var("COPI_WORMHOLE_TEST_MODE")
+                        .unwrap_or_else(|_| "both".to_string());
+                    let do_offer = !matches!(test_mode.as_str(), "offer_skip" | "download_only");
+                    let do_download = !matches!(test_mode.as_str(), "download_skip" | "offer_only");
+
+                    eprintln!(
+                        "[Wormhole Test] mode={} do_offer={} do_download={}",
+                        test_mode, do_offer, do_download
+                    );
+                    #[cfg(target_os = "windows")]
+                    log_startup_line(&format!(
+                        "[Wormhole Test] mode={} offer={} download={}",
+                        test_mode, do_offer, do_download
+                    ));
+
+                    let preferred_remote_offer_id = std::env::var("COPI_WORMHOLE_DOWNLOAD_FILE_ID").ok();
+                    let expected_remote_name = std::env::var("COPI_WORMHOLE_EXPECT_REMOTE_NAME").ok();
+
+                    if do_offer {
+                        let explicit_test_file = std::env::var("COPI_WORMHOLE_TEST_FILE").ok();
+                        if let Some(path) = explicit_test_file {
+                            eprintln!(
+                                "[Wormhole Test] Offering explicit file from COPI_WORMHOLE_TEST_FILE: {}",
+                                path
+                            );
+                            match wormhole::wormhole_offer_file(path.clone(), test_handle.clone()).await {
+                                Ok(file) => {
+                                    eprintln!(
+                                        "[Wormhole Test] Local offer OK: {} ({}, {} bytes)",
+                                        file.file_name, file.id, file.file_size
+                                    );
+                                    #[cfg(target_os = "windows")]
+                                    log_startup_line(&format!(
+                                        "[Wormhole Test] local offer ok: {} {} bytes",
+                                        file.id, file.file_size
+                                    ));
+                                }
+                                Err(e) => {
+                                    eprintln!("[Wormhole Test] Local offer FAILED: {}", e);
+                                    #[cfg(target_os = "windows")]
+                                    log_startup_line(&format!(
+                                        "[Wormhole Test] local offer failed: {}",
+                                        e
+                                    ));
+                                    return;
+                                }
                             }
-                            Err(e) => {
-                                eprintln!("[Wormhole Test] Local offer FAILED: {}", e);
-                                #[cfg(target_os = "windows")]
-                                log_startup_line(&format!("[Wormhole Test] local offer failed: {}", e));
-                                return;
+                        } else {
+                            eprintln!("[Wormhole Test] Running wormhole_debug_test (offer local test file)...");
+                            match wormhole::wormhole_debug_test(test_handle.clone()).await {
+                                Ok(result) => {
+                                    eprintln!("[Wormhole Test] Local offer OK:\n{}", result);
+                                    #[cfg(target_os = "windows")]
+                                    log_startup_line("[Wormhole Test] local offer ok");
+                                }
+                                Err(e) => {
+                                    eprintln!("[Wormhole Test] Local offer FAILED: {}", e);
+                                    #[cfg(target_os = "windows")]
+                                    log_startup_line(&format!(
+                                        "[Wormhole Test] local offer failed: {}",
+                                        e
+                                    ));
+                                    return;
+                                }
                             }
                         }
                     } else {
-                        eprintln!("[Wormhole Test] Running wormhole_debug_test (offer local test file)...");
-                        match wormhole::wormhole_debug_test(test_handle.clone()).await {
-                            Ok(result) => {
-                                eprintln!("[Wormhole Test] Local offer OK:\n{}", result);
-                                #[cfg(target_os = "windows")]
-                                log_startup_line("[Wormhole Test] local offer ok");
-                            }
-                            Err(e) => {
-                                eprintln!("[Wormhole Test] Local offer FAILED: {}", e);
-                                #[cfg(target_os = "windows")]
-                                log_startup_line(&format!("[Wormhole Test] local offer failed: {}", e));
-                                return;
-                            }
-                        }
+                        eprintln!("[Wormhole Test] Skipping local offer (download-only mode)");
+                        #[cfg(target_os = "windows")]
+                        log_startup_line("[Wormhole Test] skipping local offer");
                     }
 
-                    let preferred_remote_offer_id = std::env::var("COPI_WORMHOLE_DOWNLOAD_FILE_ID").ok();
+                    if !do_download {
+                        eprintln!("[Wormhole Test] Skipping remote download (offer-only mode)");
+                        #[cfg(target_os = "windows")]
+                        log_startup_line("[Wormhole Test] skipping remote download");
+                        return;
+                    }
 
                     // Try to find a remote offer and download it.
                     let mut target_remote_file: Option<String> = None;
-                    for attempt in 1..=30 {
+                    for attempt in 1..=45 {
                         match wormhole::wormhole_list_files(test_handle.clone()).await {
                             Ok(files) => {
                                 if target_remote_file.is_none() {
@@ -648,6 +686,10 @@ fn main() {
                                         files.iter().find(|f| {
                                             !f.is_local
                                                 && f.id == *preferred_id
+                                                && expected_remote_name
+                                                    .as_ref()
+                                                    .map(|name| &f.file_name == name)
+                                                    .unwrap_or(true)
                                                 && matches!(
                                                     f.status,
                                                     wormhole::WormholeStatus::Pending
@@ -657,6 +699,10 @@ fn main() {
                                     } else {
                                         files.iter().find(|f| {
                                             !f.is_local
+                                                && expected_remote_name
+                                                    .as_ref()
+                                                    .map(|name| &f.file_name == name)
+                                                    .unwrap_or(true)
                                                 && matches!(
                                                     f.status,
                                                     wormhole::WormholeStatus::Pending
@@ -672,8 +718,8 @@ fn main() {
                                         );
                                         #[cfg(target_os = "windows")]
                                         log_startup_line(&format!(
-                                            "[Wormhole Test] requesting download: {}",
-                                            file.id
+                                            "[Wormhole Test] requesting download: {} {}",
+                                            file.id, file.file_name
                                         ));
                                         if let Err(e) =
                                             wormhole::wormhole_request_download(file.id.clone(), test_handle.clone())
@@ -696,13 +742,20 @@ fn main() {
                                         match remote_file.status {
                                             wormhole::WormholeStatus::Completed => {
                                                 eprintln!(
-                                                    "[Wormhole Test] Download completed for {} ({})",
-                                                    remote_file.file_name, remote_file.id
+                                                    "[Wormhole Test] Download completed for {} ({}) bytes={}/{} path={:?}",
+                                                    remote_file.file_name,
+                                                    remote_file.id,
+                                                    remote_file.bytes_transferred,
+                                                    remote_file.file_size,
+                                                    remote_file.local_path
                                                 );
                                                 #[cfg(target_os = "windows")]
                                                 log_startup_line(&format!(
-                                                    "[Wormhole Test] download completed: {}",
-                                                    remote_file.id
+                                                    "[Wormhole Test] download completed: {} bytes={}/{} path={}",
+                                                    remote_file.id,
+                                                    remote_file.bytes_transferred,
+                                                    remote_file.file_size,
+                                                    remote_file.local_path.clone().unwrap_or_default()
                                                 ));
                                                 return;
                                             }
@@ -731,7 +784,10 @@ fn main() {
                         }
 
                         if attempt % 5 == 0 {
-                            eprintln!("[Wormhole Test] Waiting for remote offer/download progress (attempt {})", attempt);
+                            eprintln!(
+                                "[Wormhole Test] Waiting for remote offer/download progress (attempt {})",
+                                attempt
+                            );
                         }
                         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     }
