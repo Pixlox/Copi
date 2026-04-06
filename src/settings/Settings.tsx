@@ -53,6 +53,7 @@ interface CopiConfig {
     auto_connect: boolean;
     sync_embeddings: boolean;
     sync_collections_and_pins: boolean;
+    wormhole_expiration_hours?: number | null;
   };
 }
 
@@ -700,6 +701,35 @@ function SyncSection() {
               }));
             }}
           />
+        </SettingRow>
+        <SettingDivider />
+        <SettingRow
+          label="Wormhole Expiration"
+          description="How long wormhole offers stay available"
+        >
+          <select
+            className="settings-sync-input"
+            data-no-drag
+            value={String(config?.sync.wormhole_expiration_hours ?? 24)}
+            onChange={(event) => {
+              const hours = Number(event.target.value);
+              void saveSyncConfig((cfg) => ({
+                ...cfg,
+                sync: {
+                  ...cfg.sync,
+                  wormhole_expiration_hours:
+                    Number.isFinite(hours) && hours > 0 ? Math.trunc(hours) : 24,
+                },
+              }));
+            }}
+          >
+            <option value="1">1 hour</option>
+            <option value="6">6 hours</option>
+            <option value="12">12 hours</option>
+            <option value="24">24 hours</option>
+            <option value="48">48 hours</option>
+            <option value="72">72 hours</option>
+          </select>
         </SettingRow>
       </SettingCard>
 

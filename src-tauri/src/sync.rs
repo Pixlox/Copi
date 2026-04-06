@@ -1447,6 +1447,53 @@ async fn run_session(
                 );
             }
         }
+
+        // Send current local wormhole offers to newly connected peer so
+        // offers created while the peer was offline still appear remotely.
+        let wormhole_offers = {
+            let state = app_bootstrap.state::<AppState>();
+            let files = match state.db_read_pool.get() {
+                Ok(conn) => crate::wormhole::list_wormhole_files(&conn).unwrap_or_default(),
+                Err(_) => Vec::new(),
+            };
+
+            files
+                .into_iter()
+                .filter(|f| {
+                    f.is_local
+                        && matches!(
+                            f.status,
+                            crate::wormhole::WormholeStatus::Available
+                                | crate::wormhole::WormholeStatus::Pending
+                        )
+                })
+                .map(|f| crate::wormhole::WormholeOffer {
+                    id: f.id,
+                    file_name: f.file_name,
+                    file_size: f.file_size,
+                    mime_type: f.mime_type,
+                    checksum: f.checksum,
+                    expires_at: f.expires_at,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        if !wormhole_offers.is_empty() {
+            eprintln!(
+                "[Wormhole] Sending {} existing offers to peer {}",
+                wormhole_offers.len(),
+                peer_bootstrap
+            );
+            for offer in wormhole_offers {
+                if let Err(error) = writer_bootstrap.send(&Msg::WormholeOffer(offer)).await {
+                    eprintln!(
+                        "[Wormhole] Failed to send existing offer to peer {}: {}",
+                        peer_bootstrap, error
+                    );
+                    break;
+                }
+            }
+        }
     });
 
     let mut ping = tokio::time::interval(PING_INTERVAL);
@@ -3541,11 +3588,42 @@ async fn handle_wormhole_offer(
         expires_at: offer.expires_at.clone(),
     };
 
-    // Insert into database
+    // Upsert into database (offers can be re-broadcast)
     {
         let state = app.state::<AppState>();
         let conn = state.db_write.lock().map_err(|e| anyhow!("lock: {}", e))?;
-        crate::wormhole::insert_wormhole_file(&conn, &wormhole_file)?;
+        if crate::wormhole::get_wormhole_file(&conn, &offer.id)?.is_some() {
+            conn.execute(
+                "UPDATE wormhole_files SET
+                    file_name = ?1,
+                    file_size = ?2,
+                    mime_type = ?3,
+                    checksum = ?4,
+                    origin_device_id = ?5,
+                    origin_device_name = ?6,
+                    is_local = 0,
+                    status = ?7,
+                    bytes_transferred = 0,
+                    transfer_started_at = NULL,
+                    transfer_completed_at = NULL,
+                    local_path = NULL,
+                    expires_at = ?8
+                 WHERE id = ?9",
+                rusqlite::params![
+                    &wormhole_file.file_name,
+                    wormhole_file.file_size as i64,
+                    &wormhole_file.mime_type,
+                    &wormhole_file.checksum,
+                    &wormhole_file.origin_device_id,
+                    &wormhole_file.origin_device_name,
+                    crate::wormhole::WormholeStatus::Available.as_str(),
+                    &wormhole_file.expires_at,
+                    &wormhole_file.id,
+                ],
+            )?;
+        } else {
+            crate::wormhole::insert_wormhole_file(&conn, &wormhole_file)?;
+        }
     }
 
     // Emit event to UI

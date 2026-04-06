@@ -572,6 +572,136 @@ fn main() {
             eprintln!("[Copi] Ready. Press hotkey to open overlay.");
             #[cfg(target_os = "windows")]
             log_startup_line("setup completed successfully");
+            
+            // Wormhole test mode: set COPI_WORMHOLE_TEST=1 to run terminal-only E2E checks.
+            if std::env::var("COPI_WORMHOLE_TEST").is_ok() {
+                let test_handle = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    #[cfg(target_os = "windows")]
+                    log_startup_line("[Wormhole Test] started");
+
+                    eprintln!("[Wormhole Test] Waiting 5s for sync to establish...");
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+                    eprintln!("[Wormhole Test] Running wormhole_debug_sync_status...");
+                    match wormhole::wormhole_debug_sync_status(test_handle.clone()).await {
+                        Ok(result) => {
+                            eprintln!("[Wormhole Test] Sync status:\n{}", result);
+                            #[cfg(target_os = "windows")]
+                            log_startup_line(&format!("[Wormhole Test] sync status: {}", result.replace('\n', " | ")));
+                        }
+                        Err(e) => {
+                            eprintln!("[Wormhole Test] Sync status failed: {}", e);
+                            #[cfg(target_os = "windows")]
+                            log_startup_line(&format!("[Wormhole Test] sync status failed: {}", e));
+                        }
+                    }
+
+                    eprintln!("[Wormhole Test] Running wormhole_debug_test (offer local test file)...");
+                    match wormhole::wormhole_debug_test(test_handle.clone()).await {
+                        Ok(result) => {
+                            eprintln!("[Wormhole Test] Local offer OK:\n{}", result);
+                            #[cfg(target_os = "windows")]
+                            log_startup_line("[Wormhole Test] local offer ok");
+                        }
+                        Err(e) => {
+                            eprintln!("[Wormhole Test] Local offer FAILED: {}", e);
+                            #[cfg(target_os = "windows")]
+                            log_startup_line(&format!("[Wormhole Test] local offer failed: {}", e));
+                            return;
+                        }
+                    }
+
+                    // Try to find a remote offer and download it.
+                    let mut target_remote_file: Option<String> = None;
+                    for attempt in 1..=30 {
+                        match wormhole::wormhole_list_files(test_handle.clone()).await {
+                            Ok(files) => {
+                                if target_remote_file.is_none() {
+                                    if let Some(file) = files.iter().find(|f| {
+                                        !f.is_local
+                                            && matches!(
+                                                f.status,
+                                                wormhole::WormholeStatus::Pending
+                                                    | wormhole::WormholeStatus::Available
+                                            )
+                                    }) {
+                                        eprintln!(
+                                            "[Wormhole Test] Found remote file {} ({}), requesting download",
+                                            file.file_name, file.id
+                                        );
+                                        #[cfg(target_os = "windows")]
+                                        log_startup_line(&format!(
+                                            "[Wormhole Test] requesting download: {}",
+                                            file.id
+                                        ));
+                                        if let Err(e) =
+                                            wormhole::wormhole_request_download(file.id.clone(), test_handle.clone())
+                                                .await
+                                        {
+                                            eprintln!("[Wormhole Test] Download request failed: {}", e);
+                                            #[cfg(target_os = "windows")]
+                                            log_startup_line(&format!(
+                                                "[Wormhole Test] download request failed: {}",
+                                                e
+                                            ));
+                                            break;
+                                        }
+                                        target_remote_file = Some(file.id.clone());
+                                    }
+                                }
+
+                                if let Some(target_id) = target_remote_file.as_ref() {
+                                    if let Some(remote_file) = files.iter().find(|f| &f.id == target_id) {
+                                        match remote_file.status {
+                                            wormhole::WormholeStatus::Completed => {
+                                                eprintln!(
+                                                    "[Wormhole Test] Download completed for {} ({})",
+                                                    remote_file.file_name, remote_file.id
+                                                );
+                                                #[cfg(target_os = "windows")]
+                                                log_startup_line(&format!(
+                                                    "[Wormhole Test] download completed: {}",
+                                                    remote_file.id
+                                                ));
+                                                return;
+                                            }
+                                            wormhole::WormholeStatus::Failed
+                                            | wormhole::WormholeStatus::Cancelled
+                                            | wormhole::WormholeStatus::Expired => {
+                                                eprintln!(
+                                                    "[Wormhole Test] Download ended in {:?} for {}",
+                                                    remote_file.status, remote_file.id
+                                                );
+                                                #[cfg(target_os = "windows")]
+                                                log_startup_line(&format!(
+                                                    "[Wormhole Test] download ended in {:?}: {}",
+                                                    remote_file.status, remote_file.id
+                                                ));
+                                                return;
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("[Wormhole Test] List files failed: {}", e);
+                            }
+                        }
+
+                        if attempt % 5 == 0 {
+                            eprintln!("[Wormhole Test] Waiting for remote offer/download progress (attempt {})", attempt);
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+
+                    eprintln!("[Wormhole Test] Completed without observing full remote download flow");
+                    #[cfg(target_os = "windows")]
+                    log_startup_line("[Wormhole Test] timeout waiting for full remote download flow");
+                });
+            }
+            
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

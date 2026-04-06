@@ -155,7 +155,6 @@ struct ActiveTransfer {
     file_name: String,
     total_bytes: u64,
     bytes_transferred: AtomicU64,
-    start_time: Instant,
     last_emit_time: AsyncMutex<Instant>,
     last_emit_bytes: AtomicU64,
     recent_speeds: AsyncMutex<VecDeque<f64>>,
@@ -170,7 +169,6 @@ impl ActiveTransfer {
             file_name,
             total_bytes,
             bytes_transferred: AtomicU64::new(0),
-            start_time: Instant::now(),
             last_emit_time: AsyncMutex::new(Instant::now()),
             last_emit_bytes: AtomicU64::new(0),
             recent_speeds: AsyncMutex::new(VecDeque::with_capacity(5)),
@@ -269,7 +267,7 @@ impl WormholeState {
         }
     }
 
-    pub async fn start_transfer(
+    async fn start_transfer(
         &self,
         file_id: String,
         file_name: String,
@@ -284,11 +282,11 @@ impl WormholeState {
         transfer
     }
 
-    pub async fn get_transfer(&self, file_id: &str) -> Option<Arc<ActiveTransfer>> {
+    async fn get_transfer(&self, file_id: &str) -> Option<Arc<ActiveTransfer>> {
         self.active_transfers.read().await.get(file_id).cloned()
     }
 
-    pub async fn remove_transfer(&self, file_id: &str) {
+    async fn remove_transfer(&self, file_id: &str) {
         self.active_transfers.write().await.remove(file_id);
     }
 
@@ -299,6 +297,18 @@ impl WormholeState {
         } else {
             false
         }
+    }
+
+    async fn set_pending_download_path(&self, file_id: String, path: PathBuf) {
+        self.pending_downloads.write().await.insert(file_id, path);
+    }
+
+    async fn get_pending_download_path(&self, file_id: &str) -> Option<PathBuf> {
+        self.pending_downloads.read().await.get(file_id).cloned()
+    }
+
+    async fn clear_pending_download_path(&self, file_id: &str) {
+        self.pending_downloads.write().await.remove(file_id);
     }
 }
 
@@ -888,6 +898,7 @@ pub async fn wormhole_cancel_download(file_id: String, app: AppHandle) -> Result
     // Cancel active transfer
     if let Some(wormhole_state) = app.try_state::<WormholeState>() {
         wormhole_state.cancel_transfer(&file_id).await;
+        wormhole_state.clear_pending_download_path(&file_id).await;
     }
 
     // Update database
@@ -956,7 +967,7 @@ pub async fn open_wormhole_window(app: AppHandle) -> Result<(), String> {
         window.set_focus().map_err(|e| e.to_string())?;
     } else {
         // Create window if it doesn't exist
-        let window = WebviewWindowBuilder::new(&app, "wormhole", WebviewUrl::App("/wormhole.html".into()))
+        let window = WebviewWindowBuilder::new(&app, "wormhole", WebviewUrl::App("/".into()))
             .title("Wormhole")
             .inner_size(420.0, 560.0)
             .min_inner_size(380.0, 480.0)
@@ -1096,6 +1107,10 @@ pub async fn stream_file_to_peer(
     loop {
         if transfer.is_cancelled() {
             eprintln!("[Wormhole] Transfer cancelled: {}", file_id);
+            if let Ok(conn) = state.db_write.lock() {
+                let _ = update_wormhole_status(&conn, file_id, WormholeStatus::Cancelled);
+            }
+            wormhole_state.remove_transfer(file_id).await;
             return Err(anyhow!("Transfer cancelled"));
         }
 
@@ -1185,8 +1200,10 @@ pub async fn handle_incoming_chunk(
         return Err(anyhow!("Download cancelled"));
     }
 
-    // Determine download path
-    let download_path = {
+    // Determine and persist download path for this transfer
+    let download_path = if let Some(existing) = wormhole_state.get_pending_download_path(&chunk.file_id).await {
+        existing
+    } else {
         let file = {
             let conn = state.db_read_pool.get().context("get db connection")?;
             get_wormhole_file(&conn, &chunk.file_id)
@@ -1197,9 +1214,8 @@ pub async fn handle_incoming_chunk(
         let downloads_dir = get_downloads_folder();
         let mut path = downloads_dir.join(&file.file_name);
 
-        // Handle duplicate filenames
+        // Handle duplicate filenames once at transfer start
         if path.exists() && chunk.offset == 0 {
-            // Extract stem and ext as owned Strings before the loop to avoid borrow issues
             let stem = path
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -1224,6 +1240,9 @@ pub async fn handle_incoming_chunk(
             }
         }
 
+        wormhole_state
+            .set_pending_download_path(chunk.file_id.clone(), path.clone())
+            .await;
         path
     };
 
@@ -1283,6 +1302,7 @@ pub async fn handle_incoming_chunk(
             }
 
             wormhole_state.remove_transfer(&chunk.file_id).await;
+            wormhole_state.clear_pending_download_path(&chunk.file_id).await;
 
             let _ = app.emit("wormhole://transfer-failed", serde_json::json!({
                 "file_id": chunk.file_id,
@@ -1303,6 +1323,7 @@ pub async fn handle_incoming_chunk(
         }
 
         wormhole_state.remove_transfer(&chunk.file_id).await;
+        wormhole_state.clear_pending_download_path(&chunk.file_id).await;
 
         let _ = app.emit("wormhole://transfer-complete", serde_json::json!({
             "file_id": chunk.file_id,

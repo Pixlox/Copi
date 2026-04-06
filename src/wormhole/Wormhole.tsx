@@ -24,25 +24,31 @@ import { isMacPlatform } from "../utils/platform";
 // ════════════════════════════════════════════════════════════════════════════
 
 interface WormholeFile {
-  file_id: string;
+  id: string;
   file_name: string;
   file_size: number;
   mime_type: string | null;
-  status: "pending" | "transferring" | "completed" | "failed" | "expired";
+  status: "pending" | "uploading" | "available" | "downloading" | "completed" | "expired" | "cancelled" | "failed";
   is_local: boolean;
-  source_device_id: string;
-  source_device_name: string | null;
-  created_at: number;
-  expires_at: number;
-  error_message: string | null;
+  origin_device_id: string;
+  origin_device_name: string | null;
+  bytes_transferred: number;
+  transfer_started_at: string | null;
+  transfer_completed_at: string | null;
+  local_path: string | null;
+  created_at: string;
+  expires_at: string;
 }
 
 interface TransferProgress {
   file_id: string;
+  file_name: string;
   bytes_transferred: number;
   total_bytes: number;
-  speed_bps: number;
-  eta_seconds: number | null;
+  percent_complete: number;
+  speed_bytes_per_sec: number;
+  estimated_seconds_remaining: number;
+  is_upload: boolean;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -61,8 +67,8 @@ function formatSpeed(bps: number): string {
   return `${formatBytes(bps)}/s`;
 }
 
-function formatEta(seconds: number | null): string {
-  if (seconds === null || seconds <= 0) return "";
+function formatEta(seconds: number): string {
+  if (seconds <= 0) return "";
   if (seconds < 60) return `${Math.ceil(seconds)}s`;
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${Math.ceil(seconds % 60)}s`;
   const h = Math.floor(seconds / 3600);
@@ -70,9 +76,10 @@ function formatEta(seconds: number | null): string {
   return `${h}h ${m}m`;
 }
 
-function formatTimeRemaining(expiresAt: number): string {
-  const now = Math.floor(Date.now() / 1000);
-  const remaining = expiresAt - now;
+function formatTimeRemaining(expiresAtIso: string): string {
+  const expiresAtMs = new Date(expiresAtIso).getTime();
+  if (!Number.isFinite(expiresAtMs)) return "";
+  const remaining = Math.max(0, Math.floor((expiresAtMs - Date.now()) / 1000));
   if (remaining <= 0) return "Expired";
   if (remaining < 3600) return `${Math.floor(remaining / 60)}m left`;
   if (remaining < 86400) return `${Math.floor(remaining / 3600)}h left`;
@@ -185,6 +192,18 @@ function DropZone({ onFilesDropped, isDragActive, setIsDragActive }: {
   );
 }
 
+function normalizeWormholeFile(file: WormholeFile): WormholeFile {
+  const status = file.status;
+  const normalizedStatus: WormholeFile["status"] = status === "pending" && file.is_local
+    ? "available"
+    : status;
+
+  return {
+    ...file,
+    status: normalizedStatus,
+  };
+}
+
 function FileCard({ file, progress, onDownload, onRetract, onCancel }: {
   file: WormholeFile;
   progress?: TransferProgress;
@@ -193,15 +212,22 @@ function FileCard({ file, progress, onDownload, onRetract, onCancel }: {
   onCancel: () => void;
 }) {
   const Icon = getFileIcon(file.mime_type, file.file_name);
-  const isTransferring = file.status === "transferring";
+  const isUploading = file.status === "uploading";
+  const isDownloading = file.status === "downloading";
+  const isTransferring = isUploading || isDownloading;
+  const isAvailable = file.status === "available";
   const isPending = file.status === "pending";
   const isCompleted = file.status === "completed";
   const isFailed = file.status === "failed";
   const isExpired = file.status === "expired";
+  const isCancelled = file.status === "cancelled";
 
   const progressPercent = progress 
-    ? Math.min(100, (progress.bytes_transferred / progress.total_bytes) * 100)
+    ? Math.min(100, progress.percent_complete)
     : 0;
+
+  const canRetract = file.is_local && (isPending || isAvailable || isUploading);
+  const canDownload = !file.is_local && (isPending || isAvailable);
 
   return (
     <div className={`wormhole-file-card ${file.status}`}>
@@ -223,35 +249,38 @@ function FileCard({ file, progress, onDownload, onRetract, onCancel }: {
         </span>
         <div className="wormhole-file-meta">
           <span className="wormhole-file-size">{formatBytes(file.file_size)}</span>
-          {!file.is_local && file.source_device_name && (
-            <span className="wormhole-file-source">from {file.source_device_name}</span>
+          {!file.is_local && file.origin_device_name && (
+            <span className="wormhole-file-source">from {file.origin_device_name}</span>
           )}
           {isTransferring && progress && (
             <>
-              <span className="wormhole-file-speed">{formatSpeed(progress.speed_bps)}</span>
-              {progress.eta_seconds !== null && (
-                <span className="wormhole-file-eta">{formatEta(progress.eta_seconds)}</span>
+              <span className="wormhole-file-speed">{formatSpeed(progress.speed_bytes_per_sec)}</span>
+              {progress.estimated_seconds_remaining > 0 && (
+                <span className="wormhole-file-eta">{formatEta(progress.estimated_seconds_remaining)}</span>
               )}
             </>
           )}
-          {isPending && !file.is_local && (
+          {(isPending || isAvailable) && !file.is_local && (
             <span className="wormhole-file-expiry">{formatTimeRemaining(file.expires_at)}</span>
           )}
           {isCompleted && (
             <span className="wormhole-file-completed">Completed</span>
           )}
           {isFailed && (
-            <span className="wormhole-file-failed">{file.error_message || "Transfer failed"}</span>
+            <span className="wormhole-file-failed">Transfer failed</span>
           )}
           {isExpired && (
             <span className="wormhole-file-expired">Expired</span>
+          )}
+          {isCancelled && (
+            <span className="wormhole-file-expired">Cancelled</span>
           )}
         </div>
       </div>
       
       <div className="wormhole-file-actions">
         {/* Local pending file: can retract */}
-        {isPending && file.is_local && (
+        {canRetract && (
           <button 
             className="wormhole-file-action danger" 
             onClick={onRetract}
@@ -262,7 +291,7 @@ function FileCard({ file, progress, onDownload, onRetract, onCancel }: {
         )}
         
         {/* Remote pending file: can download */}
-        {isPending && !file.is_local && (
+        {canDownload && (
           <button 
             className="wormhole-file-action primary" 
             onClick={onDownload}
@@ -273,7 +302,7 @@ function FileCard({ file, progress, onDownload, onRetract, onCancel }: {
         )}
         
         {/* Transferring: can cancel */}
-        {isTransferring && (
+        {isDownloading && (
           <button 
             className="wormhole-file-action danger" 
             onClick={onCancel}
@@ -316,7 +345,7 @@ export default function Wormhole() {
   const refreshFiles = useCallback(async () => {
     try {
       const result = await invoke<WormholeFile[]>("wormhole_list_files");
-      setFiles(result);
+      setFiles(result.map(normalizeWormholeFile));
       setError(null);
     } catch (e) {
       console.error("[Wormhole] Failed to fetch files:", e);
@@ -343,17 +372,32 @@ export default function Wormhole() {
   // Listen for events
   useEffect(() => {
     const unlisteners: Promise<() => void>[] = [];
-
-    // New file offered (from us or remote)
-    unlisteners.push(listen("wormhole://file-offered", () => {
+    const refreshAll = () => {
       refreshFiles();
       refreshPendingCount();
+    };
+
+    // New file offered (from us)
+    unlisteners.push(listen("wormhole://file-offered", () => {
+      refreshAll();
+    }));
+
+    // New offer received from a peer
+    unlisteners.push(listen("wormhole://offer-received", () => {
+      refreshAll();
     }));
 
     // File retracted
     unlisteners.push(listen("wormhole://file-retracted", () => {
-      refreshFiles();
-      refreshPendingCount();
+      refreshAll();
+    }));
+
+    // Remote retraction / expiry
+    unlisteners.push(listen("wormhole://offer-retracted", () => {
+      refreshAll();
+    }));
+    unlisteners.push(listen("wormhole://file-expired", () => {
+      refreshAll();
     }));
 
     // Transfer progress
@@ -366,20 +410,50 @@ export default function Wormhole() {
     }));
 
     // Transfer completed
+    unlisteners.push(listen<unknown>("wormhole://transfer-complete", (event) => {
+      let fileId: string | null = null;
+      if (typeof event.payload === "string") {
+        fileId = event.payload;
+      } else if (
+        event.payload &&
+        typeof event.payload === "object" &&
+        "file_id" in event.payload &&
+        typeof (event.payload as { file_id?: unknown }).file_id === "string"
+      ) {
+        fileId = (event.payload as { file_id: string }).file_id;
+      }
+
+      if (!fileId) {
+        refreshAll();
+        return;
+      }
+
+      setProgress(prev => {
+        const next = new Map(prev);
+        next.delete(fileId);
+        return next;
+      });
+      refreshAll();
+    }));
+
+    // Backward-compatible completed event name
     unlisteners.push(listen<{ file_id: string }>("wormhole://transfer-completed", (event) => {
       setProgress(prev => {
         const next = new Map(prev);
         next.delete(event.payload.file_id);
         return next;
       });
-      refreshFiles();
-      refreshPendingCount();
+      refreshAll();
     }));
 
     // Transfer failed
-    unlisteners.push(listen<{ file_id: string; reason: string }>("wormhole://transfer-failed", () => {
-      refreshFiles();
-      refreshPendingCount();
+    unlisteners.push(listen<{ file_id: string; reason: string }>("wormhole://transfer-failed", (event) => {
+      setProgress(prev => {
+        const next = new Map(prev);
+        next.delete(event.payload.file_id);
+        return next;
+      });
+      refreshAll();
     }));
 
     return () => {
@@ -391,7 +465,7 @@ export default function Wormhole() {
   const handleFilesDropped = useCallback(async (paths: string[]) => {
     for (const path of paths) {
       try {
-        await invoke("wormhole_offer_file", { filePath: path });
+        await invoke("wormhole_offer_file", { path });
       } catch (e) {
         console.error("[Wormhole] Failed to offer file:", e);
         setError(typeof e === "string" ? e : "Failed to offer file");
@@ -454,9 +528,14 @@ export default function Wormhole() {
   // Separate files by category
   const localFiles = files.filter(f => f.is_local);
   const remoteFiles = files.filter(f => !f.is_local);
-  const pendingRemote = remoteFiles.filter(f => f.status === "pending");
-  const activeTransfers = files.filter(f => f.status === "transferring");
-  const completedFiles = files.filter(f => f.status === "completed" || f.status === "failed" || f.status === "expired");
+  const pendingRemote = remoteFiles.filter(f => f.status === "pending" || f.status === "available");
+  const activeTransfers = files.filter(f => f.status === "uploading" || f.status === "downloading");
+  const sharedLocal = localFiles.filter(
+    f => f.status === "pending" || f.status === "available" || f.status === "uploading"
+  );
+  const completedFiles = files.filter(
+    f => f.status === "completed" || f.status === "failed" || f.status === "expired" || f.status === "cancelled"
+  );
 
   return (
     <div className="wormhole-root">
@@ -510,17 +589,17 @@ export default function Wormhole() {
             <h2>
               <Download size={14} />
               Available for Download
-              <span className="wormhole-section-badge">{pendingRemote.length}</span>
+              <span className="wormhole-section-badge">{pendingCount}</span>
             </h2>
             <div className="wormhole-file-list">
               {pendingRemote.map(file => (
                 <FileCard
-                  key={file.file_id}
+                  key={file.id}
                   file={file}
-                  progress={progress.get(file.file_id)}
-                  onDownload={() => handleDownload(file.file_id)}
-                  onRetract={() => handleRetract(file.file_id)}
-                  onCancel={() => handleCancel(file.file_id)}
+                  progress={progress.get(file.id)}
+                  onDownload={() => handleDownload(file.id)}
+                  onRetract={() => handleRetract(file.id)}
+                  onCancel={() => handleCancel(file.id)}
                 />
               ))}
             </div>
@@ -537,12 +616,12 @@ export default function Wormhole() {
             <div className="wormhole-file-list">
               {activeTransfers.map(file => (
                 <FileCard
-                  key={file.file_id}
+                  key={file.id}
                   file={file}
-                  progress={progress.get(file.file_id)}
-                  onDownload={() => handleDownload(file.file_id)}
-                  onRetract={() => handleRetract(file.file_id)}
-                  onCancel={() => handleCancel(file.file_id)}
+                  progress={progress.get(file.id)}
+                  onDownload={() => handleDownload(file.id)}
+                  onRetract={() => handleRetract(file.id)}
+                  onCancel={() => handleCancel(file.id)}
                 />
               ))}
             </div>
@@ -550,21 +629,21 @@ export default function Wormhole() {
         )}
 
         {/* Your shared files (local pending) */}
-        {localFiles.filter(f => f.status === "pending").length > 0 && (
+        {sharedLocal.length > 0 && (
           <section className="wormhole-section">
             <h2>
               <Upload size={14} />
               Your Shared Files
             </h2>
             <div className="wormhole-file-list">
-              {localFiles.filter(f => f.status === "pending").map(file => (
+              {sharedLocal.map(file => (
                 <FileCard
-                  key={file.file_id}
+                  key={file.id}
                   file={file}
-                  progress={progress.get(file.file_id)}
-                  onDownload={() => handleDownload(file.file_id)}
-                  onRetract={() => handleRetract(file.file_id)}
-                  onCancel={() => handleCancel(file.file_id)}
+                  progress={progress.get(file.id)}
+                  onDownload={() => handleDownload(file.id)}
+                  onRetract={() => handleRetract(file.id)}
+                  onCancel={() => handleCancel(file.id)}
                 />
               ))}
             </div>
@@ -581,12 +660,12 @@ export default function Wormhole() {
             <div className="wormhole-file-list">
               {completedFiles.map(file => (
                 <FileCard
-                  key={file.file_id}
+                  key={file.id}
                   file={file}
-                  progress={progress.get(file.file_id)}
-                  onDownload={() => handleDownload(file.file_id)}
-                  onRetract={() => handleRetract(file.file_id)}
-                  onCancel={() => handleCancel(file.file_id)}
+                  progress={progress.get(file.id)}
+                  onDownload={() => handleDownload(file.id)}
+                  onRetract={() => handleRetract(file.id)}
+                  onCancel={() => handleCancel(file.id)}
                 />
               ))}
             </div>
