@@ -2901,7 +2901,9 @@ async fn lookup_clip_for_push(
 
 #[tauri::command]
 pub async fn sync_get_identity(app: AppHandle) -> Result<SyncIdentityPayload, String> {
-    let state = app.state::<AppState>();
+    let state = app
+        .try_state::<AppState>()
+        .ok_or_else(|| "app state not initialized".to_string())?;
     let sync = state
         .sync
         .get()
@@ -2914,8 +2916,10 @@ pub async fn sync_get_identity(app: AppHandle) -> Result<SyncIdentityPayload, St
 
 #[tauri::command]
 pub async fn sync_list_peers(app: AppHandle) -> Result<Vec<SyncPeerPayload>, String> {
+    let state = app
+        .try_state::<AppState>()
+        .ok_or_else(|| "app state not initialized".to_string())?;
     let trusted = get_trusted_peers(&app).map_err(|e| e.to_string())?;
-    let state = app.state::<AppState>();
     let Some(sync) = state.sync.get() else {
         return Ok(Vec::new());
     };
@@ -2937,7 +2941,9 @@ pub async fn sync_list_peers(app: AppHandle) -> Result<Vec<SyncPeerPayload>, Str
 
 #[tauri::command]
 pub async fn sync_generate_pin(app: AppHandle) -> Result<SyncPinPayload, String> {
-    let state = app.state::<AppState>();
+    let state = app
+        .try_state::<AppState>()
+        .ok_or_else(|| "app state not initialized".to_string())?;
     let sync = state
         .sync
         .get()
@@ -2954,7 +2960,9 @@ pub async fn sync_generate_pin(app: AppHandle) -> Result<SyncPinPayload, String>
 
 #[tauri::command]
 pub async fn sync_get_status(app: AppHandle) -> Result<serde_json::Value, String> {
-    let state = app.state::<AppState>();
+    let state = app
+        .try_state::<AppState>()
+        .ok_or_else(|| "app state not initialized".to_string())?;
     let sync = state
         .sync
         .get()
@@ -2974,7 +2982,9 @@ pub async fn sync_pair_with(
     target_addr: String,
     pin: String,
 ) -> Result<(), String> {
-    let state = app.state::<AppState>();
+    let state = app
+        .try_state::<AppState>()
+        .ok_or_else(|| "app state not initialized".to_string())?;
     let sync = state
         .sync
         .get()
@@ -3070,7 +3080,10 @@ pub async fn sync_pair_with(
 #[tauri::command]
 pub async fn sync_remove_peer(app: AppHandle, device_id: String) -> Result<(), String> {
     remove_trusted_peer(&app, &device_id).map_err(|e| e.to_string())?;
-    if let Some(sync) = app.state::<AppState>().sync.get() {
+    let Some(state) = app.try_state::<AppState>() else {
+        return Ok(());
+    };
+    if let Some(sync) = state.sync.get() {
         sync.unregister_peer(&device_id).await;
         sync.known_addrs.write().await.remove(&device_id);
         sync.connecting.write().await.remove(&device_id);
@@ -3123,7 +3136,9 @@ pub async fn on_local_clip_saved(app: &AppHandle, content_hash: &str) {
 
 #[tauri::command]
 pub async fn sync_list_discovered(app: AppHandle) -> Result<Vec<DiscoveredPeer>, String> {
-    let state = app.state::<AppState>();
+    let state = app
+        .try_state::<AppState>()
+        .ok_or_else(|| "app state not initialized".to_string())?;
     let sync = state
         .sync
         .get()
