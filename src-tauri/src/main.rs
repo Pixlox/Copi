@@ -620,6 +620,10 @@ fn main() {
             wormhole::wormhole_clear_completed,
             wormhole::wormhole_get_pending_count,
             wormhole::open_wormhole_window,
+            // Wormhole debug commands (for testing)
+            wormhole::wormhole_debug_test,
+            wormhole::wormhole_debug_list,
+            wormhole::wormhole_debug_sync_status,
         ])
         .build(tauri::generate_context!())
         .unwrap_or_else(|error| {
