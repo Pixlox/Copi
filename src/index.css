@@ -2679,6 +2679,33 @@ input::placeholder {
   color: var(--text-tertiary);
 }
 
+.wormhole-dropzone-btn {
+  margin-top: 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 120px;
+  height: 30px;
+  padding: 0 12px;
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+  background: var(--surface-primary);
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 120ms ease;
+}
+
+.wormhole-dropzone-btn:hover {
+  background: var(--surface-hover);
+  border-color: var(--border-strong);
+}
+
+.wormhole-dropzone-btn:active {
+  transform: translateY(1px);
+}
+
 /* Error */
 .wormhole-error {
   display: flex;

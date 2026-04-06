@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback, useRef, type MouseEvent as ReactMouse
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { open } from "@tauri-apps/plugin-dialog";
 import {
   Upload,
   Download,
@@ -111,8 +112,9 @@ function getFileIcon(mimeType: string | null, fileName: string) {
 // Components
 // ════════════════════════════════════════════════════════════════════════════
 
-function DropZone({ onFilesDropped, isDragActive, setIsDragActive }: {
+function DropZone({ onFilesDropped, onSelectFiles, isDragActive, setIsDragActive }: {
   onFilesDropped: (paths: string[]) => void;
+  onSelectFiles: () => void;
   isDragActive: boolean;
   setIsDragActive: (active: boolean) => void;
 }) {
@@ -185,8 +187,16 @@ function DropZone({ onFilesDropped, isDragActive, setIsDragActive }: {
           {isDragActive ? "Drop files to send" : "Drag files here to send"}
         </span>
         <span className="wormhole-dropzone-hint">
-          Files will be available to all synced devices
+          Drag files in, or choose them manually
         </span>
+        <button
+          type="button"
+          className="wormhole-dropzone-btn"
+          onClick={onSelectFiles}
+          data-no-drag
+        >
+          Select Files
+        </button>
       </div>
     </div>
   );
@@ -340,6 +350,7 @@ export default function Wormhole() {
   const [isDragActive, setIsDragActive] = useState(false);
   const [pendingCount, setPendingCount] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const lastOfferFingerprintRef = useRef<{ key: string; at: number } | null>(null);
 
   // Fetch files
   const refreshFiles = useCallback(async () => {
@@ -463,7 +474,23 @@ export default function Wormhole() {
 
   // Handle file drop
   const handleFilesDropped = useCallback(async (paths: string[]) => {
-    for (const path of paths) {
+    const uniquePaths = Array.from(
+      new Set(paths.map((p) => p.trim()).filter((p) => p.length > 0))
+    );
+
+    if (uniquePaths.length === 0) return;
+
+    const fingerprint = uniquePaths.slice().sort().join("|");
+    const now = Date.now();
+    const previous = lastOfferFingerprintRef.current;
+    if (previous && previous.key === fingerprint && now - previous.at < 1200) {
+      return;
+    }
+    lastOfferFingerprintRef.current = { key: fingerprint, at: now };
+
+    setError(null);
+
+    for (const path of uniquePaths) {
       try {
         await invoke("wormhole_offer_file", { path });
       } catch (e) {
@@ -474,6 +501,60 @@ export default function Wormhole() {
     refreshFiles();
     refreshPendingCount();
   }, [refreshFiles, refreshPendingCount]);
+
+  // Native picker button
+  const handleSelectFiles = useCallback(async () => {
+    try {
+      const selected = await open({
+        title: "Select files for Wormhole",
+        multiple: true,
+        directory: false,
+      });
+
+      if (!selected) return;
+      const paths = Array.isArray(selected) ? selected : [selected];
+      await handleFilesDropped(paths);
+    } catch (e) {
+      console.error("[Wormhole] Failed to open file picker:", e);
+      setError(typeof e === "string" ? e : "Failed to open file picker");
+    }
+  }, [handleFilesDropped]);
+
+  // Native drag-and-drop listener (reliable on Tauri desktop)
+  useEffect(() => {
+    let dragDepth = 0;
+    const unlistenPromise = getCurrentWindow().onDragDropEvent((event) => {
+      const payload = event.payload;
+      if (payload.type === "enter") {
+        dragDepth += 1;
+        setIsDragActive(true);
+        return;
+      }
+
+      if (payload.type === "over") {
+        setIsDragActive(true);
+        return;
+      }
+
+      if (payload.type === "leave") {
+        dragDepth = Math.max(0, dragDepth - 1);
+        if (dragDepth === 0) {
+          setIsDragActive(false);
+        }
+        return;
+      }
+
+      if (payload.type === "drop") {
+        dragDepth = 0;
+        setIsDragActive(false);
+        void handleFilesDropped(payload.paths);
+      }
+    });
+
+    return () => {
+      unlistenPromise.then((fn) => fn());
+    };
+  }, [handleFilesDropped]);
 
   // Handle download request
   const handleDownload = useCallback(async (fileId: string) => {
@@ -568,6 +649,7 @@ export default function Wormhole() {
         {/* Drop Zone */}
         <DropZone 
           onFilesDropped={handleFilesDropped}
+          onSelectFiles={handleSelectFiles}
           isDragActive={isDragActive}
           setIsDragActive={setIsDragActive}
         />
