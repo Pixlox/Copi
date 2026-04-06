@@ -636,20 +636,36 @@ fn main() {
                         }
                     }
 
+                    let preferred_remote_offer_id = std::env::var("COPI_WORMHOLE_DOWNLOAD_FILE_ID").ok();
+
                     // Try to find a remote offer and download it.
                     let mut target_remote_file: Option<String> = None;
                     for attempt in 1..=30 {
                         match wormhole::wormhole_list_files(test_handle.clone()).await {
                             Ok(files) => {
                                 if target_remote_file.is_none() {
-                                    if let Some(file) = files.iter().find(|f| {
-                                        !f.is_local
-                                            && matches!(
-                                                f.status,
-                                                wormhole::WormholeStatus::Pending
-                                                    | wormhole::WormholeStatus::Available
-                                            )
-                                    }) {
+                                    let candidate = if let Some(preferred_id) = preferred_remote_offer_id.as_ref() {
+                                        files.iter().find(|f| {
+                                            !f.is_local
+                                                && f.id == *preferred_id
+                                                && matches!(
+                                                    f.status,
+                                                    wormhole::WormholeStatus::Pending
+                                                        | wormhole::WormholeStatus::Available
+                                                )
+                                        })
+                                    } else {
+                                        files.iter().find(|f| {
+                                            !f.is_local
+                                                && matches!(
+                                                    f.status,
+                                                    wormhole::WormholeStatus::Pending
+                                                        | wormhole::WormholeStatus::Available
+                                                )
+                                        })
+                                    };
+
+                                    if let Some(file) = candidate {
                                         eprintln!(
                                             "[Wormhole Test] Found remote file {} ({}), requesting download",
                                             file.file_name, file.id
