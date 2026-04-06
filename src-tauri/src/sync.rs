@@ -747,7 +747,12 @@ async fn run_browser(
 
     eprintln!("[Sync] {} trusted peers to reconnect", trusted_peers.len());
     for peer in &trusted_peers {
-        ensure_reconnect_loop(app.clone(), sync.clone(), peer.device_id.clone(), generation);
+        ensure_reconnect_loop(
+            app.clone(),
+            sync.clone(),
+            peer.device_id.clone(),
+            generation,
+        );
     }
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();

@@ -1071,7 +1071,10 @@ fn open_external_url(url: String) -> Result<(), String> {
         } as isize;
 
         if result <= 32 {
-            return Err(format!("failed to open url (ShellExecuteW code {})", result));
+            return Err(format!(
+                "failed to open url (ShellExecuteW code {})",
+                result
+            ));
         }
         return Ok(());
     }
