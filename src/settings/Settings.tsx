@@ -2,7 +2,6 @@ import { useEffect, useState, useCallback, useRef } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   Keyboard,
   Palette,
@@ -20,13 +19,11 @@ import {
   Pencil,
   Check,
   Laptop,
-  Minus,
-  Square,
 } from "lucide-react";
 import { useThemeContext } from "../contexts/ThemeContext";
 import Picker from "../components/Picker";
 import { checkForUpdates } from "../utils/updater";
-import { formatShortcut, isMacPlatform, isWindowsPlatform, platformName } from "../utils/platform";
+import { formatShortcut, isMacPlatform, platformName } from "../utils/platform";
 
 // ════════════════════════════════════════════════════════════════════════════
 // Types
@@ -1185,7 +1182,6 @@ function CollectionsSection({
 // ════════════════════════════════════════════════════════════════════════════
 
 export default function Settings() {
-  const appWindow = getCurrentWindow();
   const [config, setConfig] = useState<CopiConfig | null>(null);
   const [activeSection, setActiveSection] = useState<Section>("general");
   const [dbSize, setDbSize] = useState(0);
@@ -1195,7 +1191,6 @@ export default function Settings() {
   const [confirmClear, setConfirmClear] = useState(false);
   const [clearError, setClearError] = useState<string | null>(null);
   const [clearing, setClearing] = useState(false);
-  const [isMaximized, setIsMaximized] = useState(false);
 
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const statsRefreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1236,26 +1231,6 @@ export default function Settings() {
     getVersion().then(setAppVersion).catch(() => {});
     fetchCollections();
   }, [fetchCollections, refreshStats]);
-
-  useEffect(() => {
-    if (!isWindowsPlatform) {
-      return;
-    }
-    appWindow
-      .isMaximized()
-      .then((value) => setIsMaximized(value))
-      .catch(() => {});
-    const unlistenResized = appWindow.onResized(async () => {
-      try {
-        setIsMaximized(await appWindow.isMaximized());
-      } catch {
-        // ignore
-      }
-    });
-    return () => {
-      unlistenResized.then((off) => off()).catch(() => {});
-    };
-  }, [appWindow]);
 
   // Listen to collections-changed event for real-time updates
   useEffect(() => {
@@ -1371,8 +1346,8 @@ export default function Settings() {
   return (
     <div className="settings-root">
       {/* ── Sidebar ─────────────────────────────────────────────────── */}
-      <aside className="settings-sidebar" data-tauri-drag-region>
-        <div className="settings-sidebar-brand" data-tauri-drag-region>
+      <aside className="settings-sidebar">
+        <div className="settings-sidebar-brand">
           <Logo size={28} />
           <span>Copi</span>
         </div>
@@ -1397,49 +1372,8 @@ export default function Settings() {
 
       {/* ── Content ─────────────────────────────────────────────────── */}
       <main className="settings-content">
-        <header className="settings-content-header" data-tauri-drag-region>
-          {isWindowsPlatform && <div className="settings-content-header-spacer" data-tauri-drag-region />}
+        <header className="settings-content-header">
           <h1>{activeSectionData.label}</h1>
-          {isWindowsPlatform && (
-            <div className="settings-win-controls" data-no-drag>
-              <button
-                className="settings-win-btn"
-                onClick={() => {
-                  void appWindow.minimize();
-                }}
-                aria-label="Minimize"
-                title="Minimize"
-              >
-                <Minus size={14} />
-              </button>
-              <button
-                className="settings-win-btn"
-                onClick={() => {
-                  void appWindow.isMaximized().then((value) => {
-                    if (value) {
-                      void appWindow.unmaximize().then(() => setIsMaximized(false));
-                    } else {
-                      void appWindow.maximize().then(() => setIsMaximized(true));
-                    }
-                  });
-                }}
-                aria-label={isMaximized ? "Restore" : "Maximize"}
-                title={isMaximized ? "Restore" : "Maximize"}
-              >
-                <Square size={12} />
-              </button>
-              <button
-                className="settings-win-btn close"
-                onClick={() => {
-                  void appWindow.hide();
-                }}
-                aria-label="Close"
-                title="Close"
-              >
-                <X size={12} />
-              </button>
-            </div>
-          )}
         </header>
 
         <div className="settings-content-body">

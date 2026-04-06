@@ -1539,40 +1539,11 @@ input::placeholder {
   filter: brightness(0.75);
 }
 
-/* Windows title bar controls */
-.settings-win-controls {
-  display: flex;
-  margin-left: auto;
-}
-
-.settings-win-btn {
-  width: 46px;
-  height: 32px;
-  border: none;
-  background: transparent;
-  color: var(--text-secondary);
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition: background 100ms ease;
-}
-
-.settings-win-btn:hover {
-  background: var(--surface-hover);
-  color: var(--text-primary);
-}
-
-.settings-win-btn.close:hover {
-  background: #E81123;
-  color: #FFFFFF;
-}
-
 .settings-sidebar-brand {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 48px 16px 16px 16px;
+  padding: 20px 16px 16px 16px;
   flex-shrink: 0;
 }
 
@@ -1667,39 +1638,12 @@ input::placeholder {
 .settings-content-header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  height: 52px;
-  padding: 0 24px;
-  padding-top: 6px;
-  border-bottom: 0.5px solid var(--border-subtle);
-}
-
-.settings-content-header-spacer,
-.settings-content-header-controls {
-  display: none;
-}
-
-.platform-windows .settings-content-header {
-  min-height: 42px;
-  height: 42px;
-  padding-top: 0;
-  background: rgba(0, 0, 0, 0.12);
-}
-
-.platform-windows.light .settings-content-header {
-  background: rgba(255, 255, 255, 0.68);
-}
-
-.platform-windows .settings-content-header-spacer,
-.platform-windows .settings-content-header-controls {
-  display: block;
-  width: 138px;
-  min-width: 138px;
-  height: 100%;
+  justify-content: flex-start;
+  padding: 20px 24px 0 24px;
 }
 
 .light .settings-content-header {
-  border-bottom-color: rgba(0, 0, 0, 0.08);
+  border-bottom-color: transparent;
 }
 
 .settings-content-header h1 {
