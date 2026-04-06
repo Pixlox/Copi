@@ -88,11 +88,21 @@ Uppercase, title case, JSON pretty print, extract URLs, deduplicate lines, sort,
 
 **🔒 Privacy first**
 
-Exclude any app by name or bundle ID. Password managers don't captured if you don't want them to. It's all local too.
+Exclude any app by name or bundle ID. Password managers don't capture if you don't want them to. It's all local, too.
 
 </td>
 </tr>
 </table>
+<table> 
+<td width="50%">
+
+**🔄 Copi Sync (new!)**
+
+Sync your clipboard, pins, and collections across your devices instantly with Copi. Works cross-platform, fast and secure.
+
+</td>
+</table>
+
 
 ---
 
@@ -148,9 +158,9 @@ npm run tauri dev
 
 ## Status
 
-Copi is pre-alpha. It'll work well day to day but there are rough edges. macOS is the primary target, and Windows support is functional but secondary.
+Copi is in alpha. It'll work well day to day but there may be rough edges.
 
-If you find a bug, [open an issue](https://github.com/Pixlox/copi/issues/new) .
+If you find a bug, [open an issue](https://github.com/Pixlox/copi/issues/new).
 
 PRs are welcome.
 
@@ -158,6 +168,6 @@ PRs are welcome.
 
 <div align="center">
 
-Made with ♥ by [Pixlox](https://pixlox.me)
+Made with ♥ by [Pixlox](https://pixlox.me) and [Megumi Labs](https://github.com/MegumiLabs) 
 
 </div>
