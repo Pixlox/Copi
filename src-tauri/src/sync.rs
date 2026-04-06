@@ -7,6 +7,7 @@ use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use rand::RngCore;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::Sha256;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
@@ -183,7 +184,7 @@ struct SecureSender {
 
 impl SecureSender {
     async fn send(&self, msg: &Msg) -> Result<()> {
-        let payload = serde_json::to_vec(msg).context("serialize secure msg")?;
+        let payload = serialize_secure_payload(msg).context("serialize secure msg")?;
         let mut writer = self.writer.0.lock().await;
         let nonce = self.nonce.fetch_add(1, Ordering::SeqCst);
         let nonce_bytes = nonce_to_bytes(nonce);
@@ -220,11 +221,76 @@ impl SecureReceiver {
             .cipher
             .decrypt(Nonce::from_slice(&nonce_bytes), ciphertext.as_ref())
             .context("decrypt secure payload")?;
-        let msg = serde_json::from_slice(&plaintext).context("parse secure payload")?;
+        let msg = parse_secure_payload(&plaintext).context("parse secure payload")?;
         self.next_nonce = nonce + 1;
         Ok(msg)
     }
 
+}
+
+fn serialize_secure_payload(msg: &Msg) -> Result<Vec<u8>> {
+    match msg {
+        Msg::WormholeChunk(chunk) => {
+            let data_b64 = B64.encode(&chunk.data);
+            let value = serde_json::json!({
+                "t": "wormhole_chunk",
+                "file_id": chunk.file_id,
+                "offset": chunk.offset,
+                "data": data_b64,
+                "is_final": chunk.is_final,
+            });
+            serde_json::to_vec(&value).context("serialize wormhole chunk payload")
+        }
+        _ => serde_json::to_vec(msg).context("serialize payload"),
+    }
+}
+
+fn parse_secure_payload(bytes: &[u8]) -> Result<Msg> {
+    if let Ok(msg) = serde_json::from_slice::<Msg>(bytes) {
+        return Ok(msg);
+    }
+
+    let value: Value = serde_json::from_slice(bytes).context("parse secure payload as json")?;
+    let msg_type = value
+        .get("t")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("missing message type"))?;
+
+    if msg_type == "wormhole_chunk" {
+        let file_id = value
+            .get("file_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("missing wormhole chunk file_id"))?
+            .to_string();
+        let offset = value
+            .get("offset")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow!("missing wormhole chunk offset"))?;
+        let is_final = value
+            .get("is_final")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| anyhow!("missing wormhole chunk is_final"))?;
+        let data_field = value
+            .get("data")
+            .ok_or_else(|| anyhow!("missing wormhole chunk data"))?;
+
+        let data = if let Some(as_b64) = data_field.as_str() {
+            B64.decode(as_b64)
+                .context("decode wormhole chunk base64 data")?
+        } else {
+            serde_json::from_value::<Vec<u8>>(data_field.clone())
+                .context("decode wormhole chunk byte-array data")?
+        };
+
+        return Ok(Msg::WormholeChunk(crate::wormhole::WormholeChunk {
+            file_id,
+            offset,
+            data,
+            is_final,
+        }));
+    }
+
+    Err(anyhow!("unsupported secure payload type: {}", msg_type))
 }
 
 fn nonce_to_bytes(counter: u64) -> [u8; 12] {

@@ -34,37 +34,6 @@ const CHUNK_SIZE_XLARGE: usize = 512 * 1024; // >1GB: 512KB
 /// transport / parser thresholds.
 const CHUNK_SIZE_MAX_SAFE: usize = 64 * 1024;
 
-mod chunk_data_serde {
-    use base64::engine::general_purpose::STANDARD as B64;
-    use base64::Engine as _;
-    use serde::{de::Error as SerdeDeError, Deserialize, Deserializer, Serializer};
-
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum ChunkDataRepr {
-        Base64(String),
-        ByteArray(Vec<u8>),
-    }
-
-    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&B64.encode(bytes))
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        match ChunkDataRepr::deserialize(deserializer)? {
-            ChunkDataRepr::Base64(value) => {
-                B64.decode(value).map_err(|error| SerdeDeError::custom(error.to_string()))
-            }
-            ChunkDataRepr::ByteArray(value) => Ok(value),
-        }
-    }
-}
 
 /// Progress event throttling
 const PROGRESS_EMIT_INTERVAL_MS: u64 = 100;
@@ -95,7 +64,6 @@ pub struct WormholeRequest {
 pub struct WormholeChunk {
     pub file_id: String,
     pub offset: u64,
-    #[serde(with = "chunk_data_serde")]
     pub data: Vec<u8>,
     pub is_final: bool,
 }
