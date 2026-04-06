@@ -101,6 +101,9 @@ jobs:
       - name: Build and release
         uses: tauri-apps/tauri-action@action-v0.6.2
         env:
+          TAURI_LOG: debug
+          RUST_LOG: tauri_bundler=debug
+          RUST_BACKTRACE: "1"
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:

@@ -2,8 +2,15 @@
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi"
      xmlns:fire="http://schemas.microsoft.com/wix/FirewallExtension">
   <Fragment>
-    <ComponentGroup Id="CopiSyncFirewall">
+    <DirectoryRef Id="TARGETDIR">
       <Component Id="CmpCopiSyncFirewall" Guid="*">
+        <RegistryValue
+          Root="HKLM"
+          Key="Software\Pixlox\Copi"
+          Name="FirewallRulesInstalled"
+          Type="integer"
+          Value="1"
+          KeyPath="yes" />
         <fire:FirewallException
           Id="CopiSyncTcp51827"
           Name="Copi LAN Sync TCP"
@@ -19,6 +26,7 @@
           Scope="localSubnet"
           IgnoreFailure="yes" />
       </Component>
-    </ComponentGroup>
+    </DirectoryRef>
   </Fragment>
+
 </Wix>
