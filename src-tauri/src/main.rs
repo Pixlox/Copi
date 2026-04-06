@@ -580,8 +580,24 @@ fn main() {
                     #[cfg(target_os = "windows")]
                     log_startup_line("[Wormhole Test] started");
 
-                    eprintln!("[Wormhole Test] Waiting 5s for sync to establish...");
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    let start_delay_secs = std::env::var("COPI_WORMHOLE_TEST_START_DELAY_SECS")
+                        .ok()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(8);
+                    let poll_attempts = std::env::var("COPI_WORMHOLE_TEST_ATTEMPTS")
+                        .ok()
+                        .and_then(|s| s.parse::<u32>().ok())
+                        .unwrap_or(90);
+                    let poll_interval_secs = std::env::var("COPI_WORMHOLE_TEST_POLL_SECS")
+                        .ok()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(2);
+
+                    eprintln!(
+                        "[Wormhole Test] Waiting {}s for sync to establish...",
+                        start_delay_secs
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(start_delay_secs)).await;
 
                     eprintln!("[Wormhole Test] Running wormhole_debug_sync_status...");
                     match wormhole::wormhole_debug_sync_status(test_handle.clone()).await {
@@ -610,6 +626,15 @@ fn main() {
                     log_startup_line(&format!(
                         "[Wormhole Test] mode={} offer={} download={}",
                         test_mode, do_offer, do_download
+                    ));
+                    eprintln!(
+                        "[Wormhole Test] polling attempts={} interval={}s",
+                        poll_attempts, poll_interval_secs
+                    );
+                    #[cfg(target_os = "windows")]
+                    log_startup_line(&format!(
+                        "[Wormhole Test] polling attempts={} interval={}s",
+                        poll_attempts, poll_interval_secs
                     ));
 
                     let preferred_remote_offer_id = std::env::var("COPI_WORMHOLE_DOWNLOAD_FILE_ID").ok();
@@ -678,7 +703,7 @@ fn main() {
 
                     // Try to find a remote offer and download it.
                     let mut target_remote_file: Option<String> = None;
-                    for attempt in 1..=45 {
+                    for attempt in 1..=poll_attempts {
                         match wormhole::wormhole_list_files(test_handle.clone()).await {
                             Ok(files) => {
                                 if target_remote_file.is_none() {
@@ -789,7 +814,7 @@ fn main() {
                                 attempt
                             );
                         }
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        tokio::time::sleep(std::time::Duration::from_secs(poll_interval_secs)).await;
                     }
 
                     eprintln!("[Wormhole Test] Completed without observing full remote download flow");
