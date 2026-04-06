@@ -20,6 +20,7 @@ import {
   Pencil,
   Check,
   Laptop,
+  Zap,
 } from "lucide-react";
 import { useThemeContext } from "../contexts/ThemeContext";
 import Picker from "../components/Picker";
@@ -1379,6 +1380,14 @@ export default function Settings() {
         </nav>
 
         <div className="settings-sidebar-footer">
+          <button 
+            className="settings-wormhole-btn"
+            onClick={() => invoke("open_wormhole_window")}
+            title="Open Wormhole - Send large files"
+          >
+            <Zap size={14} />
+            <span>Wormhole</span>
+          </button>
           <span>{appVersion ? `v${appVersion}` : ""}</span>
         </div>
       </aside>

@@ -23,6 +23,7 @@ mod query_parser;
 mod search;
 mod settings;
 mod sync;
+mod wormhole;
 
 #[cfg(target_os = "windows")]
 fn startup_log_path() -> std::path::PathBuf {
@@ -363,6 +364,8 @@ fn main() {
             app.manage(MenuBarState {
                 tray_icon: Mutex::new(None),
             });
+            // Initialize wormhole state
+            app.manage(wormhole::WormholeState::new());
 
             let shortcut_plugin_result = handle.plugin(
                 tauri_plugin_global_shortcut::Builder::new()
@@ -607,6 +610,16 @@ fn main() {
             collections::list_collections,
             collections::move_clip_to_collection,
             open_external_url,
+            // Wormhole commands
+            wormhole::wormhole_offer_file,
+            wormhole::wormhole_retract,
+            wormhole::wormhole_request_download,
+            wormhole::wormhole_cancel_download,
+            wormhole::wormhole_list_files,
+            wormhole::wormhole_get_file,
+            wormhole::wormhole_clear_completed,
+            wormhole::wormhole_get_pending_count,
+            wormhole::open_wormhole_window,
         ])
         .build(tauri::generate_context!())
         .unwrap_or_else(|error| {
@@ -794,6 +807,9 @@ pub(crate) fn start_runtime_services_once(app: &tauri::AppHandle) {
 
     let sync_state = crate::sync::start_sync(app.clone());
     let _ = app.state::<AppState>().sync.set(sync_state);
+
+    // Start wormhole expiry cleanup task
+    wormhole::start_expiry_task(app.clone());
 }
 
 fn show_setup_window_inner(app: &tauri::AppHandle) {

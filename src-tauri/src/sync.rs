@@ -89,6 +89,20 @@ enum Msg {
     },
     Ping,
     Pong,
+    // Wormhole messages for large file transfer
+    WormholeOffer(crate::wormhole::WormholeOffer),
+    WormholeRetract {
+        file_id: String,
+    },
+    WormholeRequest(crate::wormhole::WormholeRequest),
+    WormholeChunk(crate::wormhole::WormholeChunk),
+    WormholeComplete {
+        file_id: String,
+    },
+    WormholeAck {
+        file_id: String,
+    },
+    WormholeReject(crate::wormhole::WormholeReject),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -420,6 +434,126 @@ impl SyncState {
         if let Ok(mut guard) = self.pairing_pin.lock() {
             *guard = None;
         }
+    }
+
+    // ─── Wormhole Methods ─────────────────────────────────────────
+
+    /// Broadcast a wormhole file offer to all connected peers
+    pub async fn broadcast_wormhole_offer(&self, offer: crate::wormhole::WormholeOffer) -> Result<()> {
+        if !self.is_enabled() {
+            return Ok(());
+        }
+        eprintln!(
+            "[Wormhole] Broadcasting offer to peers: {} ({})",
+            offer.file_name, offer.id
+        );
+        self.broadcast(Msg::WormholeOffer(offer)).await
+    }
+
+    /// Broadcast wormhole file retraction to all connected peers
+    pub async fn broadcast_wormhole_retract(&self, file_id: &str) -> Result<()> {
+        if !self.is_enabled() {
+            return Ok(());
+        }
+        eprintln!("[Wormhole] Broadcasting retract: {}", file_id);
+        self.broadcast(Msg::WormholeRetract {
+            file_id: file_id.to_string(),
+        })
+        .await
+    }
+
+    /// Send wormhole request to a specific peer
+    pub async fn send_wormhole_request(
+        &self,
+        peer_device_id: &str,
+        request: crate::wormhole::WormholeRequest,
+    ) -> Result<()> {
+        let writer = {
+            let guard = self.live.read().await;
+            guard
+                .get(peer_device_id)
+                .map(|peer| peer.writer.clone())
+                .ok_or_else(|| anyhow!("Peer not connected: {}", peer_device_id))?
+        };
+        eprintln!(
+            "[Wormhole] Sending request to {}: {}",
+            peer_device_id, request.file_id
+        );
+        writer.send(&Msg::WormholeRequest(request)).await
+    }
+
+    /// Send wormhole chunk to a specific peer
+    pub async fn send_wormhole_chunk(
+        &self,
+        peer_device_id: &str,
+        chunk: crate::wormhole::WormholeChunk,
+    ) -> Result<()> {
+        let writer = {
+            let guard = self.live.read().await;
+            guard
+                .get(peer_device_id)
+                .map(|peer| peer.writer.clone())
+                .ok_or_else(|| anyhow!("Peer not connected: {}", peer_device_id))?
+        };
+        writer.send(&Msg::WormholeChunk(chunk)).await
+    }
+
+    /// Send wormhole complete notification to a specific peer
+    pub async fn send_wormhole_complete(&self, peer_device_id: &str, file_id: &str) -> Result<()> {
+        let writer = {
+            let guard = self.live.read().await;
+            guard
+                .get(peer_device_id)
+                .map(|peer| peer.writer.clone())
+                .ok_or_else(|| anyhow!("Peer not connected: {}", peer_device_id))?
+        };
+        eprintln!(
+            "[Wormhole] Sending complete to {}: {}",
+            peer_device_id, file_id
+        );
+        writer
+            .send(&Msg::WormholeComplete {
+                file_id: file_id.to_string(),
+            })
+            .await
+    }
+
+    /// Send wormhole acknowledgment to a specific peer
+    pub async fn send_wormhole_ack(&self, peer_device_id: &str, file_id: &str) -> Result<()> {
+        let writer = {
+            let guard = self.live.read().await;
+            guard
+                .get(peer_device_id)
+                .map(|peer| peer.writer.clone())
+                .ok_or_else(|| anyhow!("Peer not connected: {}", peer_device_id))?
+        };
+        writer
+            .send(&Msg::WormholeAck {
+                file_id: file_id.to_string(),
+            })
+            .await
+    }
+
+    /// Send wormhole rejection to a specific peer
+    pub async fn send_wormhole_reject(
+        &self,
+        peer_device_id: &str,
+        file_id: &str,
+        reason: &str,
+    ) -> Result<()> {
+        let writer = {
+            let guard = self.live.read().await;
+            guard
+                .get(peer_device_id)
+                .map(|peer| peer.writer.clone())
+                .ok_or_else(|| anyhow!("Peer not connected: {}", peer_device_id))?
+        };
+        writer
+            .send(&Msg::WormholeReject(crate::wormhole::WormholeReject {
+                file_id: file_id.to_string(),
+                reason: reason.to_string(),
+            }))
+            .await
     }
 }
 
@@ -1431,6 +1565,29 @@ async fn handle_message(
         }
         Msg::Ping => writer.send(&Msg::Pong).await,
         Msg::Pong => Ok(()),
+        // Wormhole message handling
+        Msg::WormholeOffer(offer) => {
+            handle_wormhole_offer(app, peer_id, offer).await
+        }
+        Msg::WormholeRetract { file_id } => {
+            handle_wormhole_retract(app, &file_id).await
+        }
+        Msg::WormholeRequest(request) => {
+            handle_wormhole_request(app, peer_id, request).await
+        }
+        Msg::WormholeChunk(chunk) => {
+            handle_wormhole_chunk(app, chunk).await
+        }
+        Msg::WormholeComplete { file_id } => {
+            handle_wormhole_complete(app, &file_id).await
+        }
+        Msg::WormholeAck { file_id } => {
+            eprintln!("[Wormhole] Received ack for file: {}", file_id);
+            Ok(())
+        }
+        Msg::WormholeReject(reject) => {
+            handle_wormhole_reject(app, reject).await
+        }
         _ => Ok(()),
     }
 }
@@ -3338,6 +3495,209 @@ pub fn on_collection_changed(app: &AppHandle) {
             eprintln!("[Sync] Failed to push collection batch: {}", error);
         }
     });
+}
+
+// ─── Wormhole Message Handlers ────────────────────────────────────
+
+/// Handle incoming wormhole offer from peer
+async fn handle_wormhole_offer(
+    app: &AppHandle,
+    peer_device_id: &str,
+    offer: crate::wormhole::WormholeOffer,
+) -> Result<()> {
+    eprintln!(
+        "[Wormhole] Received offer from {}: {} ({} bytes)",
+        peer_device_id, offer.file_name, offer.file_size
+    );
+
+    // Get peer display name
+    let peer_name = {
+        let state = app.state::<AppState>();
+        let conn = state.db_read_pool.get().context("get db connection")?;
+        conn.query_row(
+            "SELECT display_name FROM sync_peers WHERE device_id = ?1",
+            [peer_device_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    };
+
+    // Create wormhole file record
+    let wormhole_file = crate::wormhole::WormholeFile {
+        id: offer.id.clone(),
+        file_name: offer.file_name.clone(),
+        file_size: offer.file_size,
+        mime_type: offer.mime_type.clone(),
+        checksum: offer.checksum.clone(),
+        origin_device_id: peer_device_id.to_string(),
+        origin_device_name: peer_name,
+        is_local: false,
+        status: crate::wormhole::WormholeStatus::Available,
+        bytes_transferred: 0,
+        transfer_started_at: None,
+        transfer_completed_at: None,
+        local_path: None,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        expires_at: offer.expires_at.clone(),
+    };
+
+    // Insert into database
+    {
+        let state = app.state::<AppState>();
+        let conn = state.db_write.lock().map_err(|e| anyhow!("lock: {}", e))?;
+        crate::wormhole::insert_wormhole_file(&conn, &wormhole_file)?;
+    }
+
+    // Emit event to UI
+    let _ = app.emit("wormhole://offer-received", &wormhole_file);
+
+    Ok(())
+}
+
+/// Handle wormhole retract message
+async fn handle_wormhole_retract(app: &AppHandle, file_id: &str) -> Result<()> {
+    eprintln!("[Wormhole] Received retract: {}", file_id);
+
+    // Update database
+    {
+        let state = app.state::<AppState>();
+        let conn = state.db_write.lock().map_err(|e| anyhow!("lock: {}", e))?;
+        crate::wormhole::update_wormhole_status(
+            &conn,
+            file_id,
+            crate::wormhole::WormholeStatus::Cancelled,
+        )?;
+    }
+
+    // Cancel any active transfer
+    if let Some(wormhole_state) = app.try_state::<crate::wormhole::WormholeState>() {
+        wormhole_state.cancel_transfer(file_id).await;
+    }
+
+    // Emit event to UI
+    let _ = app.emit("wormhole://offer-retracted", file_id);
+
+    Ok(())
+}
+
+/// Handle wormhole download request from peer
+async fn handle_wormhole_request(
+    app: &AppHandle,
+    peer_device_id: &str,
+    request: crate::wormhole::WormholeRequest,
+) -> Result<()> {
+    eprintln!(
+        "[Wormhole] Received download request from {} for {}",
+        peer_device_id, request.file_id
+    );
+
+    // Verify file exists and we're the owner
+    let file = {
+        let state = app.state::<AppState>();
+        let conn = state.db_read_pool.get().context("get db connection")?;
+        crate::wormhole::get_wormhole_file(&conn, &request.file_id)?
+    };
+
+    let Some(file) = file else {
+        eprintln!("[Wormhole] File not found: {}", request.file_id);
+        let state = app.state::<AppState>();
+        if let Some(sync) = state.sync.get() {
+            let _ = sync
+                .send_wormhole_reject(peer_device_id, &request.file_id, "File not found")
+                .await;
+        }
+        return Ok(());
+    };
+
+    if !file.is_local {
+        eprintln!("[Wormhole] Not the owner of file: {}", request.file_id);
+        let state = app.state::<AppState>();
+        if let Some(sync) = state.sync.get() {
+            let _ = sync
+                .send_wormhole_reject(peer_device_id, &request.file_id, "Not the file owner")
+                .await;
+        }
+        return Ok(());
+    }
+
+    // Start streaming file to peer
+    let app_clone = app.clone();
+    let peer_id = peer_device_id.to_string();
+    let file_id = request.file_id.clone();
+    let resume_from = request.resume_from.unwrap_or(0);
+
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) =
+            crate::wormhole::stream_file_to_peer(&app_clone, &file_id, &peer_id, resume_from).await
+        {
+            eprintln!("[Wormhole] Stream failed: {}", e);
+            let _ = app_clone.emit(
+                "wormhole://transfer-failed",
+                serde_json::json!({
+                    "file_id": file_id,
+                    "reason": e.to_string()
+                }),
+            );
+        }
+    });
+
+    Ok(())
+}
+
+/// Handle incoming wormhole chunk
+async fn handle_wormhole_chunk(
+    app: &AppHandle,
+    chunk: crate::wormhole::WormholeChunk,
+) -> Result<()> {
+    crate::wormhole::handle_incoming_chunk(app, chunk).await
+}
+
+/// Handle wormhole transfer complete notification
+async fn handle_wormhole_complete(app: &AppHandle, file_id: &str) -> Result<()> {
+    eprintln!("[Wormhole] Received complete notification for: {}", file_id);
+
+    // The actual completion is handled in handle_incoming_chunk when is_final=true
+    // This message is for confirmation/acknowledgment
+
+    Ok(())
+}
+
+/// Handle wormhole rejection
+async fn handle_wormhole_reject(
+    app: &AppHandle,
+    reject: crate::wormhole::WormholeReject,
+) -> Result<()> {
+    eprintln!(
+        "[Wormhole] Received rejection for {}: {}",
+        reject.file_id, reject.reason
+    );
+
+    // Update database status
+    {
+        let state = app.state::<AppState>();
+        let conn = state.db_write.lock().map_err(|e| anyhow!("lock: {}", e))?;
+        crate::wormhole::update_wormhole_status(
+            &conn,
+            &reject.file_id,
+            crate::wormhole::WormholeStatus::Failed,
+        )?;
+    }
+
+    // Cancel any active transfer
+    if let Some(wormhole_state) = app.try_state::<crate::wormhole::WormholeState>() {
+        wormhole_state.cancel_transfer(&reject.file_id).await;
+    }
+
+    // Emit event to UI
+    let _ = app.emit(
+        "wormhole://transfer-failed",
+        serde_json::json!({
+            "file_id": reject.file_id,
+            "reason": reject.reason
+        }),
+    );
+
+    Ok(())
 }
 
 #[cfg(test)]

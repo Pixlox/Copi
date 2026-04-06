@@ -49,6 +49,8 @@ pub struct SyncConfig {
     pub sync_embeddings: bool,
     /// Sync pinned state and collections metadata across devices
     pub sync_collections_and_pins: bool,
+    /// Wormhole file expiration time in hours (default 24)
+    pub wormhole_expiration_hours: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -59,6 +61,7 @@ pub struct SyncConfigPayload {
     pub auto_connect: bool,
     pub sync_embeddings: bool,
     pub sync_collections_and_pins: bool,
+    pub wormhole_expiration_hours: Option<u32>,
 }
 
 impl From<SyncConfig> for SyncConfigPayload {
@@ -69,6 +72,7 @@ impl From<SyncConfig> for SyncConfigPayload {
             auto_connect: value.auto_connect,
             sync_embeddings: value.sync_embeddings,
             sync_collections_and_pins: value.sync_collections_and_pins,
+            wormhole_expiration_hours: value.wormhole_expiration_hours,
         }
     }
 }
@@ -161,6 +165,7 @@ impl Default for SyncConfig {
             auto_connect: true,
             sync_embeddings: true,
             sync_collections_and_pins: false,
+            wormhole_expiration_hours: Some(24),
         }
     }
 }
