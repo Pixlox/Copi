@@ -1,6 +1,6 @@
 [package]
 name = "copi"
-version = "0.4.21"
+version = "0.4.22"
 edition = "2021"
 rust-version = "1.88"
 authors = ["Pixlox"]
@@ -84,6 +84,7 @@ windows = { version = "0.61", features = [
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+
 
 
 
