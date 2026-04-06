@@ -77,6 +77,9 @@
         "componentGroupRefs": [
           "CopiSyncFirewall"
         ]
+      },
+      "nsis": {
+        "installerHooks": "../../wix/firewall-hooks.nsh"
       }
     },
     "icon": [

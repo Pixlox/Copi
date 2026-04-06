@@ -32,7 +32,16 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
+
+      - name: Install Windows build tools
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install WiX Toolset
+        if: runner.os == 'Windows'
+        run: choco install wixtoolset --no-progress -y
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
