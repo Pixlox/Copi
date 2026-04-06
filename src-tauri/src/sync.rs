@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -31,6 +31,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const PING_INTERVAL: Duration = Duration::from_secs(60);
 pub const FILE_AUTO_SYNC_MAX_BYTES: i64 = 10 * 1024 * 1024;
 const SYNC_VERSION_STRIDE: i64 = 1_i64 << 32;
+const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
@@ -166,13 +167,54 @@ pub struct PeerWriter(Arc<AsyncMutex<tokio::net::tcp::OwnedWriteHalf>>);
 
 impl PeerWriter {
     async fn send(&self, msg: &Msg) -> Result<()> {
-        let mut payload = serde_json::to_vec(msg).context("serialize msg")?;
-        payload.push(b'\n');
+        let payload = serde_json::to_vec(msg).context("serialize msg")?;
+        if payload.len() > MAX_FRAME_BYTES {
+            return Err(anyhow!(
+                "frame too large: {} bytes (max {})",
+                payload.len(),
+                MAX_FRAME_BYTES
+            ));
+        }
         let mut writer = self.0.lock().await;
-        writer.write_all(&payload).await.context("write msg")?;
+        let frame_len = (payload.len() as u32).to_be_bytes();
+        writer
+            .write_all(&frame_len)
+            .await
+            .context("write frame len")?;
+        writer.write_all(&payload).await.context("write frame msg")?;
         writer.flush().await.context("flush msg")?;
         Ok(())
     }
+}
+
+async fn read_frame(
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+) -> Result<Option<Vec<u8>>> {
+    let mut len_buf = [0u8; 4];
+    match reader.read_exact(&mut len_buf).await {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Ok(None);
+        }
+        Err(error) => return Err(anyhow!("read frame len: {}", error)),
+    }
+
+    let frame_len = u32::from_be_bytes(len_buf) as usize;
+    if frame_len == 0 || frame_len > MAX_FRAME_BYTES {
+        return Err(anyhow!(
+            "invalid frame length {} (max {})",
+            frame_len,
+            MAX_FRAME_BYTES
+        ));
+    }
+
+    let mut frame = vec![0u8; frame_len];
+    reader
+        .read_exact(&mut frame)
+        .await
+        .context("read frame payload")?;
+
+    Ok(Some(frame))
 }
 
 #[derive(Clone)]
@@ -192,13 +234,27 @@ impl SecureSender {
             .cipher
             .encrypt(Nonce::from_slice(&nonce_bytes), payload.as_ref())
             .context("encrypt secure msg")?;
-        let mut frame = serde_json::to_vec(&Msg::Secure {
+        let frame = serde_json::to_vec(&Msg::Secure {
             nonce,
             payload: B64.encode(encrypted),
         })
         .context("serialize msg")?;
-        frame.push(b'\n');
-        writer.write_all(&frame).await.context("write msg")?;
+        if frame.len() > MAX_FRAME_BYTES {
+            return Err(anyhow!(
+                "secure frame too large: {} bytes (max {})",
+                frame.len(),
+                MAX_FRAME_BYTES
+            ));
+        }
+        let frame_len = (frame.len() as u32).to_be_bytes();
+        writer
+            .write_all(&frame_len)
+            .await
+            .context("write secure frame len")?;
+        writer
+            .write_all(&frame)
+            .await
+            .context("write secure frame")?;
         writer.flush().await.context("flush msg")?;
         Ok(())
     }
@@ -1217,12 +1273,11 @@ async fn run_session(
             .await?;
     }
 
-    let mut first_line = String::new();
-    let read = reader.read_line(&mut first_line).await?;
-    if read == 0 {
+    let first_frame = read_frame(&mut reader).await?;
+    let Some(first_frame) = first_frame else {
         return Err(anyhow!("session closed before handshake"));
-    }
-    let first_msg: Msg = serde_json::from_str(first_line.trim_end()).context("parse first msg")?;
+    };
+    let first_msg: Msg = serde_json::from_slice(&first_frame).context("parse first msg")?;
 
     let (peer_id, peer_seed) = match first_msg {
         Msg::PairRequest {
@@ -1353,13 +1408,12 @@ async fn run_session(
             .await?;
     }
 
-    let mut handshake_line = String::new();
-    let read = reader.read_line(&mut handshake_line).await?;
-    if read == 0 {
+    let handshake_frame = read_frame(&mut reader).await?;
+    let Some(handshake_frame) = handshake_frame else {
         return Err(anyhow!("session closed before secure handshake"));
-    }
+    };
     let handshake_outer: Msg =
-        serde_json::from_str(handshake_line.trim_end()).context("parse handshake outer msg")?;
+        serde_json::from_slice(&handshake_frame).context("parse handshake outer msg")?;
     let handshake_msg = match handshake_outer {
         Msg::Secure { nonce, payload } => secure_receiver.decrypt_msg(nonce, &payload)?,
         _ => return Err(anyhow!("expected secure handshake frame")),
@@ -1564,18 +1618,17 @@ async fn run_session(
 
     let mut ping = tokio::time::interval(PING_INTERVAL);
     let session_result = loop {
-        let mut line = String::new();
         tokio::select! {
-            read_result = reader.read_line(&mut line) => {
+            read_result = read_frame(&mut reader) => {
                 match read_result {
-                    Ok(0) => break Ok(()),
-                    Ok(_) => {
-                        let raw = line.trim_end();
-                        let outer: Msg = match serde_json::from_str(raw) {
+                    Ok(None) => break Ok(()),
+                    Ok(Some(frame)) => {
+                        let outer: Msg = match serde_json::from_slice(&frame) {
                             Ok(msg) => msg,
                             Err(error) => {
+                                let raw = String::from_utf8_lossy(&frame);
                                 let prefix: String = raw.chars().take(80).collect();
-                                let bytes: Vec<u8> = raw.as_bytes().iter().take(24).copied().collect();
+                                let bytes: Vec<u8> = frame.iter().take(24).copied().collect();
                                 eprintln!("[Sync] Failed to parse message from {}: {}", peer_id, error);
                                 eprintln!(
                                     "[Sync] Parse raw prefix from {}: {:?} bytes={:02X?}",
@@ -1604,7 +1657,7 @@ async fn run_session(
                             break Err(error);
                         }
                     }
-                    Err(error) => break Err(anyhow!("read error: {}", error)),
+                    Err(error) => break Err(anyhow!("read frame error: {}", error)),
                 }
             }
             _ = ping.tick() => {
@@ -3080,16 +3133,14 @@ pub async fn sync_pair_with(
         .map_err(|e| e.to_string())?;
 
     let mut reader = BufReader::new(read_half);
-    let mut line = String::new();
-    let read = reader
-        .read_line(&mut line)
+    let frame = read_frame(&mut reader)
         .await
         .map_err(|e| e.to_string())?;
-    if read == 0 {
+    let Some(frame) = frame else {
         return Err("pairing connection closed".to_string());
-    }
+    };
 
-    let msg: Msg = serde_json::from_str(line.trim_end()).map_err(|e| e.to_string())?;
+    let msg: Msg = serde_json::from_slice(&frame).map_err(|e| e.to_string())?;
     match msg {
         Msg::PairAccept {
             device_id,
