@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback, useRef, type MouseEvent as ReactMouse
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   Upload,
@@ -523,7 +524,8 @@ export default function Wormhole() {
   // Native drag-and-drop listener (reliable on Tauri desktop)
   useEffect(() => {
     let dragDepth = 0;
-    const unlistenPromise = getCurrentWindow().onDragDropEvent((event) => {
+
+    const handleNativeDragEvent = (event: { payload: { type: "enter" | "over" | "drop" | "leave"; paths?: string[] } }) => {
       const payload = event.payload;
       if (payload.type === "enter") {
         dragDepth += 1;
@@ -547,12 +549,21 @@ export default function Wormhole() {
       if (payload.type === "drop") {
         dragDepth = 0;
         setIsDragActive(false);
-        void handleFilesDropped(payload.paths);
+        void handleFilesDropped(payload.paths ?? []);
       }
+    };
+
+    const unlistenWindowPromise = getCurrentWindow().onDragDropEvent((event) => {
+      handleNativeDragEvent(event as { payload: { type: "enter" | "over" | "drop" | "leave"; paths?: string[] } });
+    });
+
+    const unlistenWebviewPromise = getCurrentWebview().onDragDropEvent((event) => {
+      handleNativeDragEvent(event as { payload: { type: "enter" | "over" | "drop" | "leave"; paths?: string[] } });
     });
 
     return () => {
-      unlistenPromise.then((fn) => fn());
+      unlistenWindowPromise.then((fn) => fn());
+      unlistenWebviewPromise.then((fn) => fn());
     };
   }, [handleFilesDropped]);
 
