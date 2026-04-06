@@ -211,24 +211,6 @@ impl SecureReceiver {
         Ok(msg)
     }
 
-    fn decrypt_next_msg(&mut self, payload_b64: &str) -> Result<Msg> {
-        let nonce = self.next_nonce;
-        self.decrypt_msg(nonce, payload_b64)
-    }
-}
-
-fn looks_like_raw_secure_payload(line: &str) -> bool {
-    if line.len() < 24 {
-        return false;
-    }
-    line.as_bytes().iter().all(|b| {
-        b.is_ascii_alphanumeric()
-            || *b == b'+'
-            || *b == b'/'
-            || *b == b'='
-            || *b == b'-'
-            || *b == b'_'
-    })
 }
 
 fn nonce_to_bytes(counter: u64) -> [u8; 12] {
@@ -1345,26 +1327,6 @@ async fn run_session(
                         let outer: Msg = match serde_json::from_str(raw) {
                             Ok(msg) => msg,
                             Err(error) => {
-                                if looks_like_raw_secure_payload(raw) {
-                                    match secure_receiver.decrypt_next_msg(raw) {
-                                        Ok(msg) => {
-                                            eprintln!(
-                                                "[Sync] Recovered raw secure payload frame from {}",
-                                                peer_id
-                                            );
-                                            if let Err(error) = handle_message(&app, &sync, &peer_id, &secure_writer, msg).await {
-                                                break Err(error);
-                                            }
-                                            continue;
-                                        }
-                                        Err(fallback_error) => {
-                                            eprintln!(
-                                                "[Sync] Failed raw secure payload recovery from {}: {}",
-                                                peer_id, fallback_error
-                                            );
-                                        }
-                                    }
-                                }
                                 let prefix: String = raw.chars().take(80).collect();
                                 let bytes: Vec<u8> = raw.as_bytes().iter().take(24).copied().collect();
                                 eprintln!("[Sync] Failed to parse message from {}: {}", peer_id, error);
