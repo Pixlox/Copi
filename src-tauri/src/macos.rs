@@ -188,11 +188,6 @@ pub(crate) fn get_foreground_window_handle() -> Option<isize> {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
-pub(crate) fn get_foreground_window_handle() -> Option<isize> {
-    None
-}
-
 #[cfg(target_os = "macos")]
 pub(crate) fn get_app_icon_png(app_info: &FrontmostApp) -> Option<Vec<u8>> {
     use objc2::runtime::AnyObject;

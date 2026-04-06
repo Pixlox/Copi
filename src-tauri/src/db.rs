@@ -73,7 +73,12 @@ pub fn init_db(app: &tauri::AppHandle) -> Result<DbConnections> {
             id INTEGER PRIMARY KEY,
             name TEXT NOT NULL,
             color TEXT,
-            created_at INTEGER NOT NULL
+            created_at INTEGER NOT NULL,
+            -- Sync columns
+            sync_id TEXT UNIQUE,
+            sync_version INTEGER DEFAULT 0,
+            deleted INTEGER DEFAULT 0,
+            origin_device_id TEXT
         );
 
         CREATE TABLE IF NOT EXISTS clips (
@@ -89,15 +94,73 @@ pub fn init_db(app: &tauri::AppHandle) -> Result<DbConnections> {
             image_thumbnail BLOB,
             image_width INTEGER DEFAULT 0,
             image_height INTEGER DEFAULT 0,
+            is_file INTEGER DEFAULT 0,
+            file_name TEXT,
+            file_size INTEGER DEFAULT 0,
+            file_data BLOB,
+            file_path TEXT,
             created_at INTEGER NOT NULL,
             pinned INTEGER DEFAULT 0,
-            collection_id INTEGER REFERENCES collections(id)
+            collection_id INTEGER REFERENCES collections(id),
+            collection_sync_id TEXT,
+            -- Sync columns
+            sync_id TEXT UNIQUE,
+            sync_version INTEGER DEFAULT 0,
+            deleted INTEGER DEFAULT 0,
+            origin_device_id TEXT
         );
 
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS sync_peers (
+            device_id TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL DEFAULT '',
+            last_seen INTEGER NOT NULL DEFAULT 0,
+            last_addr TEXT,
+            public_key TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS sync_cursors (
+            device_id TEXT PRIMARY KEY,
+            last_received_ts INTEGER NOT NULL DEFAULT 0
+        );
+
+        -- Sync: Device identity (this device)
+        CREATE TABLE IF NOT EXISTS device_info (
+            device_id TEXT PRIMARY KEY,
+            device_name TEXT NOT NULL,
+            platform TEXT NOT NULL,
+            private_key BLOB NOT NULL,
+            public_key BLOB NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+
+        -- Sync: Paired devices (other devices we sync with)
+        CREATE TABLE IF NOT EXISTS paired_devices (
+            device_id TEXT PRIMARY KEY,
+            device_name TEXT NOT NULL,
+            platform TEXT NOT NULL,
+            public_key BLOB NOT NULL,
+            paired_at INTEGER NOT NULL,
+            last_seen INTEGER,
+            last_sync_version INTEGER DEFAULT 0,
+            last_sent_version INTEGER DEFAULT 0
+        );
+
+        -- Sync: Pending operations queue (for offline sync)
+        CREATE TABLE IF NOT EXISTS sync_queue (
+            id INTEGER PRIMARY KEY,
+            operation TEXT NOT NULL,
+            entity_type TEXT NOT NULL,
+            entity_sync_id TEXT NOT NULL,
+            payload BLOB NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+
+        -- Sync indexes are created in run_migrations() after legacy columns are added.
         ",
     )?;
 
@@ -171,6 +234,7 @@ pub fn init_db(app: &tauri::AppHandle) -> Result<DbConnections> {
         "
         CREATE INDEX IF NOT EXISTS idx_clips_sort ON clips(pinned DESC, copy_count DESC, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_clips_created_at ON clips(created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_clips_active_created ON clips(deleted, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_clips_collection_created ON clips(collection_id, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_clips_content_type_created ON clips(content_type, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_clips_language_created ON clips(language, created_at DESC);
@@ -225,9 +289,21 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         ("image_thumbnail", "BLOB"),
         ("image_width", "INTEGER DEFAULT 0"),
         ("image_height", "INTEGER DEFAULT 0"),
+        ("is_file", "INTEGER DEFAULT 0"),
+        ("file_name", "TEXT"),
+        ("file_size", "INTEGER DEFAULT 0"),
+        ("file_data", "BLOB"),
+        ("file_path", "TEXT"),
         ("pinned", "INTEGER DEFAULT 0"),
         ("language", "TEXT"),
         ("copy_count", "INTEGER DEFAULT 0"),
+        ("collection_sync_id", "TEXT"),
+        // Sync columns
+        ("sync_id", "TEXT"),
+        ("sync_version", "INTEGER DEFAULT 0"),
+        ("deleted", "INTEGER DEFAULT 0"),
+        ("origin_device_id", "TEXT"),
+        ("source_device", "TEXT NOT NULL DEFAULT ''"),
     ];
 
     for (col, col_type) in &needed {
@@ -238,6 +314,69 @@ fn run_migrations(conn: &Connection) -> Result<()> {
             )?;
         }
     }
+
+    // Migrate collections table for sync columns
+    let collection_columns: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('collections')")?
+        .query_map([], |row| row.get(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let collection_sync_cols = [
+        ("sync_id", "TEXT"),
+        ("sync_version", "INTEGER DEFAULT 0"),
+        ("deleted", "INTEGER DEFAULT 0"),
+        ("origin_device_id", "TEXT"),
+    ];
+
+    for (col, col_type) in &collection_sync_cols {
+        if !collection_columns.iter().any(|c| c == col) {
+            conn.execute(
+                &format!("ALTER TABLE collections ADD COLUMN {} {}", col, col_type),
+                [],
+            )?;
+        }
+    }
+
+    let paired_columns: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('paired_devices')")?
+        .query_map([], |row| row.get(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    if !paired_columns.iter().any(|c| c == "last_sent_version") {
+        conn.execute(
+            "ALTER TABLE paired_devices ADD COLUMN last_sent_version INTEGER DEFAULT 0",
+            [],
+        )?;
+    }
+
+    // Add last_addr column to sync_peers for cross-platform reconnection
+    let sync_peers_columns: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('sync_peers')")?
+        .query_map([], |row| row.get(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    if !sync_peers_columns.iter().any(|c| c == "last_addr") {
+        conn.execute("ALTER TABLE sync_peers ADD COLUMN last_addr TEXT", [])?;
+    }
+
+    if !sync_peers_columns.iter().any(|c| c == "public_key") {
+        conn.execute("ALTER TABLE sync_peers ADD COLUMN public_key TEXT", [])?;
+    }
+
+    conn.execute_batch(
+        "
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_clips_sync_id ON clips(sync_id) WHERE sync_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_clips_sync_version ON clips(sync_version);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_collections_sync_id ON collections(sync_id) WHERE sync_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_collections_sync_version ON collections(sync_version);
+        CREATE INDEX IF NOT EXISTS idx_clips_deleted ON clips(deleted) WHERE deleted = 1;
+        CREATE INDEX IF NOT EXISTS idx_collections_deleted ON collections(deleted) WHERE deleted = 1;
+        CREATE INDEX IF NOT EXISTS idx_sync_queue_created ON sync_queue(created_at);
+        CREATE INDEX IF NOT EXISTS idx_paired_devices_last_seen ON paired_devices(last_seen);
+        CREATE INDEX IF NOT EXISTS idx_clips_source_device ON clips(source_device, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_clips_collection_sync_id ON clips(collection_sync_id);
+        ",
+    )?;
 
     const PIN_SYSTEM_MIGRATION_KEY: &str = "pin_system_v1_migrated";
     let pin_migration_done = conn
@@ -260,6 +399,72 @@ fn run_migrations(conn: &Connection) -> Result<()> {
     // Migrate existing raw RGBA images to PNG (saves ~10-20x space)
     // Detect: image_data length > (image_width * image_height * 2) = likely raw RGBA
     migrate_raw_images_to_png(conn)?;
+
+    // Generate sync_id for existing clips and collections that don't have one
+    migrate_sync_ids(conn)?;
+
+    Ok(())
+}
+
+/// Generate sync_id (UUIDv4) for existing clips and collections
+fn migrate_sync_ids(conn: &Connection) -> Result<()> {
+    const MIGRATION_KEY: &str = "sync_ids_v1_migrated";
+    let done: Option<String> = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            [MIGRATION_KEY],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    if done.is_some() {
+        return Ok(());
+    }
+
+    // Get all clips without sync_id
+    let clip_ids: Vec<i64> = conn
+        .prepare("SELECT id FROM clips WHERE sync_id IS NULL")?
+        .query_map([], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let clip_count = clip_ids.len();
+    for id in clip_ids {
+        let sync_id = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "UPDATE clips SET sync_id = ?1 WHERE id = ?2",
+            rusqlite::params![sync_id, id],
+        )?;
+    }
+
+    // Get all collections without sync_id
+    let collection_ids: Vec<i64> = conn
+        .prepare("SELECT id FROM collections WHERE sync_id IS NULL")?
+        .query_map([], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let collection_count = collection_ids.len();
+    for id in collection_ids {
+        let sync_id = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "UPDATE collections SET sync_id = ?1 WHERE id = ?2",
+            rusqlite::params![sync_id, id],
+        )?;
+    }
+
+    conn.execute(
+        "INSERT OR REPLACE INTO settings(key, value) VALUES (?1, '1')",
+        [MIGRATION_KEY],
+    )?;
+
+    let total = clip_count + collection_count;
+    if total > 0 {
+        eprintln!(
+            "[DB] Generated sync_ids for {} clips and {} collections",
+            clip_count, collection_count
+        );
+    }
 
     Ok(())
 }

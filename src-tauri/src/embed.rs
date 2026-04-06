@@ -8,6 +8,7 @@ use tauri::{Emitter, Manager};
 use tokenizers::Tokenizer;
 
 const EMBED_DIMS: usize = 384;
+pub const EMBEDDING_MODEL_SIGNATURE: &str = "multilingual-e5-small-384-v1";
 const QUERY_CACHE_MAX: usize = 1024;
 const QUERY_CACHE_EVICT: usize = 256;
 const WORKER_CONCURRENCY: usize = 4;
@@ -186,6 +187,7 @@ fn collect_missing_embedding_ids(app: &tauri::AppHandle) -> Vec<i64> {
         "SELECT c.id FROM clips c
          LEFT JOIN clip_embeddings e ON c.id = e.rowid
          WHERE e.rowid IS NULL
+           AND c.deleted = 0
            AND (c.content_type != 'image' OR c.ocr_text IS NOT NULL)
            AND (c.content != '' OR c.ocr_text IS NOT NULL)
          ORDER BY c.created_at DESC",
@@ -289,7 +291,7 @@ fn embed_single_clip(model: &EmbeddingModel, app: &tauri::AppHandle, clip_id: i6
             }
         };
         match conn.query_row(
-            "SELECT content, ocr_text, source_app, content_type FROM clips WHERE id = ?",
+            "SELECT content, ocr_text, source_app, content_type FROM clips WHERE id = ? AND deleted = 0",
             [clip_id],
             |row| {
                 let content: String = row.get(0).unwrap_or_default();
@@ -364,6 +366,18 @@ fn embed_single_clip(model: &EmbeddingModel, app: &tauri::AppHandle, clip_id: i6
             return EmbedOutcome::Failed;
         }
     };
+    let sync_id: Option<String> = conn
+        .query_row("SELECT sync_id FROM clips WHERE id = ?1", [clip_id], |r| {
+            r.get(0)
+        })
+        .ok();
+    let sync_version: Option<i64> = conn
+        .query_row(
+            "SELECT sync_version FROM clips WHERE id = ?1",
+            [clip_id],
+            |r| r.get(0),
+        )
+        .ok();
     let _ = conn.execute("DELETE FROM clip_embeddings WHERE rowid = ?", [clip_id]);
     match conn.execute(
         "INSERT INTO clip_embeddings(rowid, embedding) VALUES (?1, ?2)",

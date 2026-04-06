@@ -7,6 +7,8 @@ export interface ClipResult {
   content: string;
   content_type: string;
   source_app: string;
+  source_device: string;
+  is_file: boolean;
   created_at: number;
   pinned: boolean;
   content_highlighted: string | null;
@@ -71,6 +73,8 @@ export function useSearch() {
   const resultsRef = useRef<ClipResult[]>([]);
   const totalCountRef = useRef(0);
   const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const refreshCollectionsPendingRef = useRef(false);
+  const refreshResultsPendingRef = useRef(false);
 
   const applySearchStatus = useCallback((nextStatus: SearchStatus) => {
     setSearchStatus((prev) => (searchStatusEqual(prev, nextStatus) ? prev : nextStatus));
@@ -91,6 +95,8 @@ export function useSearch() {
           clip.ocr_text === next?.ocr_text &&
           clip.content_type === next?.content_type &&
           clip.source_app === next?.source_app &&
+          clip.source_device === next?.source_device &&
+          clip.is_file === next?.is_file &&
           clip.created_at === next?.created_at
         );
       })
@@ -161,16 +167,24 @@ export function useSearch() {
   collectionIdRef.current = collectionId;
 
   const scheduleRefresh = useCallback((includeCollections: boolean, refreshResults: boolean) => {
+    refreshCollectionsPendingRef.current = refreshCollectionsPendingRef.current || includeCollections;
+    refreshResultsPendingRef.current = refreshResultsPendingRef.current || refreshResults;
+
     if (refreshTimerRef.current) {
       clearTimeout(refreshTimerRef.current);
     }
     refreshTimerRef.current = setTimeout(() => {
-      if (refreshResults) {
+      const shouldRefreshResults = refreshResultsPendingRef.current;
+      const shouldIncludeCollections = refreshCollectionsPendingRef.current;
+      refreshResultsPendingRef.current = false;
+      refreshCollectionsPendingRef.current = false;
+
+      if (shouldRefreshResults) {
         fetchResults(queryRef.current, filterRef.current, collectionIdRef.current);
       }
       fetchCount();
       fetchSearchStatus();
-      if (includeCollections) {
+      if (shouldIncludeCollections) {
         fetchCollections();
       }
     }, 90);
@@ -194,16 +208,20 @@ export function useSearch() {
     };
 
     const unlistenNew = listen("new-clip", () => refreshFromMutation(false, false));
-    const unlistenChanged = listen("clips-changed", () => refreshFromMutation(false, true)); // Always refresh on delete/update
+    const unlistenChanged = listen("clips-changed", () => refreshFromMutation(true, true)); // Always refresh on delete/update
     const unlistenCollections = listen("collections-changed", () => refreshFromMutation(true, true));
+    const unlistenOverlayShown = listen("overlay:shown", () => refreshFromMutation(true, true));
 
     return () => {
       if (refreshTimerRef.current) {
         clearTimeout(refreshTimerRef.current);
       }
+      refreshCollectionsPendingRef.current = false;
+      refreshResultsPendingRef.current = false;
       unlistenNew.then((fn) => fn());
       unlistenChanged.then((fn) => fn());
       unlistenCollections.then((fn) => fn());
+      unlistenOverlayShown.then((fn) => fn());
     };
   }, [scheduleRefresh]);
 

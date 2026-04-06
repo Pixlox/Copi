@@ -1,7 +1,10 @@
-#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::{Emitter, Manager};
@@ -19,6 +22,7 @@ mod privacy;
 mod query_parser;
 mod search;
 mod settings;
+mod sync;
 
 #[cfg(target_os = "windows")]
 fn startup_log_path() -> std::path::PathBuf {
@@ -29,7 +33,10 @@ fn startup_log_path() -> std::path::PathBuf {
             .join("startup.log");
     }
 
-    std::env::temp_dir().join("copi").join("logs").join("startup.log")
+    std::env::temp_dir()
+        .join("copi")
+        .join("logs")
+        .join("startup.log")
 }
 
 #[cfg(target_os = "windows")]
@@ -76,6 +83,8 @@ pub struct AppState {
     pub clip_tx: tokio::sync::mpsc::Sender<i64>,
     pub clip_rx: Mutex<Option<tokio::sync::mpsc::Receiver<i64>>>,
     pub clipboard_watcher_running: Mutex<bool>,
+    pub suppress_next_clipboard_capture: AtomicBool,
+    pub suppressed_clipboard_change_count: AtomicI64,
     pub previous_frontmost_app: Mutex<Option<String>>,
     pub previous_foreground_window: Mutex<Option<isize>>,
     pub overlay_drag_ignore_until_ms: AtomicU64,
@@ -83,6 +92,7 @@ pub struct AppState {
     pub runtime_started: AtomicBool,
     pub search_status: Mutex<search::SearchStatusPayload>,
     pub model_setup_status: Mutex<model_setup::ModelSetupStatus>,
+    pub sync: std::sync::OnceLock<Arc<crate::sync::SyncState>>,
 }
 
 pub struct MenuBarState {
@@ -131,6 +141,15 @@ fn main() {
             log_startup_line(&format!("panic at {}: {}", location, payload));
             let backtrace = std::backtrace::Backtrace::force_capture();
             log_startup_line(&format!("backtrace: {}", backtrace));
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            eprintln!("[Panic] {}", info);
+            eprintln!(
+                "[Panic] backtrace: {}",
+                std::backtrace::Backtrace::force_capture()
+            );
         }
     }));
 
@@ -217,8 +236,7 @@ fn main() {
                     handle.plugin(tauri_plugin_updater::Builder::new().build())?;
                     handle.plugin(tauri_plugin_dialog::init())?;
                     handle.plugin(tauri_plugin_process::init())?;
-                    let autostart_builder =
-                        tauri_plugin_autostart::Builder::new().app_name("Copi");
+                    let autostart_builder = tauri_plugin_autostart::Builder::new().app_name("Copi");
                     #[cfg(target_os = "macos")]
                     let autostart_builder = autostart_builder
                         .macos_launcher(tauri_plugin_autostart::MacosLauncher::LaunchAgent);
@@ -294,6 +312,8 @@ fn main() {
                 clip_tx: clip_tx.clone(),
                 clip_rx: Mutex::new(Some(clip_rx)),
                 clipboard_watcher_running: Mutex::new(true),
+                suppress_next_clipboard_capture: AtomicBool::new(false),
+                suppressed_clipboard_change_count: AtomicI64::new(i64::MIN),
                 previous_frontmost_app: Mutex::new(None),
                 previous_foreground_window: Mutex::new(None),
                 overlay_drag_ignore_until_ms: AtomicU64::new(0),
@@ -338,6 +358,7 @@ fn main() {
                         setup_required: true,
                     }
                 }),
+                sync: std::sync::OnceLock::new(),
             });
             app.manage(MenuBarState {
                 tray_icon: Mutex::new(None),
@@ -443,20 +464,10 @@ fn main() {
 
             // Tray icon
             let tray_init_result = (|| -> Result<(), Box<dyn std::error::Error>> {
-                let settings_item = MenuItem::with_id(
-                    &handle,
-                    "settings",
-                    "Settings\u{2026}",
-                    true,
-                    None::<&str>,
-                )?;
-                let pause_item = MenuItem::with_id(
-                    &handle,
-                    "pause",
-                    "Pause Monitoring",
-                    true,
-                    None::<&str>,
-                )?;
+                let settings_item =
+                    MenuItem::with_id(&handle, "settings", "Settings\u{2026}", true, None::<&str>)?;
+                let pause_item =
+                    MenuItem::with_id(&handle, "pause", "Pause Monitoring", true, None::<&str>)?;
                 let quit = MenuItem::with_id(&handle, "quit", "Quit Copi", true, None::<&str>)?;
                 let menu = Menu::with_items(
                     &handle,
@@ -582,6 +593,13 @@ fn main() {
             settings::set_config,
             settings::get_db_size,
             settings::clear_all_history,
+            sync::sync_get_identity,
+            sync::sync_get_status,
+            sync::sync_list_peers,
+            sync::sync_list_discovered,
+            sync::sync_generate_pin,
+            sync::sync_pair_with,
+            sync::sync_remove_peer,
             collections::create_collection,
             collections::delete_collection,
             collections::rename_collection,
@@ -596,9 +614,9 @@ fn main() {
             log_startup_line(&format!("build failed: {}", error));
             panic!("error while building tauri application: {}", error);
         })
-        .run(|_app_handle, event| {
+        .run(|_app_handle, _event| {
             #[cfg(target_os = "windows")]
-            match event {
+            match _event {
                 tauri::RunEvent::Ready => log_startup_line("run event: ready"),
                 tauri::RunEvent::Exit => log_startup_line("run event: exit"),
                 tauri::RunEvent::ExitRequested { .. } => {
@@ -773,6 +791,9 @@ pub(crate) fn start_runtime_services_once(app: &tauri::AppHandle) {
             let _ = tokio::task::spawn_blocking(move || cleanup_old_clips(&cleanup_handle)).await;
         }
     });
+
+    let sync_state = crate::sync::start_sync(app.clone());
+    let _ = app.state::<AppState>().sync.set(sync_state);
 }
 
 fn show_setup_window_inner(app: &tauri::AppHandle) {
@@ -823,14 +844,15 @@ pub(crate) fn cleanup_old_clips(app: &tauri::AppHandle) {
         return;
     };
     let Ok(_) = conn.execute(
-        "DELETE FROM clip_embeddings WHERE rowid IN (SELECT id FROM clips WHERE created_at < ?1 AND pinned = 0)",
+        "DELETE FROM clip_embeddings WHERE rowid IN (SELECT id FROM clips WHERE created_at < ?1 AND pinned = 0 AND deleted = 0)",
         [cutoff],
     ) else {
         return;
     };
+    let sync_version = sync::next_sync_version_from_conn(&conn);
     let Ok(count) = conn.execute(
-        "DELETE FROM clips WHERE created_at < ?1 AND pinned = 0",
-        [cutoff],
+        "UPDATE clips SET deleted = 1, sync_version = ?1 WHERE created_at < ?2 AND pinned = 0 AND deleted = 0",
+        rusqlite::params![sync_version, cutoff],
     ) else {
         return;
     };
@@ -895,7 +917,11 @@ fn show_overlay_inner(app: &tauri::AppHandle) {
     }
 
     #[cfg(target_os = "windows")]
-    if let Ok(mut guard) = app.state::<AppState>().previous_foreground_window.try_lock() {
+    if let Ok(mut guard) = app
+        .state::<AppState>()
+        .previous_foreground_window
+        .try_lock()
+    {
         *guard = crate::macos::get_foreground_window_handle();
     }
 
@@ -1102,8 +1128,28 @@ fn build_menubar_icon() -> tauri::image::Image<'static> {
 
     // Scale factors for 32x32 canvas (original was 44x44)
     let scale = 32.0 / 44.0;
-    draw_rounded_rect(&mut rgba, width, height, 16.0 * scale, 12.0 * scale, 22.0 * scale, 26.0 * scale, 5.0 * scale, 0.5);
-    draw_rounded_rect(&mut rgba, width, height, 6.0 * scale, 6.0 * scale, 22.0 * scale, 26.0 * scale, 5.0 * scale, 1.0);
+    draw_rounded_rect(
+        &mut rgba,
+        width,
+        height,
+        16.0 * scale,
+        12.0 * scale,
+        22.0 * scale,
+        26.0 * scale,
+        5.0 * scale,
+        0.5,
+    );
+    draw_rounded_rect(
+        &mut rgba,
+        width,
+        height,
+        6.0 * scale,
+        6.0 * scale,
+        22.0 * scale,
+        26.0 * scale,
+        5.0 * scale,
+        1.0,
+    );
 
     tauri::image::Image::new_owned(rgba, width as u32, height as u32)
 }
@@ -1231,7 +1277,9 @@ fn simulate_paste() {
 
 #[cfg(target_os = "windows")]
 fn restore_previous_window(app: &tauri::AppHandle) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE,
+    };
 
     let Some(hwnd_value) = app
         .state::<AppState>()

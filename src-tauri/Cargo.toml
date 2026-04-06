@@ -40,6 +40,17 @@ tokenizers = { version = "=0.20.4", default-features = false, features = ["onig"
 
 syntect = "5"
 
+# LAN sync dependencies
+mdns-sd = "0.11"                    # mDNS service discovery (Bonjour/Avahi)
+uuid = { version = "1", features = ["v4"] }  # Sync IDs
+base64 = "0.22"                     # Base64 encoding for mDNS TXT records
+gethostname = "1.1"                 # Get device hostname
+anyhow = "1"
+chacha20poly1305 = { version = "0.10", features = ["std"] }
+hkdf = "0.12"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+rand = "0.8"
+
 # Desktop-only plugins
 [target."cfg(not(any(target_os = \"android\", target_os = \"ios\")))".dependencies]
 tauri-plugin-updater = "2"
@@ -73,9 +84,6 @@ windows = { version = "0.61", features = [
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
-
-
-
 
 
 

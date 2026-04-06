@@ -78,11 +78,9 @@ export function normalizeAppName(name: string): string {
     devenv: "Visual Studio",
     pwsh: "PowerShell",
   };
-  if (known[lower]) return known[lower];
+  if (known[lower] && /^[a-z0-9_-]+$/.test(trimmed)) {
+    return known[lower];
+  }
 
-  return trimmed
-    .replace(/[_-]+/g, " ")
-    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
-    .replace(/\s+/g, " ")
-    .replace(/\b\w/g, (m) => m.toUpperCase());
+  return trimmed;
 }

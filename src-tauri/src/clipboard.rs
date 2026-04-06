@@ -1,19 +1,48 @@
 use arboard::{Clipboard, ImageData};
+use base64::Engine as _;
+use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager};
 
 use crate::{
     macos::{get_app_icon_png, get_clipboard_source_app, get_frontmost_app_info, FrontmostApp},
-    AppState,
+    sync, AppState,
 };
 
 struct ClipboardImagePayload {
     width: usize,
     height: usize,
     bytes: Vec<u8>,
+}
+
+struct ClipboardFilePayload {
+    path: PathBuf,
+    file_name: String,
+    file_size: i64,
+    file_data: Option<Vec<u8>>,
+}
+
+const FILE_AUTO_SYNC_MAX_BYTES: i64 = crate::sync::FILE_AUTO_SYNC_MAX_BYTES;
+
+fn can_skip_text_hash(app: &tauri::AppHandle, hash: &str) -> bool {
+    let state = app.state::<AppState>();
+    let conn = match state.db_read_pool.get() {
+        Ok(conn) => conn,
+        Err(_) => return false,
+    };
+    match conn.query_row(
+        "SELECT 1 FROM clips WHERE content_hash = ?1 AND deleted = 0 LIMIT 1",
+        [hash],
+        |row| row.get::<_, i64>(0),
+    ) {
+        Ok(_) => true,
+        Err(rusqlite::Error::QueryReturnedNoRows) => false,
+        Err(_) => false,
+    }
 }
 
 // ─── Watch Clipboard ──────────────────────────────────────────────
@@ -29,6 +58,7 @@ pub async fn watch_clipboard(app: &tauri::AppHandle) {
 
     let mut last_text_hash = String::new();
     let mut last_image_hash = String::new();
+    let mut last_file_hash = String::new();
     let mut last_non_copi_app: Option<FrontmostApp> = None;
     let mut last_change_count: Option<i64> = None;
 
@@ -46,6 +76,50 @@ pub async fn watch_clipboard(app: &tauri::AppHandle) {
 
         // PERF 6: Only read clipboard when changeCount changes (zero CPU when idle)
         let current_change_count = crate::macos::get_pasteboard_change_count();
+        {
+            let state = app.state::<AppState>();
+            let suppress_next = state
+                .suppress_next_clipboard_capture
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let suppressed_change_count = state
+                .suppressed_clipboard_change_count
+                .load(std::sync::atomic::Ordering::SeqCst);
+
+            if suppress_next {
+                // Prefer sequence-based suppression when available.
+                if current_change_count >= 0
+                    && suppressed_change_count >= 0
+                    && current_change_count == suppressed_change_count
+                {
+                    state
+                        .suppressed_clipboard_change_count
+                        .store(i64::MIN, std::sync::atomic::Ordering::SeqCst);
+                    state
+                        .suppress_next_clipboard_capture
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                    last_change_count = Some(current_change_count);
+                    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+                    continue;
+                }
+
+                // Fallback for platforms/environments where change counts are unavailable.
+                if current_change_count < 0 || suppressed_change_count < 0 {
+                    state
+                        .suppressed_clipboard_change_count
+                        .store(i64::MIN, std::sync::atomic::Ordering::SeqCst);
+                    state
+                        .suppress_next_clipboard_capture
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                    last_change_count = Some(current_change_count);
+                    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+                    continue;
+                }
+
+                state
+                    .suppress_next_clipboard_capture
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
         if current_change_count >= 0 {
             if Some(current_change_count) == last_change_count {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -67,25 +141,63 @@ pub async fn watch_clipboard(app: &tauri::AppHandle) {
         }
         let source_app = pasteboard_source
             .filter(|app| !app.is_copi() && !app.is_empty())
-            .or_else(|| {
-                current_frontmost
-                    .filter(|app| !app.is_copi() && !app.is_empty())
-            })
+            .or_else(|| current_frontmost.filter(|app| !app.is_copi() && !app.is_empty()))
             .or_else(|| last_non_copi_app.clone())
             .unwrap_or_default();
 
+        // ── File clipboard ────────────────────────────────────────
+        if let Ok(file_list) = clipboard.get().file_list() {
+            if !file_list.is_empty() {
+                let mut hash_input = String::new();
+                for path in &file_list {
+                    hash_input.push_str(path.to_string_lossy().as_ref());
+                    hash_input.push('\n');
+                }
+                let file_hash = compute_hash(&format!("file-list:{}", hash_input));
+                if file_hash != last_file_hash {
+                    last_file_hash = file_hash.clone();
+                    queue_file_capture(app, file_list, file_hash, source_app.clone());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(140)).await;
+                continue;
+            }
+        }
+
         // ── Text clipboard ────────────────────────────────────────
         if let Ok(text) = clipboard.get_text() {
-            let hash = compute_hash(&text);
-            if hash != last_text_hash && !text.trim().is_empty() {
-                last_text_hash = hash.clone();
-
-                if !crate::privacy::should_capture(&text, app) {
-                    tokio::time::sleep(std::time::Duration::from_millis(140)).await;
-                    continue;
+            let file_paths = parse_file_uri_list(&text);
+            if !file_paths.is_empty() {
+                let mut hash_input = String::new();
+                for path in &file_paths {
+                    hash_input.push_str(path.to_string_lossy().as_ref());
+                    hash_input.push('\n');
                 }
+                let file_hash = compute_hash(&format!("file-uri-list:{}", hash_input));
+                if file_hash != last_file_hash {
+                    last_file_hash = file_hash.clone();
+                    queue_file_capture(app, file_paths, file_hash, source_app.clone());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(140)).await;
+                continue;
+            }
 
-                queue_text_capture(app, text, hash, source_app.clone());
+            let hash = compute_hash(&text);
+            if !text.trim().is_empty() {
+                let should_capture = if hash == last_text_hash {
+                    !can_skip_text_hash(app, &hash)
+                } else {
+                    true
+                };
+                if should_capture {
+                    last_text_hash = hash.clone();
+
+                    if !crate::privacy::should_capture(&text, app) {
+                        tokio::time::sleep(std::time::Duration::from_millis(140)).await;
+                        continue;
+                    }
+
+                    queue_text_capture(app, text, hash, source_app.clone());
+                }
             }
         }
 
@@ -127,6 +239,112 @@ pub async fn watch_clipboard(app: &tauri::AppHandle) {
 
         tokio::time::sleep(std::time::Duration::from_millis(140)).await;
     }
+}
+
+pub fn write_wire_clip_to_clipboard(
+    app: &tauri::AppHandle,
+    clip: &crate::sync::WireClip,
+) -> Result<(), String> {
+    let before_change_count = crate::macos::get_pasteboard_change_count();
+    let mut clipboard = Clipboard::new().map_err(|e| e.to_string())?;
+
+    if clip.is_file {
+        if let Some(path) = clip
+            .file_path
+            .as_ref()
+            .filter(|p| !p.trim().is_empty())
+            .map(PathBuf::from)
+            .filter(|p| p.exists())
+        {
+            clipboard
+                .set()
+                .file_list(&[path])
+                .map_err(|e| format!("Failed to set file list: {}", e))?;
+        } else {
+            let file_data_b64 = clip
+                .file_data
+                .as_ref()
+                .ok_or_else(|| "Missing file payload".to_string())?;
+            let file_data = base64::engine::general_purpose::STANDARD
+                .decode(file_data_b64)
+                .map_err(|e| format!("Invalid file payload: {}", e))?;
+            if file_data.is_empty() {
+                return Err("Missing file payload".to_string());
+            }
+            let cache_root = app
+                .path()
+                .app_cache_dir()
+                .unwrap_or_else(|_| std::env::temp_dir().join("copi"));
+            let files_dir = cache_root.join("file-clips");
+            let _ = std::fs::create_dir_all(&files_dir);
+            let safe_name = clip
+                .file_name
+                .as_ref()
+                .filter(|n| !n.trim().is_empty())
+                .cloned()
+                .unwrap_or_else(|| "remote-file".to_string());
+            let target = files_dir.join(format!("sync-{}-{}", clip.hash, safe_name));
+            std::fs::write(&target, &file_data).map_err(|e| e.to_string())?;
+            clipboard
+                .set()
+                .file_list(&[target])
+                .map_err(|e| format!("Failed to set file list: {}", e))?;
+        }
+    } else if clip.kind == "image" {
+        let state = app.state::<AppState>();
+        let conn = state.db_read_pool.get().map_err(|e| e.to_string())?;
+        let image_hash = clip.image_hash.as_deref().unwrap_or(clip.hash.as_str());
+        let data: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT image_data FROM clips WHERE content_hash = ?1 AND deleted = 0 LIMIT 1",
+                [image_hash],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let image_data = data.ok_or_else(|| "Image bytes unavailable".to_string())?;
+        if let Some((raw, w, h)) = png_to_rgba(&image_data) {
+            clipboard
+                .set_image(ImageData {
+                    width: w,
+                    height: h,
+                    bytes: Cow::Owned(raw),
+                })
+                .map_err(|e| format!("Failed to set image: {}", e))?;
+        } else {
+            return Err("Failed to decode image".to_string());
+        }
+    } else {
+        clipboard
+            .set_text(&clip.content)
+            .map_err(|e| format!("Failed to set text: {}", e))?;
+    }
+
+    let state = app.state::<AppState>();
+    state
+        .suppress_next_clipboard_capture
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let mut after_change_count = crate::macos::get_pasteboard_change_count();
+    if before_change_count >= 0 && after_change_count <= before_change_count {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        after_change_count = crate::macos::get_pasteboard_change_count();
+    }
+    if before_change_count >= 0 && after_change_count <= before_change_count {
+        after_change_count = before_change_count + 1;
+    }
+
+    if after_change_count >= 0 {
+        state
+            .suppressed_clipboard_change_count
+            .store(after_change_count, std::sync::atomic::Ordering::SeqCst);
+    } else {
+        state
+            .suppressed_clipboard_change_count
+            .store(i64::MIN, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    Ok(())
 }
 
 // ─── Backfill Image Metadata ──────────────────────────────────────
@@ -242,7 +460,7 @@ pub async fn backfill_language_tags(app: &tauri::AppHandle) {
                               ELSE content
                             END AS language_source
                      FROM clips
-                     WHERE language IS NULL OR TRIM(language) = ''
+                     WHERE deleted = 0 AND (language IS NULL OR TRIM(language) = '')
                      ORDER BY created_at DESC
                      LIMIT 250",
                 )
@@ -274,7 +492,7 @@ pub async fn backfill_language_tags(app: &tauri::AppHandle) {
             for (clip_id, language) in updates {
                 if conn
                     .execute(
-                        "UPDATE clips SET language = ?1 WHERE id = ?2 AND (language IS NULL OR TRIM(language) = '')",
+                        "UPDATE clips SET language = ?1 WHERE id = ?2 AND deleted = 0 AND (language IS NULL OR TRIM(language) = '')",
                         rusqlite::params![language, clip_id],
                     )
                     .ok()
@@ -308,22 +526,48 @@ pub async fn backfill_language_tags(app: &tauri::AppHandle) {
 #[tauri::command]
 pub async fn copy_to_clipboard(app: tauri::AppHandle, clip_id: i64) -> Result<(), String> {
     // Phase 1: read data from pool (no write lock held)
-    let (content_type, content, image_bytes, width, height) = {
+    let (
+        content_type,
+        content,
+        image_bytes,
+        width,
+        height,
+        is_file,
+        file_name,
+        file_data,
+        file_path,
+    ) = {
         let conn = app
             .state::<AppState>()
             .db_read_pool
             .get()
             .map_err(|e| e.to_string())?;
         conn.query_row(
-            "SELECT content_type, COALESCE(content, ''), COALESCE(image_data, X''), COALESCE(image_width, 0), COALESCE(image_height, 0) FROM clips WHERE id = ?",
+            "SELECT content_type,
+                    COALESCE(content, ''),
+                    COALESCE(image_data, X''),
+                    COALESCE(image_width, 0),
+                    COALESCE(image_height, 0),
+                    COALESCE(is_file, 0),
+                    COALESCE(file_name, ''),
+                    COALESCE(file_data, X''),
+                    COALESCE(file_path, '')
+             FROM clips
+             WHERE id = ? AND deleted = 0",
             [clip_id],
-            |row| Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
-            )),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)? != 0,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Vec<u8>>(7)?,
+                    row.get::<_, String>(8)?,
+                ))
+            },
         )
         .map_err(|e| e.to_string())?
     };
@@ -332,7 +576,38 @@ pub async fn copy_to_clipboard(app: tauri::AppHandle, clip_id: i64) -> Result<()
     // Phase 2: set clipboard (no DB lock held)
     let mut clipboard = Clipboard::new().map_err(|e| e.to_string())?;
 
-    if content_type == "image" {
+    if is_file {
+        let mut target_path = if !file_path.trim().is_empty() {
+            PathBuf::from(file_path.trim())
+        } else {
+            PathBuf::new()
+        };
+
+        if target_path.as_os_str().is_empty() || !target_path.exists() {
+            if file_data.is_empty() {
+                return Err("File bytes unavailable for this clip".to_string());
+            }
+            let cache_root = app
+                .path()
+                .app_cache_dir()
+                .unwrap_or_else(|_| std::env::temp_dir().join("copi"));
+            let files_dir = cache_root.join("file-clips");
+            let _ = std::fs::create_dir_all(&files_dir);
+
+            let name = if file_name.trim().is_empty() {
+                format!("clip-file-{}", clip_id)
+            } else {
+                file_name.clone()
+            };
+            target_path = files_dir.join(name);
+            std::fs::write(&target_path, &file_data).map_err(|e| e.to_string())?;
+        }
+
+        clipboard
+            .set()
+            .file_list(&[target_path])
+            .map_err(|e| format!("Failed to set file list: {}", e))?;
+    } else if content_type == "image" {
         // PERF 1: Decode PNG back to RGBA
         if let Some((raw_bytes, w, h)) = png_to_rgba(&image_bytes) {
             let image = ImageData {
@@ -366,7 +641,7 @@ pub async fn copy_to_clipboard(app: tauri::AppHandle, clip_id: i64) -> Result<()
         let _ = tokio::task::spawn_blocking(move || {
             if let Ok(conn) = app_clone.state::<AppState>().db_write.lock() {
                 let _ = conn.execute(
-                    "UPDATE clips SET copy_count = COALESCE(copy_count, 0) + 1 WHERE id = ?",
+                    "UPDATE clips SET copy_count = COALESCE(copy_count, 0) + 1 WHERE id = ? AND deleted = 0",
                     [clip_id],
                 );
             }
@@ -402,7 +677,7 @@ pub async fn get_clip_icons_batch(
 
     let placeholders = clip_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let query = format!(
-        "SELECT id, image_thumbnail, source_app_icon FROM clips WHERE id IN ({})",
+        "SELECT id, image_thumbnail, source_app_icon FROM clips WHERE deleted = 0 AND id IN ({})",
         placeholders
     );
 
@@ -465,6 +740,162 @@ fn b64(data: &[u8]) -> String {
         }
     }
     encoded
+}
+
+fn decode_file_uri_path(raw: &str) -> Option<PathBuf> {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with("file://") {
+        return None;
+    }
+
+    let rest = &trimmed[7..];
+    let (authority, path_part) = if rest.starts_with('/') {
+        ("", rest)
+    } else {
+        match rest.split_once('/') {
+            Some((host, tail)) => (host, tail),
+            None => (rest, ""),
+        }
+    };
+    let authority_decoded = percent_decode_uri(authority);
+    let path_decoded = percent_decode_uri(path_part);
+
+    #[cfg(target_os = "windows")]
+    {
+        if !authority_decoded.is_empty() && authority_decoded != "localhost" {
+            let tail = path_decoded.trim_start_matches('/').replace('/', "\\");
+            if tail.is_empty() {
+                return None;
+            }
+            return Some(PathBuf::from(format!(
+                "\\\\{}\\{}",
+                authority_decoded, tail
+            )));
+        }
+
+        let normalized = path_decoded.trim_start_matches('/').replace('/', "\\");
+        if normalized.is_empty() {
+            return None;
+        }
+        Some(PathBuf::from(normalized))
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        if !authority_decoded.is_empty() && authority_decoded != "localhost" {
+            let full = format!(
+                "//{}/{}",
+                authority_decoded,
+                path_decoded.trim_start_matches('/')
+            );
+            if full.len() <= 2 {
+                return None;
+            }
+            return Some(PathBuf::from(full));
+        }
+
+        let decoded = if path_decoded.starts_with('/') {
+            path_decoded
+        } else {
+            format!("/{}", path_decoded)
+        };
+        if decoded.is_empty() {
+            return None;
+        }
+        Some(PathBuf::from(decoded))
+    }
+}
+
+fn percent_decode_uri(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let h1 = (bytes[i + 1] as char).to_digit(16);
+            let h2 = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(a), Some(b)) = (h1, h2) {
+                out.push(((a << 4) as u8) | (b as u8));
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+fn parse_file_uri_list(text: &str) -> Vec<PathBuf> {
+    text.lines()
+        .filter_map(decode_file_uri_path)
+        .filter(|path| path.exists())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file_uri_for_path(path: &std::path::Path) -> String {
+        let raw = path.to_string_lossy().replace('\\', "/");
+        #[cfg(target_os = "windows")]
+        {
+            format!("file:///{}", raw.trim_start_matches('/'))
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            format!("file://{}", raw)
+        }
+    }
+
+    fn localhost_file_uri_for_path(path: &std::path::Path) -> String {
+        let raw = path.to_string_lossy().replace('\\', "/");
+        #[cfg(target_os = "windows")]
+        {
+            format!("file://localhost/{}", raw.trim_start_matches('/'))
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            format!("file://localhost{}", raw)
+        }
+    }
+
+    #[test]
+    fn percent_decode_uri_decodes_spaces() {
+        let decoded = percent_decode_uri("/tmp/my%20file.txt");
+        assert_eq!(decoded, "/tmp/my file.txt");
+    }
+
+    #[test]
+    fn parse_file_uri_list_only_keeps_existing_paths() {
+        let temp = std::env::temp_dir().join("copi_clipboard_uri_test_existing.txt");
+        std::fs::write(&temp, b"ok").unwrap();
+
+        let existing_uri = file_uri_for_path(&temp);
+        let text = format!(
+            "{}\nfile:///definitely-not-existing-copi-path",
+            existing_uri
+        );
+        let paths = parse_file_uri_list(&text);
+
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], temp);
+
+        let _ = std::fs::remove_file(&temp);
+    }
+
+    #[test]
+    fn decode_file_uri_path_handles_localhost() {
+        let temp = std::env::temp_dir().join("copi_clipboard_uri_test_localhost.txt");
+        std::fs::write(&temp, b"ok").unwrap();
+
+        let uri = localhost_file_uri_for_path(&temp);
+        let decoded = decode_file_uri_path(&uri).unwrap();
+
+        assert_eq!(decoded, temp);
+        let _ = std::fs::remove_file(&temp);
+    }
 }
 
 // PERF 1: PNG encoding/decoding
@@ -596,6 +1027,65 @@ fn process_image_capture(
     );
 }
 
+fn queue_file_capture(
+    app: &tauri::AppHandle,
+    file_list: Vec<PathBuf>,
+    hash: String,
+    source_app: FrontmostApp,
+) {
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = tokio::task::spawn_blocking(move || {
+            process_file_capture(&app_handle, file_list, hash, source_app)
+        })
+        .await;
+    });
+}
+
+fn process_file_capture(
+    app: &tauri::AppHandle,
+    file_list: Vec<PathBuf>,
+    fallback_hash: String,
+    source_app: FrontmostApp,
+) {
+    let path = match file_list.into_iter().find(|p| p.is_file()) {
+        Some(path) => path,
+        None => return,
+    };
+
+    let meta = match std::fs::metadata(&path) {
+        Ok(meta) => meta,
+        Err(_) => return,
+    };
+    let file_size = meta.len() as i64;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| "file".to_string());
+
+    let file_data = if file_size > 0 && file_size <= FILE_AUTO_SYNC_MAX_BYTES {
+        std::fs::read(&path).ok()
+    } else {
+        None
+    };
+
+    let hash = if let Some(bytes) = file_data.as_ref() {
+        compute_hash_bytes(bytes)
+    } else {
+        fallback_hash
+    };
+
+    let payload = ClipboardFilePayload {
+        path,
+        file_name,
+        file_size,
+        file_data,
+    };
+
+    insert_file_clip(app, &payload, &hash, &source_app);
+}
+
 fn repair_image_clip(app: &tauri::AppHandle, clip_id: i64) -> bool {
     let state = app.state::<AppState>();
     let (stored_bytes, width, height, existing_ocr, has_thumbnail): (
@@ -702,13 +1192,21 @@ fn repair_image_clip(app: &tauri::AppHandle, clip_id: i64) -> bool {
 }
 
 fn run_ocr(app: &tauri::AppHandle, bytes: &[u8], width: u32, height: u32) -> Option<String> {
+    if width < 3 || height < 3 {
+        return None;
+    }
+
     let state = app.state::<AppState>();
     let ocr = state.ocr_engine.as_ref()?;
     match ocr.recognize_text(bytes, width, height) {
         Ok(text) if !text.trim().is_empty() => Some(text),
         Ok(_) => None,
         Err(error) => {
-            eprintln!("[OCR] Failed: {}", error);
+            let msg = error.to_string();
+            if msg.contains("image is too small") {
+                return None;
+            }
+            eprintln!("[OCR] Failed: {}", msg);
             None
         }
     }
@@ -891,28 +1389,55 @@ fn insert_clip(
 
     let icon = fetch_app_icon(&state, source_app);
     let conn = state.db_write.lock().unwrap();
+    let sync_id = uuid::Uuid::new_v4().to_string();
+    let sync_version = sync::next_sync_version_from_conn(&conn);
+    let origin_device_id: Option<String> = conn
+        .query_row("SELECT device_id FROM device_info LIMIT 1", [], |row| {
+            row.get(0)
+        })
+        .ok();
 
     let result = conn.execute(
-        "INSERT INTO clips (content, content_hash, content_type, source_app, source_app_icon, content_highlighted, language, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "INSERT INTO clips (content, content_hash, content_type, source_app, source_app_icon, content_highlighted, language, created_at, pinned, collection_sync_id, sync_id, sync_version, deleted, origin_device_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, NULL, ?9, ?10, 0, ?11)
          ON CONFLICT(content_hash) DO UPDATE SET
             source_app = CASE
-                WHEN excluded.source_app <> '' THEN excluded.source_app
+                WHEN clips.source_device = '' AND excluded.source_app <> '' THEN excluded.source_app
+                WHEN clips.source_app = '' AND excluded.source_app <> '' THEN excluded.source_app
                 ELSE clips.source_app
             END,
             source_app_icon = CASE
-                WHEN length(excluded.source_app_icon) > 0 THEN excluded.source_app_icon
+                WHEN clips.source_device = '' AND length(excluded.source_app_icon) > 0 THEN excluded.source_app_icon
+                WHEN length(clips.source_app_icon) = 0 AND length(excluded.source_app_icon) > 0 THEN excluded.source_app_icon
                 ELSE clips.source_app_icon
             END,
             content_highlighted = COALESCE(excluded.content_highlighted, clips.content_highlighted),
-            created_at = excluded.created_at",
-        rusqlite::params![capped, hash, content_type, source_app.name, icon, highlighted, language, now],
+            created_at = excluded.created_at,
+            pinned = clips.pinned,
+            collection_sync_id = clips.collection_sync_id,
+            sync_id = COALESCE(clips.sync_id, excluded.sync_id),
+            sync_version = excluded.sync_version,
+            deleted = 0,
+            origin_device_id = COALESCE(clips.origin_device_id, excluded.origin_device_id)",
+        rusqlite::params![
+            capped,
+            hash,
+            content_type,
+            source_app.name,
+            icon,
+            highlighted,
+            language,
+            now,
+            sync_id,
+            sync_version,
+            origin_device_id
+        ],
     );
 
     if result.is_ok() {
         let clip_id: Option<i64> = conn
             .query_row(
-                "SELECT id FROM clips WHERE content_hash = ?",
+                "SELECT id FROM clips WHERE content_hash = ? AND deleted = 0",
                 [hash],
                 |row| row.get(0),
             )
@@ -922,6 +1447,11 @@ fn insert_clip(
             enqueue_embedding(&state, clip_id, "insert_clip");
         }
         let _ = app.emit("new-clip", ());
+        let app_clone = app.clone();
+        let hash_str = hash.to_string();
+        tauri::async_runtime::spawn(async move {
+            crate::sync::on_local_clip_saved(&app_clone, &hash_str).await;
+        });
     }
 }
 
@@ -950,16 +1480,25 @@ fn insert_image_clip(
     let icon = fetch_app_icon(&state, source_app);
 
     let conn = state.db_write.lock().unwrap();
+    let sync_id = uuid::Uuid::new_v4().to_string();
+    let sync_version = sync::next_sync_version_from_conn(&conn);
+    let origin_device_id: Option<String> = conn
+        .query_row("SELECT device_id FROM device_info LIMIT 1", [], |row| {
+            row.get(0)
+        })
+        .ok();
     let result = conn.execute(
-        "INSERT INTO clips (content, content_hash, content_type, source_app, source_app_icon, ocr_text, language, image_data, image_thumbnail, image_width, image_height, created_at)
-         VALUES ('[Image]', ?1, 'image', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        "INSERT INTO clips (content, content_hash, content_type, source_app, source_app_icon, ocr_text, language, image_data, image_thumbnail, image_width, image_height, created_at, pinned, collection_sync_id, sync_id, sync_version, deleted, origin_device_id)
+         VALUES ('[Image]', ?1, 'image', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, NULL, ?11, ?12, 0, ?13)
          ON CONFLICT(content_hash) DO UPDATE SET
             source_app = CASE
-                WHEN excluded.source_app <> '' THEN excluded.source_app
+                WHEN clips.source_device = '' AND excluded.source_app <> '' THEN excluded.source_app
+                WHEN clips.source_app = '' AND excluded.source_app <> '' THEN excluded.source_app
                 ELSE clips.source_app
             END,
             source_app_icon = CASE
-                WHEN length(excluded.source_app_icon) > 0 THEN excluded.source_app_icon
+                WHEN clips.source_device = '' AND length(excluded.source_app_icon) > 0 THEN excluded.source_app_icon
+                WHEN length(clips.source_app_icon) = 0 AND length(excluded.source_app_icon) > 0 THEN excluded.source_app_icon
                 ELSE clips.source_app_icon
             END,
             ocr_text = COALESCE(excluded.ocr_text, clips.ocr_text),
@@ -977,14 +1516,34 @@ fn insert_image_clip(
                 WHEN excluded.image_height > 0 THEN excluded.image_height
                 ELSE clips.image_height
             END,
-            created_at = excluded.created_at",
-        rusqlite::params![hash, source_app.name, icon, ocr_text, language, store_bytes, thumb, width, height, now],
+            created_at = excluded.created_at,
+            pinned = clips.pinned,
+            collection_sync_id = clips.collection_sync_id,
+            sync_id = COALESCE(clips.sync_id, excluded.sync_id),
+            sync_version = excluded.sync_version,
+            deleted = 0,
+            origin_device_id = COALESCE(clips.origin_device_id, excluded.origin_device_id)",
+        rusqlite::params![
+            hash,
+            source_app.name,
+            icon,
+            ocr_text,
+            language,
+            store_bytes,
+            thumb,
+            width,
+            height,
+            now,
+            sync_id,
+            sync_version,
+            origin_device_id
+        ],
     );
 
     if result.is_ok() {
         let clip_id: Option<i64> = conn
             .query_row(
-                "SELECT id FROM clips WHERE content_hash = ?",
+                "SELECT id FROM clips WHERE content_hash = ? AND deleted = 0",
                 [hash],
                 |row| row.get(0),
             )
@@ -994,6 +1553,90 @@ fn insert_image_clip(
             enqueue_embedding(&state, clip_id, "insert_image_clip");
         }
         let _ = app.emit("new-clip", ());
+        let app_clone = app.clone();
+        let hash_str = hash.to_string();
+        tauri::async_runtime::spawn(async move {
+            crate::sync::on_local_clip_saved(&app_clone, &hash_str).await;
+        });
+    }
+}
+
+fn insert_file_clip(
+    app: &tauri::AppHandle,
+    payload: &ClipboardFilePayload,
+    hash: &str,
+    source_app: &FrontmostApp,
+) {
+    let state = app.state::<AppState>();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    let icon = fetch_app_icon(&state, source_app);
+    let file_path = payload.path.to_string_lossy().to_string();
+
+    let conn = state.db_write.lock().unwrap();
+    let sync_id = uuid::Uuid::new_v4().to_string();
+    let sync_version = sync::next_sync_version_from_conn(&conn);
+    let origin_device_id: Option<String> = conn
+        .query_row("SELECT device_id FROM device_info LIMIT 1", [], |row| {
+            row.get(0)
+        })
+        .ok();
+
+    let result = conn.execute(
+        "INSERT INTO clips (content, content_hash, content_type, source_app, source_app_icon, created_at, pinned, collection_sync_id, sync_id, sync_version, deleted, origin_device_id, is_file, file_name, file_size, file_data, file_path)
+         VALUES (?1, ?2, 'text', ?3, ?4, ?5, 0, NULL, ?6, ?7, 0, ?8, 1, ?9, ?10, ?11, ?12)
+         ON CONFLICT(content_hash) DO UPDATE SET
+            source_app = CASE
+                WHEN clips.source_device = '' AND excluded.source_app <> '' THEN excluded.source_app
+                WHEN clips.source_app = '' AND excluded.source_app <> '' THEN excluded.source_app
+                ELSE clips.source_app
+            END,
+            source_app_icon = CASE
+                WHEN clips.source_device = '' AND length(excluded.source_app_icon) > 0 THEN excluded.source_app_icon
+                WHEN length(clips.source_app_icon) = 0 AND length(excluded.source_app_icon) > 0 THEN excluded.source_app_icon
+                ELSE clips.source_app_icon
+            END,
+            created_at = excluded.created_at,
+            pinned = clips.pinned,
+            collection_sync_id = clips.collection_sync_id,
+            sync_id = COALESCE(clips.sync_id, excluded.sync_id),
+            sync_version = excluded.sync_version,
+            deleted = 0,
+            origin_device_id = COALESCE(clips.origin_device_id, excluded.origin_device_id),
+            is_file = 1,
+            file_name = COALESCE(excluded.file_name, clips.file_name),
+            file_size = CASE WHEN excluded.file_size > 0 THEN excluded.file_size ELSE clips.file_size END,
+            file_data = COALESCE(excluded.file_data, clips.file_data),
+            file_path = COALESCE(excluded.file_path, clips.file_path)",
+        rusqlite::params![
+            payload.file_name,
+            hash,
+            source_app.name,
+            icon,
+            now,
+            sync_id,
+            sync_version,
+            origin_device_id,
+            payload.file_name,
+            payload.file_size,
+            payload.file_data,
+            file_path,
+        ],
+    );
+
+    if result.is_ok() {
+        drop(conn);
+        let _ = app.emit("new-clip", ());
+        if payload.file_data.is_some() {
+            let app_clone = app.clone();
+            let hash_str = hash.to_string();
+            tauri::async_runtime::spawn(async move {
+                crate::sync::on_local_clip_saved(&app_clone, &hash_str).await;
+            });
+        }
     }
 }
 

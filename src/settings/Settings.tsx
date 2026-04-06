@@ -6,6 +6,7 @@ import {
   Keyboard,
   Palette,
   Shield,
+  Wifi,
   HardDrive,
   Sun,
   Moon,
@@ -17,6 +18,7 @@ import {
   FolderOpen,
   Pencil,
   Check,
+  Laptop,
 } from "lucide-react";
 import { useThemeContext } from "../contexts/ThemeContext";
 import Picker from "../components/Picker";
@@ -43,6 +45,43 @@ interface CopiConfig {
   privacy: {
     excluded_apps: string[];
   };
+  sync: {
+    enabled: boolean;
+    device_name: string | null;
+    auto_connect: boolean;
+    sync_embeddings: boolean;
+    sync_collections_and_pins: boolean;
+  };
+}
+
+interface SyncIdentity {
+  device_id: string;
+  device_name: string;
+}
+
+interface SyncStatus {
+  enabled: boolean;
+  connectedCount: number;
+  deviceId?: string;
+  deviceName?: string;
+}
+
+interface SyncPairedDevice {
+  device_id: string;
+  display_name: string;
+  online: boolean;
+}
+
+interface SyncDiscoveredDevice {
+  device_id: string;
+  display_name: string;
+  addr: string;
+  pin: string;
+}
+
+interface SyncPinPayload {
+  pin: string;
+  expires_at: number;
 }
 
 interface CollectionInfo {
@@ -53,12 +92,13 @@ interface CollectionInfo {
   created_at: number;
 }
 
-type Section = "general" | "appearance" | "privacy" | "data" | "collections";
+type Section = "general" | "appearance" | "privacy" | "sync" | "data" | "collections";
 
 const SECTIONS: { id: Section; label: string; icon: typeof Keyboard }[] = [
   { id: "general", label: "General", icon: Keyboard },
   { id: "appearance", label: "Appearance", icon: Palette },
   { id: "privacy", label: "Privacy", icon: Shield },
+  { id: "sync", label: "Sync", icon: Wifi },
   { id: "data", label: "Data", icon: HardDrive },
   { id: "collections", label: "Collections", icon: FolderOpen },
 ];
@@ -416,7 +456,491 @@ function DataSection({
         </SettingRow>
       </SettingCard>
 
-      <div className="settings-attribution">Made with {"<3"} by Pixlox</div>
+      <div className="settings-attribution">Made with {"<3"} by Megumi Labs</div>
+    </>
+  );
+}
+
+function SyncSection() {
+  const [config, setConfig] = useState<CopiConfig | null>(null);
+  const [identity, setIdentity] = useState<SyncIdentity | null>(null);
+  const [status, setStatus] = useState<SyncStatus | null>(null);
+  const [pairedDevices, setPairedDevices] = useState<SyncPairedDevice[]>([]);
+  const [discoveredDevices, setDiscoveredDevices] = useState<SyncDiscoveredDevice[]>([]);
+  const [pairingCode, setPairingCode] = useState<SyncPinPayload | null>(null);
+  const [pairingError, setPairingError] = useState<string | null>(null);
+  const [pairingBusyAddr, setPairingBusyAddr] = useState<string | null>(null);
+  const [manualTargetAddr, setManualTargetAddr] = useState("");
+  const [manualPin, setManualPin] = useState("");
+  const [manualPairingBusy, setManualPairingBusy] = useState(false);
+  const [countdownTick, setCountdownTick] = useState(0);
+
+  const formatError = (e: unknown): string =>
+    typeof e === "string"
+      ? e
+      : e instanceof Error
+      ? e.message
+      : "Sync operation failed";
+
+  const refreshIdentity = useCallback(() => {
+    invoke<SyncIdentity>("sync_get_identity").then(setIdentity).catch(() => {});
+  }, []);
+
+  const refreshPeers = useCallback(() => {
+    invoke<SyncPairedDevice[]>("sync_list_peers")
+      .then(setPairedDevices)
+      .catch(() => {});
+  }, []);
+
+  const refreshConfig = useCallback(() => {
+    invoke<CopiConfig>("get_config").then(setConfig).catch(() => {});
+  }, []);
+
+  const refreshStatus = useCallback(() => {
+    invoke<SyncStatus>("sync_get_status").then(setStatus).catch(() => {});
+  }, []);
+
+  const saveSyncConfig = useCallback(
+    async (updater: (cfg: CopiConfig) => CopiConfig) => {
+      if (!config) return;
+      const next = updater(config);
+      setConfig(next);
+      await invoke("set_config", { config: next });
+    },
+    [config]
+  );
+
+  const refreshSync = useCallback(() => {
+    refreshIdentity();
+    refreshStatus();
+    refreshPeers();
+    refreshConfig();
+  }, [refreshConfig, refreshIdentity, refreshPeers, refreshStatus]);
+
+  const refreshDiscovered = useCallback(() => {
+    invoke<Array<{ device_id: string; display_name: string; addr: string }>>("sync_list_discovered")
+      .then((items) => {
+        setDiscoveredDevices((prev) => {
+          const byId = new Map(prev.map((item) => [item.device_id, item]));
+          const next = items.map((item) => ({
+            device_id: item.device_id,
+            display_name: item.display_name,
+            addr: item.addr,
+            pin: byId.get(item.device_id)?.pin ?? "",
+          }));
+          return next.sort((a, b) => a.display_name.localeCompare(b.display_name));
+        });
+      })
+      .catch(() => {});
+  }, []);
+
+  const upsertDiscovered = useCallback(
+    (payload: { device_id: string; display_name: string; addr: string }) => {
+      setDiscoveredDevices((prev) => {
+        const next = prev.filter((item) => item.device_id !== payload.device_id);
+        const previous = prev.find((item) => item.device_id === payload.device_id);
+        next.push({
+          device_id: payload.device_id,
+          display_name: payload.display_name,
+          addr: payload.addr,
+          pin: previous?.pin ?? "",
+        });
+        return next.sort((a, b) => a.display_name.localeCompare(b.display_name));
+      });
+    },
+    []
+  );
+
+  useEffect(() => {
+    refreshSync();
+    refreshDiscovered();
+  }, [refreshDiscovered, refreshSync]);
+
+  useEffect(() => {
+    const unlistenConfig = listen("sync:config-updated", () => {
+      refreshSync();
+      refreshDiscovered();
+    });
+    return () => {
+      unlistenConfig.then((fn) => fn());
+    };
+  }, [refreshDiscovered, refreshSync]);
+
+  useEffect(() => {
+    const unlistenPaired = listen("sync:paired", () => {
+      refreshPeers();
+    });
+    const unlistenConnected = listen("sync:connected", () => {
+      refreshPeers();
+    });
+    const unlistenDisconnected = listen("sync:disconnected", () => {
+      refreshPeers();
+    });
+    const unlistenDiscovered = listen<{ device_id: string; display_name: string; addr: string }>(
+      "sync:discovered",
+      (event) => {
+        upsertDiscovered(event.payload);
+      }
+    );
+
+    return () => {
+      unlistenPaired.then((fn) => fn());
+      unlistenConnected.then((fn) => fn());
+      unlistenDisconnected.then((fn) => fn());
+      unlistenDiscovered.then((fn) => fn());
+    };
+  }, [refreshPeers, upsertDiscovered]);
+
+  // Tick every second while a pairing code is active to update the countdown
+  useEffect(() => {
+    if (!pairingCode) return;
+    
+    const now = Math.floor(Date.now() / 1000);
+    const remaining = pairingCode.expires_at - now;
+    
+    // If already expired, don't start the timer
+    if (remaining <= 0) return;
+    
+    const interval = setInterval(() => {
+      setCountdownTick((t) => t + 1);
+    }, 1000);
+    
+    return () => clearInterval(interval);
+  }, [pairingCode]);
+
+  // Compute remaining time using the tick to force re-render
+  const codeRemainingSeconds = pairingCode
+    ? Math.max(0, pairingCode.expires_at - Math.floor(Date.now() / 1000))
+    : 0;
+  // Use countdownTick to suppress the unused variable warning
+  void countdownTick;
+
+  return (
+    <>
+      <SettingCard>
+        <SettingRow label="Enable Sync" description="Turn LAN sync on or off for this device">
+          <Toggle
+            checked={Boolean(config?.sync.enabled)}
+            onChange={(value) => {
+              void saveSyncConfig((cfg) => ({
+                ...cfg,
+                sync: {
+                  ...cfg.sync,
+                  enabled: value,
+                },
+              }));
+            }}
+          />
+        </SettingRow>
+        <SettingDivider />
+        <SettingRow label="Device Name" description="Override hostname shown to peers">
+          <input
+            className="settings-sync-input"
+            value={config?.sync.device_name ?? ""}
+            onChange={(event) => {
+              const value = event.target.value;
+              setConfig((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      sync: {
+                        ...prev.sync,
+                        device_name: value,
+                      },
+                    }
+                  : prev
+              );
+            }}
+            onBlur={() => {
+              void saveSyncConfig((cfg) => ({
+                ...cfg,
+                sync: {
+                  ...cfg.sync,
+                  device_name:
+                    (cfg.sync.device_name ?? "").trim().length > 0
+                      ? (cfg.sync.device_name ?? "").trim()
+                      : null,
+                },
+              }));
+            }}
+            placeholder="Auto-detected hostname"
+          />
+        </SettingRow>
+        <SettingDivider />
+        <SettingRow label="Auto-connect" description="Reconnect to trusted peers automatically">
+          <Toggle
+            checked={Boolean(config?.sync.auto_connect ?? true)}
+            onChange={(value) => {
+              void saveSyncConfig((cfg) => ({
+                ...cfg,
+                sync: {
+                  ...cfg.sync,
+                  auto_connect: value,
+                },
+              }));
+            }}
+          />
+        </SettingRow>
+        <SettingDivider />
+        <SettingRow
+          label="Sync Collections & Pins"
+          description="Share collection metadata and pinned state across paired devices"
+        >
+          <Toggle
+            checked={Boolean(config?.sync.sync_collections_and_pins ?? false)}
+            onChange={(value) => {
+              void saveSyncConfig((cfg) => ({
+                ...cfg,
+                sync: {
+                  ...cfg.sync,
+                  sync_collections_and_pins: value,
+                },
+              }));
+            }}
+          />
+        </SettingRow>
+      </SettingCard>
+
+      <SettingCard>
+        <SettingRow label="Status" description="Current LAN sync service status">
+          <button
+            className="settings-btn"
+            onClick={() => {
+              refreshSync();
+              refreshDiscovered();
+            }}
+          >
+            <RefreshCw size={12} /> Refresh
+          </button>
+        </SettingRow>
+        <SettingDivider />
+        <div className="settings-sync-metrics">
+          <div className="settings-sync-metric">
+            <span>Mode</span>
+            <strong>{config?.sync.enabled ? "Enabled" : "Disabled"}</strong>
+          </div>
+          <div className="settings-sync-metric">
+            <span>Connected</span>
+            <strong>{status?.connectedCount ?? pairedDevices.filter((device) => device.online).length}</strong>
+          </div>
+          <div className="settings-sync-metric">
+            <span>Paired</span>
+            <strong>{pairedDevices.length}</strong>
+          </div>
+          <div className="settings-sync-metric">
+            <span>Found</span>
+            <strong>{discoveredDevices.length}</strong>
+          </div>
+        </div>
+        {identity && (
+          <div className="settings-sync-device-pill">
+            <Laptop size={12} />
+            <span>
+              {identity.device_name} ({identity.device_id.slice(0, 8)})
+            </span>
+          </div>
+        )}
+      </SettingCard>
+
+      <SettingCard>
+        <SettingRow label="Pairing PIN" description="Generate a 6-digit PIN and enter it on the other device">
+          <button
+            className="settings-btn primary"
+            onClick={async () => {
+              setPairingError(null);
+              try {
+                const payload = await invoke<SyncPinPayload>("sync_generate_pin");
+                setPairingCode(payload);
+              } catch (e) {
+                setPairingError(formatError(e));
+              }
+            }}
+          >
+            <Wifi size={12} /> Generate
+          </button>
+        </SettingRow>
+        <SettingDivider />
+        <div className="settings-sync-code-box">
+          <span className="settings-sync-code-value" style={{ letterSpacing: "0.2em" }}>
+            {pairingCode?.pin ?? "------"}
+          </span>
+          <span className="settings-sync-code-exp">
+            {pairingCode
+              ? codeRemainingSeconds > 0
+                ? `Expires in ${codeRemainingSeconds}s`
+                : "Code expired"
+              : "No active code"}
+          </span>
+        </div>
+      </SettingCard>
+
+      <SettingCard>
+        <SettingRow
+          label="Pair by Address"
+          description="Fallback when discovery is blocked: enter peer IP (or IP:port) and PIN"
+        />
+        <SettingDivider />
+        {pairingError && <span className="settings-sync-error">{pairingError}</span>}
+        <div className="settings-sync-pair-form">
+          <div className="settings-sync-pair-grid">
+            <div className="settings-sync-pair-field">
+              <span className="settings-sync-pair-label">Peer Address</span>
+              <input
+                className="settings-sync-input"
+                placeholder="192.168.1.153 or 192.168.1.153:51827"
+                value={manualTargetAddr}
+                onChange={(e) => setManualTargetAddr(e.target.value)}
+              />
+            </div>
+            <div className="settings-sync-pair-field settings-sync-pair-field--pin">
+              <span className="settings-sync-pair-label">PIN</span>
+              <input
+                className="settings-sync-input"
+                placeholder="6-digit PIN"
+                value={manualPin}
+                onChange={(e) => setManualPin(e.target.value.replace(/[^0-9]/g, "").slice(0, 6))}
+              />
+            </div>
+          </div>
+          <div className="settings-sync-pair-actions">
+            <button
+              className="settings-btn primary"
+              disabled={manualPairingBusy || manualPin.length !== 6 || manualTargetAddr.trim().length === 0}
+              onClick={async () => {
+                const targetAddr = manualTargetAddr.trim();
+                if (!targetAddr || manualPin.length !== 6) return;
+                setManualPairingBusy(true);
+                setPairingError(null);
+                try {
+                  await invoke("sync_pair_with", { targetAddr, target_addr: targetAddr, pin: manualPin });
+                  setManualPin("");
+                  refreshStatus();
+                  refreshPeers();
+                  refreshDiscovered();
+                } catch (e) {
+                  setPairingError(formatError(e));
+                } finally {
+                  setManualPairingBusy(false);
+                }
+              }}
+            >
+              {manualPairingBusy ? "Pairing…" : "Pair by Address"}
+            </button>
+          </div>
+        </div>
+      </SettingCard>
+
+      <SettingCard>
+        <SettingRow label="Found on this network" description="Discovered devices that can be paired">
+          <button
+            className="settings-btn"
+            onClick={() => {
+              refreshSync();
+              refreshDiscovered();
+            }}
+          >
+            <RefreshCw size={12} /> Refresh
+          </button>
+        </SettingRow>
+        <SettingDivider />
+        {pairingError && <span className="settings-sync-error">{pairingError}</span>}
+        <div className="settings-sync-list">
+          {discoveredDevices.filter((d) => !pairedDevices.some((p) => p.device_id === d.device_id)).length === 0 && (
+            <div className="settings-row">
+              <div className="settings-row-info">
+                <span className="settings-row-label" style={{ color: "var(--text-tertiary)" }}>
+                  No devices discovered yet
+                </span>
+              </div>
+            </div>
+          )}
+          {discoveredDevices
+            .filter((d) => !pairedDevices.some((p) => p.device_id === d.device_id))
+            .map((device) => (
+            <div key={device.device_id} className="settings-sync-device-row">
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div className="settings-sync-device-name">{device.display_name}</div>
+                <div className="settings-sync-device-meta">{device.addr}</div>
+                <input
+                  className="settings-sync-input"
+                  placeholder="Enter 6-digit PIN"
+                  value={device.pin}
+                  onChange={(e) => {
+                    const pin = e.target.value.replace(/[^0-9]/g, "").slice(0, 6);
+                    setDiscoveredDevices((prev) =>
+                      prev.map((item) =>
+                        item.device_id === device.device_id ? { ...item, pin } : item
+                      )
+                    );
+                  }}
+                  style={{ marginTop: 6 }}
+                />
+              </div>
+              <button
+                className="settings-btn primary"
+                disabled={device.pin.length !== 6 || pairingBusyAddr === device.addr}
+                onClick={async () => {
+                  setPairingBusyAddr(device.addr);
+                  setPairingError(null);
+                  try {
+                    await invoke("sync_pair_with", { targetAddr: device.addr, target_addr: device.addr, pin: device.pin });
+                    setDiscoveredDevices((prev) =>
+                      prev.filter((item) => item.device_id !== device.device_id)
+                    );
+                    refreshStatus();
+                    refreshPeers();
+                  } catch (e) {
+                    const message = formatError(e);
+                    setPairingError(message);
+                    console.error("Pair by code failed", e);
+                  } finally {
+                    setPairingBusyAddr(null);
+                  }
+                }}
+              >
+                {pairingBusyAddr === device.addr ? "Pairing…" : "Pair"}
+              </button>
+            </div>
+          ))}
+        </div>
+      </SettingCard>
+
+      <SettingCard>
+        <SettingRow label="Paired Devices" description="Trusted devices and online status" />
+        <SettingDivider />
+        <div className="settings-sync-list">
+          {pairedDevices.length === 0 && (
+            <div className="settings-row">
+              <div className="settings-row-info">
+                <span className="settings-row-label" style={{ color: "var(--text-tertiary)" }}>
+                  No paired devices yet
+                </span>
+              </div>
+            </div>
+          )}
+          {pairedDevices.map((device) => (
+            <div key={device.device_id} className="settings-sync-device-row">
+              <div>
+                <div className="settings-sync-device-name">{device.display_name}</div>
+                <div className="settings-sync-device-meta">{device.device_id}</div>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span className="settings-sync-device-meta">{device.online ? "Online" : "Offline"}</span>
+                <button
+                  className="settings-btn danger"
+                  onClick={async () => {
+                    await invoke("sync_remove_peer", { deviceId: device.device_id, device_id: device.device_id });
+                    refreshStatus();
+                    refreshPeers();
+                  }}
+                >
+                  Remove
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </SettingCard>
     </>
   );
 }
@@ -822,8 +1346,8 @@ export default function Settings() {
   return (
     <div className="settings-root">
       {/* ── Sidebar ─────────────────────────────────────────────────── */}
-      <aside className="settings-sidebar" data-tauri-drag-region>
-        <div className="settings-sidebar-brand" data-tauri-drag-region>
+      <aside className="settings-sidebar">
+        <div className="settings-sidebar-brand">
           <Logo size={28} />
           <span>Copi</span>
         </div>
@@ -848,7 +1372,7 @@ export default function Settings() {
 
       {/* ── Content ─────────────────────────────────────────────────── */}
       <main className="settings-content">
-        <header className="settings-content-header" data-tauri-drag-region>
+        <header className="settings-content-header">
           <h1>{activeSectionData.label}</h1>
         </header>
 
@@ -856,6 +1380,9 @@ export default function Settings() {
           {activeSection === "general" && <GeneralSection config={config} saveConfig={saveConfig} />}
           {activeSection === "appearance" && <AppearanceSection config={config} saveConfig={saveConfig} />}
           {activeSection === "privacy" && <PrivacySection config={config} saveConfig={saveConfig} />}
+          {activeSection === "sync" && (
+            <SyncSection />
+          )}
           {activeSection === "data" && (
             <DataSection
               dbSize={dbSize}

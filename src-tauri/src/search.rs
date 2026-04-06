@@ -1,4 +1,5 @@
 use crate::query_parser::{self, Ordering, ParsedQuery};
+use crate::sync;
 use crate::AppState;
 use rusqlite::{OptionalExtension, ToSql};
 use serde::{Deserialize, Serialize};
@@ -23,6 +24,8 @@ pub struct ClipResult {
     pub content: String,
     pub content_type: String,
     pub source_app: String,
+    pub source_device: String,
+    pub is_file: bool,
     pub created_at: i64,
     pub pinned: bool,
     pub content_highlighted: Option<String>,
@@ -50,7 +53,7 @@ struct ScoreEntry {
     score: f64,
 }
 
-const SEL: &str = "id, content, content_type, source_app, created_at, pinned, content_highlighted, ocr_text, COALESCE(copy_count, 0)";
+const SEL: &str = "id, content, content_type, source_app, COALESCE(source_device, ''), COALESCE(is_file, 0), created_at, pinned, content_highlighted, ocr_text, COALESCE(copy_count, 0)";
 
 fn row_to_clip(r: &rusqlite::Row) -> rusqlite::Result<ClipResult> {
     Ok(ClipResult {
@@ -58,12 +61,26 @@ fn row_to_clip(r: &rusqlite::Row) -> rusqlite::Result<ClipResult> {
         content: trunc(&r.get::<_, String>(1).unwrap_or_default()),
         content_type: r.get(2)?,
         source_app: r.get(3)?,
-        created_at: r.get(4)?,
-        pinned: r.get::<_, i64>(5)? != 0,
-        content_highlighted: r.get(6)?,
-        ocr_text: r.get(7).unwrap_or(None),
-        copy_count: r.get(8).unwrap_or(0),
+        source_device: r.get(4)?,
+        is_file: r.get::<_, i64>(5)? != 0,
+        created_at: r.get(6)?,
+        pinned: r.get::<_, i64>(7)? != 0,
+        content_highlighted: r.get(8)?,
+        ocr_text: r.get(9).unwrap_or(None),
+        copy_count: r.get(10).unwrap_or(0),
     })
+}
+
+fn clip_push_key_by_id(conn: &rusqlite::Connection, clip_id: i64) -> Option<String> {
+    conn.query_row(
+        "SELECT COALESCE(NULLIF(sync_id, ''), content_hash)
+         FROM clips
+         WHERE id = ?1",
+        [clip_id],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .filter(|key| !key.is_empty())
 }
 
 #[tauri::command]
@@ -74,7 +91,12 @@ pub async fn search_clips(
     collection_id: Option<i64>,
 ) -> Result<Vec<ClipResult>, String> {
     let token = match app.try_state::<AppState>() {
-        Some(state) => state.search_generation.fetch_add(1, AtomicOrdering::Relaxed) + 1,
+        Some(state) => {
+            state
+                .search_generation
+                .fetch_add(1, AtomicOrdering::Relaxed)
+                + 1
+        }
         None => return Ok(Vec::new()),
     };
 
@@ -107,8 +129,10 @@ pub async fn get_total_clip_count(app: tauri::AppHandle) -> Result<i64, String> 
             .try_state::<AppState>()
             .ok_or_else(|| "App state not ready yet".to_string())?;
         let conn = state.db_read_pool.get().map_err(|e| e.to_string())?;
-        conn.query_row("SELECT COUNT(*) FROM clips", [], |row| row.get(0))
-            .map_err(|e| e.to_string())
+        conn.query_row("SELECT COUNT(*) FROM clips WHERE deleted = 0", [], |row| {
+            row.get(0)
+        })
+        .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -127,12 +151,24 @@ pub async fn get_search_status(app: tauri::AppHandle) -> Result<SearchStatusPayl
 pub async fn toggle_pin(app: tauri::AppHandle, clip_id: i64) -> Result<(), String> {
     let state = app.state::<AppState>();
     let conn = state.db_write.lock().map_err(|e| e.to_string())?;
-    conn.execute(
-        "UPDATE clips SET pinned = CASE WHEN pinned = 1 THEN 0 ELSE 1 END WHERE id = ?",
-        [clip_id],
+    let sync_version = sync::next_sync_version_from_conn(&conn);
+    let updated = conn.execute(
+        "UPDATE clips SET pinned = CASE WHEN pinned = 1 THEN 0 ELSE 1 END, sync_version = ?1 WHERE id = ?2 AND deleted = 0",
+        rusqlite::params![sync_version, clip_id],
     )
     .map_err(|e| e.to_string())?;
+    let sync_key = if updated > 0 {
+        clip_push_key_by_id(&conn, clip_id)
+    } else {
+        None
+    };
     drop(conn);
+    if let Some(sync_key) = sync_key {
+        let app_clone = app.clone();
+        tauri::async_runtime::spawn(async move {
+            sync::on_local_clip_saved(&app_clone, &sync_key).await;
+        });
+    }
     let _ = app.emit("clips-changed", ());
     Ok(())
 }
@@ -141,11 +177,35 @@ pub async fn toggle_pin(app: tauri::AppHandle, clip_id: i64) -> Result<(), Strin
 pub async fn delete_clip(app: tauri::AppHandle, clip_id: i64) -> Result<(), String> {
     let state = app.state::<AppState>();
     let conn = state.db_write.lock().map_err(|e| e.to_string())?;
+    let sync_version = sync::next_sync_version_from_conn(&conn);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     conn.execute("DELETE FROM clip_embeddings WHERE rowid = ?", [clip_id])
         .ok();
-    conn.execute("DELETE FROM clips WHERE id = ?", [clip_id])
+    let updated = conn
+        .execute(
+            "UPDATE clips
+             SET deleted = 1,
+                 sync_version = ?1,
+                 created_at = CASE WHEN created_at < ?2 THEN ?2 ELSE created_at END
+             WHERE id = ?3 AND deleted = 0",
+            rusqlite::params![sync_version, now, clip_id],
+        )
         .map_err(|e| e.to_string())?;
+    let sync_key = if updated > 0 {
+        clip_push_key_by_id(&conn, clip_id)
+    } else {
+        None
+    };
     drop(conn);
+    if let Some(sync_key) = sync_key {
+        let app_clone = app.clone();
+        tauri::async_runtime::spawn(async move {
+            sync::on_local_clip_saved(&app_clone, &sync_key).await;
+        });
+    }
     let _ = app.emit("clips-changed", ());
     Ok(())
 }
@@ -176,14 +236,33 @@ pub async fn update_clip_content(
     let detected_language = query_parser::detect_language(&new_content).map(str::to_string);
     let state = app.state::<AppState>();
     let conn = state.db_write.lock().map_err(|e| e.to_string())?;
-    conn.execute(
+    let sync_version = sync::next_sync_version_from_conn(&conn);
+    let updated = conn.execute(
         "UPDATE clips
-         SET content = ?1, content_hash = ?2, content_type = ?3, language = COALESCE(?5, language)
-         WHERE id = ?4",
-        rusqlite::params![new_content, hash, content_type, clip_id, detected_language],
+         SET content = ?1, content_hash = ?2, content_type = ?3, language = COALESCE(?5, language), sync_version = ?6
+         WHERE id = ?4 AND deleted = 0",
+        rusqlite::params![
+            new_content,
+            hash,
+            content_type,
+            clip_id,
+            detected_language,
+            sync_version
+        ],
     )
     .map_err(|e| e.to_string())?;
+    let sync_key = if updated > 0 {
+        clip_push_key_by_id(&conn, clip_id)
+    } else {
+        None
+    };
     drop(conn);
+    if let Some(sync_key) = sync_key {
+        let app_clone = app.clone();
+        tauri::async_runtime::spawn(async move {
+            sync::on_local_clip_saved(&app_clone, &sync_key).await;
+        });
+    }
     let tx = state.clip_tx.clone();
     tauri::async_runtime::spawn(async move {
         if let Err(e) = tx.send(clip_id).await {
@@ -208,7 +287,7 @@ pub async fn get_image_thumbnail(
         .query_row(
             "SELECT COALESCE(image_thumbnail, X''), image_data, image_width, image_height
              FROM clips
-             WHERE id = ? AND content_type = 'image'",
+             WHERE id = ? AND content_type = 'image' AND deleted = 0",
             [clip_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
@@ -238,7 +317,7 @@ pub async fn get_image_preview(
         .query_row(
             "SELECT image_data, image_width, image_height
              FROM clips
-             WHERE id = ? AND content_type = 'image'",
+             WHERE id = ? AND content_type = 'image' AND deleted = 0",
             [clip_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
@@ -259,9 +338,11 @@ pub async fn get_image_preview(
 pub async fn get_clip_full_content(app: tauri::AppHandle, clip_id: i64) -> Result<String, String> {
     let state = app.state::<AppState>();
     let conn = state.db_read_pool.get().map_err(|e| e.to_string())?;
-    conn.query_row("SELECT content FROM clips WHERE id = ?", [clip_id], |row| {
-        row.get(0)
-    })
+    conn.query_row(
+        "SELECT content FROM clips WHERE id = ? AND deleted = 0",
+        [clip_id],
+        |row| row.get(0),
+    )
     .map_err(|e| e.to_string())
 }
 
@@ -417,7 +498,7 @@ fn do_empty_search(
     filter: &str,
     collection_id: Option<i64>,
 ) -> Result<Vec<ClipResult>, String> {
-    let mut conditions = vec!["1=1".to_string()];
+    let mut conditions = vec!["deleted = 0".to_string()];
     let mut params: Vec<Box<dyn ToSql>> = vec![];
 
     match filter {
@@ -463,7 +544,7 @@ fn run_filter_search(
     collection_id: Option<i64>,
     include_temporal: bool,
 ) -> Result<Vec<ClipResult>, String> {
-    let mut conditions = vec!["1=1".to_string()];
+    let mut conditions = vec!["deleted = 0".to_string()];
     let mut params: Vec<Box<dyn ToSql>> = vec![];
     apply_filters(
         &mut conditions,
@@ -521,7 +602,7 @@ fn do_ordering(
     } else {
         1
     };
-    let mut conditions = vec!["1=1".to_string()];
+    let mut conditions = vec!["deleted = 0".to_string()];
     let mut params: Vec<Box<dyn ToSql>> = vec![];
 
     match filter {
@@ -605,7 +686,7 @@ fn do_fts_candidates(
     }
 
     let mut params: Vec<Box<dyn ToSql>> = vec![Box::new(query)];
-    let mut conditions = vec!["clips_fts MATCH ?".to_string()];
+    let mut conditions = vec!["clips_fts MATCH ?".to_string(), "c.deleted = 0".to_string()];
     apply_filters(
         &mut conditions,
         &mut params,
@@ -649,7 +730,11 @@ fn do_vector_candidates(
         .flat_map(|value| value.to_le_bytes())
         .collect();
     let mut params: Vec<Box<dyn ToSql>> = vec![Box::new(bytes), Box::new(60_i64)];
-    let mut conditions = vec!["e.embedding MATCH ?".to_string(), "e.k = ?".to_string()];
+    let mut conditions = vec![
+        "e.embedding MATCH ?".to_string(),
+        "e.k = ?".to_string(),
+        "c.deleted = 0".to_string(),
+    ];
     apply_filters(
         &mut conditions,
         &mut params,
@@ -832,7 +917,7 @@ fn fetch_clips_by_ids(conn: &rusqlite::Connection, ids: &[i64]) -> Result<Vec<Cl
     }
 
     let placeholders = (0..ids.len()).map(|_| "?").collect::<Vec<_>>().join(", ");
-    let sql = format!("SELECT {SEL} FROM clips WHERE id IN ({placeholders})");
+    let sql = format!("SELECT {SEL} FROM clips WHERE deleted = 0 AND id IN ({placeholders})");
     let params: Vec<&dyn ToSql> = ids.iter().map(|id| id as &dyn ToSql).collect();
     let rows = query_rows(conn, &sql, &params)?;
     let mut by_id: HashMap<i64, ClipResult> =
@@ -1108,6 +1193,7 @@ mod tests {
                 content_hash TEXT NOT NULL,
                 content_type TEXT NOT NULL,
                 source_app TEXT DEFAULT '',
+                source_device TEXT NOT NULL DEFAULT '',
                 source_app_icon BLOB,
                 content_highlighted TEXT,
                 ocr_text TEXT,
@@ -1115,11 +1201,15 @@ mod tests {
                 image_thumbnail BLOB,
                 image_width INTEGER DEFAULT 0,
                 image_height INTEGER DEFAULT 0,
+                is_file INTEGER DEFAULT 0,
                 created_at INTEGER NOT NULL,
                 pinned INTEGER DEFAULT 0,
                 collection_id INTEGER,
                 language TEXT,
-                copy_count INTEGER DEFAULT 0
+                copy_count INTEGER DEFAULT 0,
+                deleted INTEGER DEFAULT 0,
+                sync_id TEXT,
+                sync_version INTEGER DEFAULT 0
             );
             CREATE VIRTUAL TABLE clips_fts USING fts5(content, ocr_text);
             CREATE INDEX idx_test_clips_created ON clips(created_at DESC);
@@ -1187,6 +1277,34 @@ mod tests {
             rusqlite::params![id, content, ocr_text.unwrap_or("")],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn clip_push_key_prefers_sync_id_then_hash() {
+        let conn = setup_test_db();
+        insert_clip(
+            &conn,
+            1,
+            "sync key test",
+            "text",
+            "Notes",
+            1_710_000_000,
+            None,
+        );
+
+        conn.execute("UPDATE clips SET sync_id = 'sync-key-1' WHERE id = 1", [])
+            .unwrap();
+        assert_eq!(
+            super::clip_push_key_by_id(&conn, 1),
+            Some("sync-key-1".to_string())
+        );
+
+        conn.execute("UPDATE clips SET sync_id = '' WHERE id = 1", [])
+            .unwrap();
+        assert_eq!(
+            super::clip_push_key_by_id(&conn, 1),
+            Some("hash-1".to_string())
+        );
     }
 
     #[test]

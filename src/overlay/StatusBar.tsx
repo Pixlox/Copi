@@ -1,5 +1,8 @@
 import type { SearchStatus } from "../hooks/useSearch";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { formatShortcut, formatSymbolShortcut, isMacPlatform } from "../utils/platform";
+import { useEffect, useRef, useState } from "react";
 
 interface StatusBarProps {
   totalCount: number;
@@ -71,6 +74,96 @@ function StatusBar({
   canOpenActions,
   onToggleActions,
 }: StatusBarProps) {
+  const [syncEnabled, setSyncEnabled] = useState<boolean>(false);
+  const [syncBadge, setSyncBadge] = useState<string | null>(null);
+  const syncStatusKeyRef = useRef<string | null>(null);
+  const syncReadyRef = useRef<boolean>(false);
+  const syncBadgeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    const setSyncBadgeForTransition = (enabled: boolean, connectedCount: number) => {
+      if (!enabled) {
+        setSyncBadge(null);
+        if (syncBadgeTimerRef.current) {
+          clearTimeout(syncBadgeTimerRef.current);
+          syncBadgeTimerRef.current = null;
+        }
+        return;
+      }
+
+      const label = connectedCount > 0 ? `Sync online (${connectedCount})` : "Sync idle";
+      setSyncBadge(label);
+      if (syncBadgeTimerRef.current) {
+        clearTimeout(syncBadgeTimerRef.current);
+      }
+      syncBadgeTimerRef.current = setTimeout(() => {
+        setSyncBadge(null);
+        syncBadgeTimerRef.current = null;
+      }, 3000);
+    };
+
+    const refresh = async () => {
+      try {
+        const [status, peers] = await Promise.all([
+          invoke<{ enabled: boolean; connectedCount: number }>("sync_get_status"),
+          invoke<Array<{ device_id: string; display_name: string; online: boolean }>>("sync_list_peers"),
+        ]);
+        if (!alive) return;
+        const enabled = Boolean(status?.enabled);
+        const connected =
+          peers.length > 0
+            ? peers.filter((peer) => peer.online).length
+            : Number(status?.connectedCount ?? 0);
+
+        setSyncEnabled(enabled);
+        const nextKey = `${enabled ? 1 : 0}:${connected}`;
+        const prevKey = syncStatusKeyRef.current;
+        syncStatusKeyRef.current = nextKey;
+        if (!syncReadyRef.current) {
+          syncReadyRef.current = true;
+          return;
+        }
+        if (prevKey !== nextKey) {
+          setSyncBadgeForTransition(enabled, connected);
+        }
+      } catch {
+        if (!alive) return;
+        const prevKey = syncStatusKeyRef.current;
+        syncStatusKeyRef.current = "0:0";
+        if (syncReadyRef.current && prevKey !== "0:0") {
+          setSyncBadgeForTransition(false, 0);
+        }
+        syncReadyRef.current = true;
+        setSyncEnabled(false);
+      }
+    };
+
+    void refresh();
+    const timer = setInterval(() => void refresh(), 3000);
+    const unlistenPaired = listen("sync:paired", () => {
+      void refresh();
+    });
+    const unlistenConnected = listen("sync:connected", () => {
+      void refresh();
+    });
+    const unlistenDisconnected = listen("sync:disconnected", () => {
+      void refresh();
+    });
+
+    return () => {
+      alive = false;
+      clearInterval(timer);
+      if (syncBadgeTimerRef.current) {
+        clearTimeout(syncBadgeTimerRef.current);
+        syncBadgeTimerRef.current = null;
+      }
+      unlistenPaired.then((fn) => fn());
+      unlistenConnected.then((fn) => fn());
+      unlistenDisconnected.then((fn) => fn());
+    };
+  }, []);
+
   const filters = detectFilters(query);
   const statusLabel = formatSearchStatus(searchStatus);
   const primaryLabel = defaultEnterAction === "copy" ? "copy" : "paste";
@@ -88,6 +181,9 @@ function StatusBar({
         <span>{formatCount(totalCount)} clips</span>
         {statusLabel && (
           <span className="temporal-badge">{statusLabel}</span>
+        )}
+        {syncEnabled && syncBadge && (
+          <span className="temporal-badge">{syncBadge}</span>
         )}
         {filters.map((f) => (
           <span key={f} className="temporal-badge">{f}</span>

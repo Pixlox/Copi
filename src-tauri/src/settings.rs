@@ -1,12 +1,15 @@
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager};
 
+use crate::sync;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CopiConfig {
     pub general: GeneralConfig,
     pub appearance: AppearanceConfig,
     pub privacy: PrivacyConfig,
+    pub sync: SyncConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,6 +36,43 @@ pub struct PrivacyConfig {
     pub excluded_apps: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SyncConfig {
+    /// Whether LAN sync is enabled
+    pub enabled: bool,
+    /// This device's display name (auto-detected if not set)
+    pub device_name: Option<String>,
+    /// Auto-connect to paired devices when they come online
+    pub auto_connect: bool,
+    /// Sync embeddings along with clips (increases bandwidth but avoids regeneration)
+    pub sync_embeddings: bool,
+    /// Sync pinned state and collections metadata across devices
+    pub sync_collections_and_pins: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncConfigPayload {
+    pub enabled: bool,
+    pub device_name: Option<String>,
+    pub auto_connect: bool,
+    pub sync_embeddings: bool,
+    pub sync_collections_and_pins: bool,
+}
+
+impl From<SyncConfig> for SyncConfigPayload {
+    fn from(value: SyncConfig) -> Self {
+        Self {
+            enabled: value.enabled,
+            device_name: value.device_name,
+            auto_connect: value.auto_connect,
+            sync_embeddings: value.sync_embeddings,
+            sync_collections_and_pins: value.sync_collections_and_pins,
+        }
+    }
+}
+
 impl Default for CopiConfig {
     fn default() -> Self {
         Self {
@@ -51,6 +91,7 @@ impl Default for CopiConfig {
             privacy: PrivacyConfig {
                 excluded_apps: default_excluded_apps(),
             },
+            sync: SyncConfig::default(),
         }
     }
 }
@@ -109,6 +150,18 @@ impl Default for AppearanceConfig {
 impl Default for PrivacyConfig {
     fn default() -> Self {
         CopiConfig::default().privacy
+    }
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            device_name: None,
+            auto_connect: true,
+            sync_embeddings: true,
+            sync_collections_and_pins: false,
+        }
     }
 }
 
@@ -177,8 +230,7 @@ pub async fn set_config(app: tauri::AppHandle, config: CopiConfig) -> Result<(),
     if login_changed {
         #[cfg(desktop)]
         {
-            if let Some(autolaunch) = app.try_state::<tauri_plugin_autostart::AutoLaunchManager>()
-            {
+            if let Some(autolaunch) = app.try_state::<tauri_plugin_autostart::AutoLaunchManager>() {
                 if config.general.launch_at_login {
                     autolaunch.enable().map_err(|e| e.to_string())?;
                 } else {
@@ -189,6 +241,12 @@ pub async fn set_config(app: tauri::AppHandle, config: CopiConfig) -> Result<(),
     }
 
     save_config(&app, &config)?;
+    let _ = app.emit(
+        "sync:config-updated",
+        SyncConfigPayload::from(config.sync.clone()),
+    );
+    crate::sync::apply_config_change(&app, existing.as_ref(), &config);
+    crate::sync::apply_metadata_sync_config_change(&app, existing.as_ref(), &config);
 
     if existing
         .as_ref()
@@ -248,9 +306,13 @@ pub async fn get_db_size(app: tauri::AppHandle) -> Result<u64, String> {
 pub async fn clear_all_history(app: tauri::AppHandle) -> Result<(), String> {
     let state = app.state::<crate::AppState>();
     let mut conn = state.db_write.lock().map_err(|e| e.to_string())?;
+    let sync_version = sync::next_sync_version_from_conn(&conn);
     let tx = conn.transaction().map_err(|e| e.to_string())?;
-    tx.execute("DELETE FROM clips", [])
-        .map_err(|e| e.to_string())?;
+    tx.execute(
+        "UPDATE clips SET deleted = 1, sync_version = ?1 WHERE deleted = 0",
+        rusqlite::params![sync_version],
+    )
+    .map_err(|e| e.to_string())?;
     tx.execute("DROP TABLE IF EXISTS clip_embeddings", [])
         .map_err(|e| e.to_string())?;
     tx.execute(
@@ -261,7 +323,7 @@ pub async fn clear_all_history(app: tauri::AppHandle) -> Result<(), String> {
     tx.execute_batch("INSERT INTO clips_fts(clips_fts) VALUES('rebuild');")
         .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
-    drop(conn);
+
     let _ = app.emit("clips-changed", ());
     let _ = app.emit("collections-changed", ());
     Ok(())
