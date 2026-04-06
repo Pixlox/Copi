@@ -29,6 +29,11 @@ const CHUNK_SIZE_MEDIUM: usize = 64 * 1024; // 10-100MB: 64KB
 const CHUNK_SIZE_LARGE: usize = 256 * 1024; // 100MB-1GB: 256KB
 const CHUNK_SIZE_XLARGE: usize = 512 * 1024; // >1GB: 512KB
 
+/// Hard cap per-message payload to avoid oversized sync frames.
+/// Base64 + JSON adds overhead, so keep chunks comfortably below common
+/// transport / parser thresholds.
+const CHUNK_SIZE_MAX_SAFE: usize = 128 * 1024;
+
 /// Progress event throttling
 const PROGRESS_EMIT_INTERVAL_MS: u64 = 100;
 const PROGRESS_EMIT_MIN_BYTES: u64 = 1_000_000; // 1MB
@@ -322,12 +327,14 @@ impl Default for WormholeState {
 
 /// Get optimal chunk size based on file size
 pub fn get_optimal_chunk_size(file_size: u64) -> usize {
-    match file_size {
+    let preferred = match file_size {
         0..=10_000_000 => CHUNK_SIZE_SMALL,
         10_000_001..=100_000_000 => CHUNK_SIZE_MEDIUM,
         100_000_001..=1_000_000_000 => CHUNK_SIZE_LARGE,
         _ => CHUNK_SIZE_XLARGE,
-    }
+    };
+
+    preferred.min(CHUNK_SIZE_MAX_SAFE)
 }
 
 /// Compute SHA-256 checksum of a file (streaming, memory efficient)

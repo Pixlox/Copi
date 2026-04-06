@@ -597,18 +597,42 @@ fn main() {
                         }
                     }
 
-                    eprintln!("[Wormhole Test] Running wormhole_debug_test (offer local test file)...");
-                    match wormhole::wormhole_debug_test(test_handle.clone()).await {
-                        Ok(result) => {
-                            eprintln!("[Wormhole Test] Local offer OK:\n{}", result);
-                            #[cfg(target_os = "windows")]
-                            log_startup_line("[Wormhole Test] local offer ok");
+                    let explicit_test_file = std::env::var("COPI_WORMHOLE_TEST_FILE").ok();
+                    if let Some(path) = explicit_test_file {
+                        eprintln!(
+                            "[Wormhole Test] Offering explicit file from COPI_WORMHOLE_TEST_FILE: {}",
+                            path
+                        );
+                        match wormhole::wormhole_offer_file(path.clone(), test_handle.clone()).await {
+                            Ok(file) => {
+                                eprintln!(
+                                    "[Wormhole Test] Local offer OK: {} ({}, {} bytes)",
+                                    file.file_name, file.id, file.file_size
+                                );
+                                #[cfg(target_os = "windows")]
+                                log_startup_line("[Wormhole Test] local offer ok");
+                            }
+                            Err(e) => {
+                                eprintln!("[Wormhole Test] Local offer FAILED: {}", e);
+                                #[cfg(target_os = "windows")]
+                                log_startup_line(&format!("[Wormhole Test] local offer failed: {}", e));
+                                return;
+                            }
                         }
-                        Err(e) => {
-                            eprintln!("[Wormhole Test] Local offer FAILED: {}", e);
-                            #[cfg(target_os = "windows")]
-                            log_startup_line(&format!("[Wormhole Test] local offer failed: {}", e));
-                            return;
+                    } else {
+                        eprintln!("[Wormhole Test] Running wormhole_debug_test (offer local test file)...");
+                        match wormhole::wormhole_debug_test(test_handle.clone()).await {
+                            Ok(result) => {
+                                eprintln!("[Wormhole Test] Local offer OK:\n{}", result);
+                                #[cfg(target_os = "windows")]
+                                log_startup_line("[Wormhole Test] local offer ok");
+                            }
+                            Err(e) => {
+                                eprintln!("[Wormhole Test] Local offer FAILED: {}", e);
+                                #[cfg(target_os = "windows")]
+                                log_startup_line(&format!("[Wormhole Test] local offer failed: {}", e));
+                                return;
+                            }
                         }
                     }
 
