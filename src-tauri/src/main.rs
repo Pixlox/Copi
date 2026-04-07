@@ -578,7 +578,8 @@ fn main() {
                         "open_wormhole" => {
                             let app_handle = app.clone();
                             tauri::async_runtime::spawn(async move {
-                                if let Err(error) = wormhole::open_wormhole_window(app_handle).await {
+                                if let Err(error) = wormhole::open_wormhole_window(app_handle).await
+                                {
                                     eprintln!("[Tray] Failed to open wormhole: {}", error);
                                     #[cfg(target_os = "windows")]
                                     log_startup_line(&format!(
@@ -672,7 +673,7 @@ fn main() {
             eprintln!("[Copi] Ready. Press hotkey to open overlay.");
             #[cfg(target_os = "windows")]
             log_startup_line("setup completed successfully");
-            
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1093,7 +1094,8 @@ fn hide_overlay_inner(app: &tauri::AppHandle, paste: bool) {
     if paste {
         #[cfg(target_os = "macos")]
         {
-            restore_previous_app(app);
+            let target_bundle_id = restore_previous_app(app);
+            wait_for_frontmost_app(target_bundle_id.as_deref(), 450);
             simulate_paste();
         }
 
@@ -1365,25 +1367,113 @@ fn rounded_rect_coverage(
 // ─── macOS Helpers ────────────────────────────────────────────────
 
 #[cfg(target_os = "macos")]
-fn restore_previous_app(app: &tauri::AppHandle) {
-    if let Some(Some(id)) = app
+fn restore_previous_app(app: &tauri::AppHandle) -> Option<String> {
+    let bundle_id = app
         .state::<AppState>()
         .previous_frontmost_app
         .try_lock()
         .ok()
-        .map(|g| g.clone())
+        .and_then(|guard| guard.clone())
+        .filter(|id| !id.trim().is_empty());
+
+    let Some(bundle_id) = bundle_id else {
+        return None;
+    };
+
+    match std::process::Command::new("open")
+        .arg("-b")
+        .arg(&bundle_id)
+        .status()
     {
-        let _ = std::process::Command::new("open")
-            .arg("-b")
-            .arg(&id)
-            .spawn();
+        Ok(status) if !status.success() => {
+            eprintln!(
+                "[Paste] Reactivate command for '{}' exited with {}",
+                bundle_id, status
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            eprintln!(
+                "[Paste] Failed to reactivate '{}' before paste: {}",
+                bundle_id, error
+            );
+        }
     }
+
+    Some(bundle_id)
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_frontmost_app(target_bundle_id: Option<&str>, timeout_ms: u64) {
+    let Some(target_bundle_id) = target_bundle_id else {
+        std::thread::sleep(std::time::Duration::from_millis(90));
+        return;
+    };
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+
+    while std::time::Instant::now() < deadline {
+        if crate::macos::get_frontmost_app_bundle_id()
+            .as_deref()
+            .map(|current| current == target_bundle_id)
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+
+    eprintln!(
+        "[Paste] Timed out waiting for '{}' to become frontmost",
+        target_bundle_id
+    );
 }
 
 #[cfg(target_os = "macos")]
 fn simulate_paste() {
-    std::thread::sleep(std::time::Duration::from_millis(80));
-    // Use CGEventPost for ~20ms latency (vs ~200ms with osascript)
+    std::thread::sleep(std::time::Duration::from_millis(35));
+
+    if try_simulate_paste_with_osascript() {
+        return;
+    }
+
+    eprintln!("[Paste] osascript failed, falling back to CGEventPost");
+    simulate_paste_with_cg_event();
+}
+
+#[cfg(target_os = "macos")]
+fn try_simulate_paste_with_osascript() -> bool {
+    const SCRIPT: &str = "tell application \"System Events\" to keystroke \"v\" using command down";
+
+    match std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(SCRIPT)
+        .output()
+    {
+        Ok(output) if output.status.success() => true,
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if stderr.is_empty() {
+                eprintln!(
+                    "[Paste] osascript returned non-zero status: {}",
+                    output.status
+                );
+            } else {
+                eprintln!("[Paste] osascript error: {}", stderr);
+            }
+            false
+        }
+        Err(error) => {
+            eprintln!("[Paste] Failed to launch osascript: {}", error);
+            false
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn simulate_paste_with_cg_event() {
+    // Use CGEventPost for low latency where it is permitted.
     // kVK_ANSI_V = 0x09, kCGHIDEventTap = 0, kCGEventFlagMaskCommand = 1 << 20
     extern "C" {
         fn CGEventCreateKeyboardEvent(
