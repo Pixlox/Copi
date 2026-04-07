@@ -230,6 +230,10 @@ pub fn init_db(app: &tauri::AppHandle) -> Result<DbConnections> {
     }
 
     run_migrations(&write)?;
+
+    // Initialize wormhole table
+    crate::wormhole::init_wormhole_table(&write)?;
+
     write.execute_batch(
         "
         CREATE INDEX IF NOT EXISTS idx_clips_sort ON clips(pinned DESC, copy_count DESC, created_at DESC);

@@ -23,6 +23,7 @@ mod query_parser;
 mod search;
 mod settings;
 mod sync;
+mod wormhole;
 
 #[cfg(target_os = "windows")]
 fn startup_log_path() -> std::path::PathBuf {
@@ -363,6 +364,8 @@ fn main() {
             app.manage(MenuBarState {
                 tray_icon: Mutex::new(None),
             });
+            // Initialize wormhole state
+            app.manage(wormhole::WormholeState::new());
 
             let shortcut_plugin_result = handle.plugin(
                 tauri_plugin_global_shortcut::Builder::new()
@@ -466,6 +469,8 @@ fn main() {
             let tray_init_result = (|| -> Result<(), Box<dyn std::error::Error>> {
                 let settings_item =
                     MenuItem::with_id(&handle, "settings", "Settings\u{2026}", true, None::<&str>)?;
+                let wormhole_item =
+                    MenuItem::with_id(&handle, "open_wormhole", "Open Wormhole", true, None::<&str>)?;
                 let pause_item =
                     MenuItem::with_id(&handle, "pause", "Pause Monitoring", true, None::<&str>)?;
                 let quit = MenuItem::with_id(&handle, "quit", "Quit Copi", true, None::<&str>)?;
@@ -474,19 +479,39 @@ fn main() {
                     &[
                         &settings_item,
                         &PredefinedMenuItem::separator(&handle)?,
+                        &wormhole_item,
                         &pause_item,
                         &PredefinedMenuItem::separator(&handle)?,
                         &quit,
                     ],
                 )?;
+                if let Ok(running) = handle.state::<AppState>().clipboard_watcher_running.lock() {
+                    if !*running {
+                        let _ = pause_item.set_text("Resume Monitoring");
+                    }
+                }
+                let pause_item_for_events = pause_item.clone();
 
                 let mut tray_builder = TrayIconBuilder::with_id("copi-menubar")
                     .menu(&menu)
                     .tooltip("Copi")
                     .show_menu_on_left_click(true)
-                    .on_menu_event(|app, event| match event.id().as_ref() {
+                    .on_menu_event(move |app, event| match event.id().as_ref() {
                         "settings" => {
                             show_settings_window_inner(app);
+                        }
+                        "open_wormhole" => {
+                            let app_handle = app.clone();
+                            tauri::async_runtime::spawn(async move {
+                                if let Err(error) = wormhole::open_wormhole_window(app_handle).await {
+                                    eprintln!("[Tray] Failed to open wormhole: {}", error);
+                                    #[cfg(target_os = "windows")]
+                                    log_startup_line(&format!(
+                                        "tray open wormhole failed: {}",
+                                        error
+                                    ));
+                                }
+                            });
                         }
                         "pause" => {
                             let state = app.state::<AppState>();
@@ -494,8 +519,10 @@ fn main() {
                             *running = !*running;
                             if *running {
                                 eprintln!("[Tray] Clipboard monitoring resumed");
+                                let _ = pause_item_for_events.set_text("Pause Monitoring");
                             } else {
                                 eprintln!("[Tray] Clipboard monitoring paused");
+                                let _ = pause_item_for_events.set_text("Resume Monitoring");
                             }
                         }
                         "quit" => app.exit(0),
@@ -569,6 +596,7 @@ fn main() {
             eprintln!("[Copi] Ready. Press hotkey to open overlay.");
             #[cfg(target_os = "windows")]
             log_startup_line("setup completed successfully");
+            
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -607,6 +635,16 @@ fn main() {
             collections::list_collections,
             collections::move_clip_to_collection,
             open_external_url,
+            // Wormhole commands
+            wormhole::wormhole_offer_file,
+            wormhole::wormhole_retract,
+            wormhole::wormhole_request_download,
+            wormhole::wormhole_cancel_download,
+            wormhole::wormhole_list_files,
+            wormhole::wormhole_get_file,
+            wormhole::wormhole_clear_completed,
+            wormhole::wormhole_get_pending_count,
+            wormhole::open_wormhole_window,
         ])
         .build(tauri::generate_context!())
         .unwrap_or_else(|error| {
@@ -794,6 +832,9 @@ pub(crate) fn start_runtime_services_once(app: &tauri::AppHandle) {
 
     let sync_state = crate::sync::start_sync(app.clone());
     let _ = app.state::<AppState>().sync.set(sync_state);
+
+    // Start wormhole expiry cleanup task
+    wormhole::start_expiry_task(app.clone());
 }
 
 fn show_setup_window_inner(app: &tauri::AppHandle) {

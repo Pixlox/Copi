@@ -20,6 +20,7 @@ import {
   Pencil,
   Check,
   Laptop,
+  Shell,
 } from "lucide-react";
 import { useThemeContext } from "../contexts/ThemeContext";
 import Picker from "../components/Picker";
@@ -52,6 +53,7 @@ interface CopiConfig {
     auto_connect: boolean;
     sync_embeddings: boolean;
     sync_collections_and_pins: boolean;
+    wormhole_expiration_hours?: number | null;
   };
 }
 
@@ -110,6 +112,15 @@ const RETENTION_OPTIONS = [
   { label: "90 days", value: "90" },
   { label: "1 year", value: "365" },
   { label: "Forever", value: "0" },
+];
+
+const WORMHOLE_EXPIRATION_OPTIONS = [
+  { label: "1 hour", value: "1" },
+  { label: "6 hours", value: "6" },
+  { label: "12 hours", value: "12" },
+  { label: "24 hours", value: "24" },
+  { label: "48 hours", value: "48" },
+  { label: "72 hours", value: "72" },
 ];
 
 const COLLECTION_COLORS = [
@@ -695,6 +706,27 @@ function SyncSection() {
                 sync: {
                   ...cfg.sync,
                   sync_collections_and_pins: value,
+                },
+              }));
+            }}
+          />
+        </SettingRow>
+        <SettingDivider />
+        <SettingRow
+          label="Wormhole Expiration"
+          description="How long wormhole offers stay available"
+        >
+          <Picker
+            value={String(config?.sync.wormhole_expiration_hours ?? 24)}
+            options={WORMHOLE_EXPIRATION_OPTIONS}
+            onChange={(value) => {
+              const hours = Number(value);
+              void saveSyncConfig((cfg) => ({
+                ...cfg,
+                sync: {
+                  ...cfg.sync,
+                  wormhole_expiration_hours:
+                    Number.isFinite(hours) && hours > 0 ? Math.trunc(hours) : 24,
                 },
               }));
             }}
@@ -1379,6 +1411,15 @@ export default function Settings() {
         </nav>
 
         <div className="settings-sidebar-footer">
+          <button 
+            className="settings-wormhole-btn"
+            onClick={() => invoke("open_wormhole_window")}
+            title="Open Wormhole - Send large files"
+          >
+            <Shell size={14} />
+            <span>Open Wormhole</span>
+          </button>
+          <div className="settings-sidebar-footer-divider" />
           <span>{appVersion ? `v${appVersion}` : ""}</span>
         </div>
       </aside>

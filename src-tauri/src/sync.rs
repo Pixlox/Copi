@@ -7,6 +7,7 @@ use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use rand::RngCore;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::Sha256;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
@@ -14,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -30,6 +31,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const PING_INTERVAL: Duration = Duration::from_secs(60);
 pub const FILE_AUTO_SYNC_MAX_BYTES: i64 = 10 * 1024 * 1024;
 const SYNC_VERSION_STRIDE: i64 = 1_i64 << 32;
+const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
@@ -89,6 +91,20 @@ enum Msg {
     },
     Ping,
     Pong,
+    // Wormhole messages for large file transfer
+    WormholeOffer(crate::wormhole::WormholeOffer),
+    WormholeRetract {
+        file_id: String,
+    },
+    WormholeRequest(crate::wormhole::WormholeRequest),
+    WormholeChunk(crate::wormhole::WormholeChunk),
+    WormholeComplete {
+        file_id: String,
+    },
+    WormholeAck {
+        file_id: String,
+    },
+    WormholeReject(crate::wormhole::WormholeReject),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,13 +167,54 @@ pub struct PeerWriter(Arc<AsyncMutex<tokio::net::tcp::OwnedWriteHalf>>);
 
 impl PeerWriter {
     async fn send(&self, msg: &Msg) -> Result<()> {
-        let mut payload = serde_json::to_vec(msg).context("serialize msg")?;
-        payload.push(b'\n');
+        let payload = serde_json::to_vec(msg).context("serialize msg")?;
+        if payload.len() > MAX_FRAME_BYTES {
+            return Err(anyhow!(
+                "frame too large: {} bytes (max {})",
+                payload.len(),
+                MAX_FRAME_BYTES
+            ));
+        }
         let mut writer = self.0.lock().await;
-        writer.write_all(&payload).await.context("write msg")?;
+        let frame_len = (payload.len() as u32).to_be_bytes();
+        writer
+            .write_all(&frame_len)
+            .await
+            .context("write frame len")?;
+        writer.write_all(&payload).await.context("write frame msg")?;
         writer.flush().await.context("flush msg")?;
         Ok(())
     }
+}
+
+async fn read_frame(
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+) -> Result<Option<Vec<u8>>> {
+    let mut len_buf = [0u8; 4];
+    match reader.read_exact(&mut len_buf).await {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Ok(None);
+        }
+        Err(error) => return Err(anyhow!("read frame len: {}", error)),
+    }
+
+    let frame_len = u32::from_be_bytes(len_buf) as usize;
+    if frame_len == 0 || frame_len > MAX_FRAME_BYTES {
+        return Err(anyhow!(
+            "invalid frame length {} (max {})",
+            frame_len,
+            MAX_FRAME_BYTES
+        ));
+    }
+
+    let mut frame = vec![0u8; frame_len];
+    reader
+        .read_exact(&mut frame)
+        .await
+        .context("read frame payload")?;
+
+    Ok(Some(frame))
 }
 
 #[derive(Clone)]
@@ -169,7 +226,7 @@ struct SecureSender {
 
 impl SecureSender {
     async fn send(&self, msg: &Msg) -> Result<()> {
-        let payload = serde_json::to_vec(msg).context("serialize secure msg")?;
+        let payload = serialize_secure_payload(msg).context("serialize secure msg")?;
         let mut writer = self.writer.0.lock().await;
         let nonce = self.nonce.fetch_add(1, Ordering::SeqCst);
         let nonce_bytes = nonce_to_bytes(nonce);
@@ -177,13 +234,27 @@ impl SecureSender {
             .cipher
             .encrypt(Nonce::from_slice(&nonce_bytes), payload.as_ref())
             .context("encrypt secure msg")?;
-        let mut frame = serde_json::to_vec(&Msg::Secure {
+        let frame = serde_json::to_vec(&Msg::Secure {
             nonce,
             payload: B64.encode(encrypted),
         })
         .context("serialize msg")?;
-        frame.push(b'\n');
-        writer.write_all(&frame).await.context("write msg")?;
+        if frame.len() > MAX_FRAME_BYTES {
+            return Err(anyhow!(
+                "secure frame too large: {} bytes (max {})",
+                frame.len(),
+                MAX_FRAME_BYTES
+            ));
+        }
+        let frame_len = (frame.len() as u32).to_be_bytes();
+        writer
+            .write_all(&frame_len)
+            .await
+            .context("write secure frame len")?;
+        writer
+            .write_all(&frame)
+            .await
+            .context("write secure frame")?;
         writer.flush().await.context("flush msg")?;
         Ok(())
     }
@@ -206,11 +277,76 @@ impl SecureReceiver {
             .cipher
             .decrypt(Nonce::from_slice(&nonce_bytes), ciphertext.as_ref())
             .context("decrypt secure payload")?;
-        let msg = serde_json::from_slice(&plaintext).context("parse secure payload")?;
+        let msg = parse_secure_payload(&plaintext).context("parse secure payload")?;
         self.next_nonce = nonce + 1;
         Ok(msg)
     }
 
+}
+
+fn serialize_secure_payload(msg: &Msg) -> Result<Vec<u8>> {
+    match msg {
+        Msg::WormholeChunk(chunk) => {
+            let data_b64 = B64.encode(&chunk.data);
+            let value = serde_json::json!({
+                "t": "wormhole_chunk",
+                "file_id": chunk.file_id,
+                "offset": chunk.offset,
+                "data": data_b64,
+                "is_final": chunk.is_final,
+            });
+            serde_json::to_vec(&value).context("serialize wormhole chunk payload")
+        }
+        _ => serde_json::to_vec(msg).context("serialize payload"),
+    }
+}
+
+fn parse_secure_payload(bytes: &[u8]) -> Result<Msg> {
+    if let Ok(msg) = serde_json::from_slice::<Msg>(bytes) {
+        return Ok(msg);
+    }
+
+    let value: Value = serde_json::from_slice(bytes).context("parse secure payload as json")?;
+    let msg_type = value
+        .get("t")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("missing message type"))?;
+
+    if msg_type == "wormhole_chunk" {
+        let file_id = value
+            .get("file_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("missing wormhole chunk file_id"))?
+            .to_string();
+        let offset = value
+            .get("offset")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow!("missing wormhole chunk offset"))?;
+        let is_final = value
+            .get("is_final")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| anyhow!("missing wormhole chunk is_final"))?;
+        let data_field = value
+            .get("data")
+            .ok_or_else(|| anyhow!("missing wormhole chunk data"))?;
+
+        let data = if let Some(as_b64) = data_field.as_str() {
+            B64.decode(as_b64)
+                .context("decode wormhole chunk base64 data")?
+        } else {
+            serde_json::from_value::<Vec<u8>>(data_field.clone())
+                .context("decode wormhole chunk byte-array data")?
+        };
+
+        return Ok(Msg::WormholeChunk(crate::wormhole::WormholeChunk {
+            file_id,
+            offset,
+            data,
+            is_final,
+        }));
+    }
+
+    Err(anyhow!("unsupported secure payload type: {}", msg_type))
 }
 
 fn nonce_to_bytes(counter: u64) -> [u8; 12] {
@@ -420,6 +556,126 @@ impl SyncState {
         if let Ok(mut guard) = self.pairing_pin.lock() {
             *guard = None;
         }
+    }
+
+    // ─── Wormhole Methods ─────────────────────────────────────────
+
+    /// Broadcast a wormhole file offer to all connected peers
+    pub async fn broadcast_wormhole_offer(&self, offer: crate::wormhole::WormholeOffer) -> Result<()> {
+        if !self.is_enabled() {
+            return Ok(());
+        }
+        eprintln!(
+            "[Wormhole] Broadcasting offer to peers: {} ({})",
+            offer.file_name, offer.id
+        );
+        self.broadcast(Msg::WormholeOffer(offer)).await
+    }
+
+    /// Broadcast wormhole file retraction to all connected peers
+    pub async fn broadcast_wormhole_retract(&self, file_id: &str) -> Result<()> {
+        if !self.is_enabled() {
+            return Ok(());
+        }
+        eprintln!("[Wormhole] Broadcasting retract: {}", file_id);
+        self.broadcast(Msg::WormholeRetract {
+            file_id: file_id.to_string(),
+        })
+        .await
+    }
+
+    /// Send wormhole request to a specific peer
+    pub async fn send_wormhole_request(
+        &self,
+        peer_device_id: &str,
+        request: crate::wormhole::WormholeRequest,
+    ) -> Result<()> {
+        let writer = {
+            let guard = self.live.read().await;
+            guard
+                .get(peer_device_id)
+                .map(|peer| peer.writer.clone())
+                .ok_or_else(|| anyhow!("Peer not connected: {}", peer_device_id))?
+        };
+        eprintln!(
+            "[Wormhole] Sending request to {}: {}",
+            peer_device_id, request.file_id
+        );
+        writer.send(&Msg::WormholeRequest(request)).await
+    }
+
+    /// Send wormhole chunk to a specific peer
+    pub async fn send_wormhole_chunk(
+        &self,
+        peer_device_id: &str,
+        chunk: crate::wormhole::WormholeChunk,
+    ) -> Result<()> {
+        let writer = {
+            let guard = self.live.read().await;
+            guard
+                .get(peer_device_id)
+                .map(|peer| peer.writer.clone())
+                .ok_or_else(|| anyhow!("Peer not connected: {}", peer_device_id))?
+        };
+        writer.send(&Msg::WormholeChunk(chunk)).await
+    }
+
+    /// Send wormhole complete notification to a specific peer
+    pub async fn send_wormhole_complete(&self, peer_device_id: &str, file_id: &str) -> Result<()> {
+        let writer = {
+            let guard = self.live.read().await;
+            guard
+                .get(peer_device_id)
+                .map(|peer| peer.writer.clone())
+                .ok_or_else(|| anyhow!("Peer not connected: {}", peer_device_id))?
+        };
+        eprintln!(
+            "[Wormhole] Sending complete to {}: {}",
+            peer_device_id, file_id
+        );
+        writer
+            .send(&Msg::WormholeComplete {
+                file_id: file_id.to_string(),
+            })
+            .await
+    }
+
+    /// Send wormhole acknowledgment to a specific peer
+    pub async fn send_wormhole_ack(&self, peer_device_id: &str, file_id: &str) -> Result<()> {
+        let writer = {
+            let guard = self.live.read().await;
+            guard
+                .get(peer_device_id)
+                .map(|peer| peer.writer.clone())
+                .ok_or_else(|| anyhow!("Peer not connected: {}", peer_device_id))?
+        };
+        writer
+            .send(&Msg::WormholeAck {
+                file_id: file_id.to_string(),
+            })
+            .await
+    }
+
+    /// Send wormhole rejection to a specific peer
+    pub async fn send_wormhole_reject(
+        &self,
+        peer_device_id: &str,
+        file_id: &str,
+        reason: &str,
+    ) -> Result<()> {
+        let writer = {
+            let guard = self.live.read().await;
+            guard
+                .get(peer_device_id)
+                .map(|peer| peer.writer.clone())
+                .ok_or_else(|| anyhow!("Peer not connected: {}", peer_device_id))?
+        };
+        writer
+            .send(&Msg::WormholeReject(crate::wormhole::WormholeReject {
+                file_id: file_id.to_string(),
+                reason: reason.to_string(),
+            }))
+            .await
     }
 }
 
@@ -1017,12 +1273,11 @@ async fn run_session(
             .await?;
     }
 
-    let mut first_line = String::new();
-    let read = reader.read_line(&mut first_line).await?;
-    if read == 0 {
+    let first_frame = read_frame(&mut reader).await?;
+    let Some(first_frame) = first_frame else {
         return Err(anyhow!("session closed before handshake"));
-    }
-    let first_msg: Msg = serde_json::from_str(first_line.trim_end()).context("parse first msg")?;
+    };
+    let first_msg: Msg = serde_json::from_slice(&first_frame).context("parse first msg")?;
 
     let (peer_id, peer_seed) = match first_msg {
         Msg::PairRequest {
@@ -1153,13 +1408,12 @@ async fn run_session(
             .await?;
     }
 
-    let mut handshake_line = String::new();
-    let read = reader.read_line(&mut handshake_line).await?;
-    if read == 0 {
+    let handshake_frame = read_frame(&mut reader).await?;
+    let Some(handshake_frame) = handshake_frame else {
         return Err(anyhow!("session closed before secure handshake"));
-    }
+    };
     let handshake_outer: Msg =
-        serde_json::from_str(handshake_line.trim_end()).context("parse handshake outer msg")?;
+        serde_json::from_slice(&handshake_frame).context("parse handshake outer msg")?;
     let handshake_msg = match handshake_outer {
         Msg::Secure { nonce, payload } => secure_receiver.decrypt_msg(nonce, &payload)?,
         _ => return Err(anyhow!("expected secure handshake frame")),
@@ -1313,60 +1567,110 @@ async fn run_session(
                 );
             }
         }
-    });
 
-    let mut ping = tokio::time::interval(PING_INTERVAL);
-    let session_result = loop {
-        let mut line = String::new();
-        tokio::select! {
-            read_result = reader.read_line(&mut line) => {
-                match read_result {
-                    Ok(0) => break Ok(()),
-                    Ok(_) => {
-                        let raw = line.trim_end();
-                        let outer: Msg = match serde_json::from_str(raw) {
-                            Ok(msg) => msg,
-                            Err(error) => {
-                                let prefix: String = raw.chars().take(80).collect();
-                                let bytes: Vec<u8> = raw.as_bytes().iter().take(24).copied().collect();
-                                eprintln!("[Sync] Failed to parse message from {}: {}", peer_id, error);
-                                eprintln!(
-                                    "[Sync] Parse raw prefix from {}: {:?} bytes={:02X?}",
-                                    peer_id,
-                                    prefix,
-                                    bytes
-                                );
-                                break Err(anyhow!("invalid message from peer"));
-                            }
-                        };
-                        let msg = match outer {
-                            Msg::Secure { nonce, payload } => {
-                                match secure_receiver.decrypt_msg(nonce, &payload) {
-                                    Ok(msg) => msg,
-                                    Err(error) => {
-                                        eprintln!("[Sync] Failed to decrypt message from {}: {}", peer_id, error);
-                                        break Err(anyhow!("failed to decrypt message"));
-                                    }
-                                }
-                            }
-                            _ => {
-                                break Err(anyhow!("received unencrypted message from trusted peer"));
-                            }
-                        };
-                        if let Err(error) = handle_message(&app, &sync, &peer_id, &secure_writer, msg).await {
-                            break Err(error);
-                        }
-                    }
-                    Err(error) => break Err(anyhow!("read error: {}", error)),
-                }
-            }
-            _ = ping.tick() => {
-                if let Err(error) = secure_writer.send(&Msg::Ping).await {
-                    break Err(error);
+        // Send current local wormhole offers to newly connected peer so
+        // offers created while the peer was offline still appear remotely.
+        let wormhole_offers = {
+            let state = app_bootstrap.state::<AppState>();
+            let files = match state.db_read_pool.get() {
+                Ok(conn) => crate::wormhole::list_wormhole_files(&conn).unwrap_or_default(),
+                Err(_) => Vec::new(),
+            };
+
+            files
+                .into_iter()
+                .filter(|f| {
+                    f.is_local
+                        && matches!(
+                            f.status,
+                            crate::wormhole::WormholeStatus::Available
+                                | crate::wormhole::WormholeStatus::Pending
+                        )
+                })
+                .map(|f| crate::wormhole::WormholeOffer {
+                    id: f.id,
+                    file_name: f.file_name,
+                    file_size: f.file_size,
+                    mime_type: f.mime_type,
+                    checksum: f.checksum,
+                    expires_at: f.expires_at,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        if !wormhole_offers.is_empty() {
+            eprintln!(
+                "[Wormhole] Sending {} existing offers to peer {}",
+                wormhole_offers.len(),
+                peer_bootstrap
+            );
+            for offer in wormhole_offers {
+                if let Err(error) = writer_bootstrap.send(&Msg::WormholeOffer(offer)).await {
+                    eprintln!(
+                        "[Wormhole] Failed to send existing offer to peer {}: {}",
+                        peer_bootstrap, error
+                    );
+                    break;
                 }
             }
         }
+    });
+
+    let ping_writer = secure_writer.clone();
+    let ping_peer = peer_id.clone();
+    let ping_task = tauri::async_runtime::spawn(async move {
+        let mut ping = tokio::time::interval(PING_INTERVAL);
+        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ping.tick().await;
+            if let Err(error) = ping_writer.send(&Msg::Ping).await {
+                eprintln!("[Sync] Ping send failed to {}: {}", ping_peer, error);
+                break;
+            }
+        }
+    });
+
+    let session_result = loop {
+        match read_frame(&mut reader).await {
+            Ok(None) => break Ok(()),
+            Ok(Some(frame)) => {
+                let outer: Msg = match serde_json::from_slice(&frame) {
+                    Ok(msg) => msg,
+                    Err(error) => {
+                        let raw = String::from_utf8_lossy(&frame);
+                        let prefix: String = raw.chars().take(80).collect();
+                        let bytes: Vec<u8> = frame.iter().take(24).copied().collect();
+                        eprintln!("[Sync] Failed to parse message from {}: {}", peer_id, error);
+                        eprintln!(
+                            "[Sync] Parse raw prefix from {}: {:?} bytes={:02X?}",
+                            peer_id,
+                            prefix,
+                            bytes
+                        );
+                        break Err(anyhow!("invalid message from peer"));
+                    }
+                };
+                let msg = match outer {
+                    Msg::Secure { nonce, payload } => match secure_receiver.decrypt_msg(nonce, &payload) {
+                        Ok(msg) => msg,
+                        Err(error) => {
+                            eprintln!("[Sync] Failed to decrypt message from {}: {}", peer_id, error);
+                            break Err(anyhow!("failed to decrypt message"));
+                        }
+                    },
+                    _ => {
+                        break Err(anyhow!("received unencrypted message from trusted peer"));
+                    }
+                };
+                if let Err(error) = handle_message(&app, &sync, &peer_id, &secure_writer, msg).await {
+                    break Err(error);
+                }
+            }
+            Err(error) => break Err(anyhow!("read frame error: {}", error)),
+        }
     };
+
+    ping_task.abort();
 
     sync.unregister_peer_if_current(&peer_id, session_token)
         .await;
@@ -1431,6 +1735,29 @@ async fn handle_message(
         }
         Msg::Ping => writer.send(&Msg::Pong).await,
         Msg::Pong => Ok(()),
+        // Wormhole message handling
+        Msg::WormholeOffer(offer) => {
+            handle_wormhole_offer(app, peer_id, offer).await
+        }
+        Msg::WormholeRetract { file_id } => {
+            handle_wormhole_retract(app, &file_id).await
+        }
+        Msg::WormholeRequest(request) => {
+            handle_wormhole_request(app, peer_id, request).await
+        }
+        Msg::WormholeChunk(chunk) => {
+            handle_wormhole_chunk(app, chunk).await
+        }
+        Msg::WormholeComplete { file_id } => {
+            handle_wormhole_complete(app, &file_id).await
+        }
+        Msg::WormholeAck { file_id } => {
+            eprintln!("[Wormhole] Received ack for file: {}", file_id);
+            Ok(())
+        }
+        Msg::WormholeReject(reject) => {
+            handle_wormhole_reject(app, reject).await
+        }
         _ => Ok(()),
     }
 }
@@ -2697,7 +3024,9 @@ async fn lookup_clip_for_push(
 
 #[tauri::command]
 pub async fn sync_get_identity(app: AppHandle) -> Result<SyncIdentityPayload, String> {
-    let state = app.state::<AppState>();
+    let state = app
+        .try_state::<AppState>()
+        .ok_or_else(|| "app state not initialized".to_string())?;
     let sync = state
         .sync
         .get()
@@ -2710,8 +3039,10 @@ pub async fn sync_get_identity(app: AppHandle) -> Result<SyncIdentityPayload, St
 
 #[tauri::command]
 pub async fn sync_list_peers(app: AppHandle) -> Result<Vec<SyncPeerPayload>, String> {
+    let state = app
+        .try_state::<AppState>()
+        .ok_or_else(|| "app state not initialized".to_string())?;
     let trusted = get_trusted_peers(&app).map_err(|e| e.to_string())?;
-    let state = app.state::<AppState>();
     let Some(sync) = state.sync.get() else {
         return Ok(Vec::new());
     };
@@ -2733,7 +3064,9 @@ pub async fn sync_list_peers(app: AppHandle) -> Result<Vec<SyncPeerPayload>, Str
 
 #[tauri::command]
 pub async fn sync_generate_pin(app: AppHandle) -> Result<SyncPinPayload, String> {
-    let state = app.state::<AppState>();
+    let state = app
+        .try_state::<AppState>()
+        .ok_or_else(|| "app state not initialized".to_string())?;
     let sync = state
         .sync
         .get()
@@ -2750,7 +3083,9 @@ pub async fn sync_generate_pin(app: AppHandle) -> Result<SyncPinPayload, String>
 
 #[tauri::command]
 pub async fn sync_get_status(app: AppHandle) -> Result<serde_json::Value, String> {
-    let state = app.state::<AppState>();
+    let state = app
+        .try_state::<AppState>()
+        .ok_or_else(|| "app state not initialized".to_string())?;
     let sync = state
         .sync
         .get()
@@ -2770,7 +3105,9 @@ pub async fn sync_pair_with(
     target_addr: String,
     pin: String,
 ) -> Result<(), String> {
-    let state = app.state::<AppState>();
+    let state = app
+        .try_state::<AppState>()
+        .ok_or_else(|| "app state not initialized".to_string())?;
     let sync = state
         .sync
         .get()
@@ -2800,16 +3137,14 @@ pub async fn sync_pair_with(
         .map_err(|e| e.to_string())?;
 
     let mut reader = BufReader::new(read_half);
-    let mut line = String::new();
-    let read = reader
-        .read_line(&mut line)
+    let frame = read_frame(&mut reader)
         .await
         .map_err(|e| e.to_string())?;
-    if read == 0 {
+    let Some(frame) = frame else {
         return Err("pairing connection closed".to_string());
-    }
+    };
 
-    let msg: Msg = serde_json::from_str(line.trim_end()).map_err(|e| e.to_string())?;
+    let msg: Msg = serde_json::from_slice(&frame).map_err(|e| e.to_string())?;
     match msg {
         Msg::PairAccept {
             device_id,
@@ -2866,7 +3201,10 @@ pub async fn sync_pair_with(
 #[tauri::command]
 pub async fn sync_remove_peer(app: AppHandle, device_id: String) -> Result<(), String> {
     remove_trusted_peer(&app, &device_id).map_err(|e| e.to_string())?;
-    if let Some(sync) = app.state::<AppState>().sync.get() {
+    let Some(state) = app.try_state::<AppState>() else {
+        return Ok(());
+    };
+    if let Some(sync) = state.sync.get() {
         sync.unregister_peer(&device_id).await;
         sync.known_addrs.write().await.remove(&device_id);
         sync.connecting.write().await.remove(&device_id);
@@ -2919,7 +3257,9 @@ pub async fn on_local_clip_saved(app: &AppHandle, content_hash: &str) {
 
 #[tauri::command]
 pub async fn sync_list_discovered(app: AppHandle) -> Result<Vec<DiscoveredPeer>, String> {
-    let state = app.state::<AppState>();
+    let state = app
+        .try_state::<AppState>()
+        .ok_or_else(|| "app state not initialized".to_string())?;
     let sync = state
         .sync
         .get()
@@ -3338,6 +3678,240 @@ pub fn on_collection_changed(app: &AppHandle) {
             eprintln!("[Sync] Failed to push collection batch: {}", error);
         }
     });
+}
+
+// ─── Wormhole Message Handlers ────────────────────────────────────
+
+/// Handle incoming wormhole offer from peer
+async fn handle_wormhole_offer(
+    app: &AppHandle,
+    peer_device_id: &str,
+    offer: crate::wormhole::WormholeOffer,
+) -> Result<()> {
+    eprintln!(
+        "[Wormhole] Received offer from {}: {} ({} bytes)",
+        peer_device_id, offer.file_name, offer.file_size
+    );
+
+    // Get peer display name
+    let peer_name = {
+        let state = app.state::<AppState>();
+        let conn = state.db_read_pool.get().context("get db connection")?;
+        conn.query_row(
+            "SELECT display_name FROM sync_peers WHERE device_id = ?1",
+            [peer_device_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    };
+
+    // Create wormhole file record
+    let wormhole_file = crate::wormhole::WormholeFile {
+        id: offer.id.clone(),
+        file_name: offer.file_name.clone(),
+        file_size: offer.file_size,
+        mime_type: offer.mime_type.clone(),
+        checksum: offer.checksum.clone(),
+        origin_device_id: peer_device_id.to_string(),
+        origin_device_name: peer_name,
+        is_local: false,
+        status: crate::wormhole::WormholeStatus::Available,
+        bytes_transferred: 0,
+        transfer_started_at: None,
+        transfer_completed_at: None,
+        local_path: None,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        expires_at: offer.expires_at.clone(),
+    };
+
+    // Upsert into database (offers can be re-broadcast)
+    {
+        let state = app.state::<AppState>();
+        let conn = state.db_write.lock().map_err(|e| anyhow!("lock: {}", e))?;
+        if crate::wormhole::get_wormhole_file(&conn, &offer.id)?.is_some() {
+            conn.execute(
+                "UPDATE wormhole_files SET
+                    file_name = ?1,
+                    file_size = ?2,
+                    mime_type = ?3,
+                    checksum = ?4,
+                    origin_device_id = ?5,
+                    origin_device_name = ?6,
+                    is_local = 0,
+                    status = ?7,
+                    bytes_transferred = 0,
+                    transfer_started_at = NULL,
+                    transfer_completed_at = NULL,
+                    local_path = NULL,
+                    expires_at = ?8
+                 WHERE id = ?9",
+                rusqlite::params![
+                    &wormhole_file.file_name,
+                    wormhole_file.file_size as i64,
+                    &wormhole_file.mime_type,
+                    &wormhole_file.checksum,
+                    &wormhole_file.origin_device_id,
+                    &wormhole_file.origin_device_name,
+                    crate::wormhole::WormholeStatus::Available.as_str(),
+                    &wormhole_file.expires_at,
+                    &wormhole_file.id,
+                ],
+            )?;
+        } else {
+            crate::wormhole::insert_wormhole_file(&conn, &wormhole_file)?;
+        }
+    }
+
+    // Emit event to UI
+    let _ = app.emit("wormhole://offer-received", &wormhole_file);
+
+    Ok(())
+}
+
+/// Handle wormhole retract message
+async fn handle_wormhole_retract(app: &AppHandle, file_id: &str) -> Result<()> {
+    eprintln!("[Wormhole] Received retract: {}", file_id);
+
+    // Update database
+    {
+        let state = app.state::<AppState>();
+        let conn = state.db_write.lock().map_err(|e| anyhow!("lock: {}", e))?;
+        crate::wormhole::update_wormhole_status(
+            &conn,
+            file_id,
+            crate::wormhole::WormholeStatus::Cancelled,
+        )?;
+    }
+
+    // Cancel any active transfer
+    if let Some(wormhole_state) = app.try_state::<crate::wormhole::WormholeState>() {
+        wormhole_state.cancel_transfer(file_id).await;
+    }
+
+    // Emit event to UI
+    let _ = app.emit("wormhole://offer-retracted", file_id);
+
+    Ok(())
+}
+
+/// Handle wormhole download request from peer
+async fn handle_wormhole_request(
+    app: &AppHandle,
+    peer_device_id: &str,
+    request: crate::wormhole::WormholeRequest,
+) -> Result<()> {
+    eprintln!(
+        "[Wormhole] Received download request from {} for {}",
+        peer_device_id, request.file_id
+    );
+
+    // Verify file exists and we're the owner
+    let file = {
+        let state = app.state::<AppState>();
+        let conn = state.db_read_pool.get().context("get db connection")?;
+        crate::wormhole::get_wormhole_file(&conn, &request.file_id)?
+    };
+
+    let Some(file) = file else {
+        eprintln!("[Wormhole] File not found: {}", request.file_id);
+        let state = app.state::<AppState>();
+        if let Some(sync) = state.sync.get() {
+            let _ = sync
+                .send_wormhole_reject(peer_device_id, &request.file_id, "File not found")
+                .await;
+        }
+        return Ok(());
+    };
+
+    if !file.is_local {
+        eprintln!("[Wormhole] Not the owner of file: {}", request.file_id);
+        let state = app.state::<AppState>();
+        if let Some(sync) = state.sync.get() {
+            let _ = sync
+                .send_wormhole_reject(peer_device_id, &request.file_id, "Not the file owner")
+                .await;
+        }
+        return Ok(());
+    }
+
+    // Start streaming file to peer
+    let app_clone = app.clone();
+    let peer_id = peer_device_id.to_string();
+    let file_id = request.file_id.clone();
+    let resume_from = request.resume_from.unwrap_or(0);
+
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) =
+            crate::wormhole::stream_file_to_peer(&app_clone, &file_id, &peer_id, resume_from).await
+        {
+            eprintln!("[Wormhole] Stream failed: {}", e);
+            let _ = app_clone.emit(
+                "wormhole://transfer-failed",
+                serde_json::json!({
+                    "file_id": file_id,
+                    "reason": e.to_string()
+                }),
+            );
+        }
+    });
+
+    Ok(())
+}
+
+/// Handle incoming wormhole chunk
+async fn handle_wormhole_chunk(
+    app: &AppHandle,
+    chunk: crate::wormhole::WormholeChunk,
+) -> Result<()> {
+    crate::wormhole::handle_incoming_chunk(app, chunk).await
+}
+
+/// Handle wormhole transfer complete notification
+async fn handle_wormhole_complete(app: &AppHandle, file_id: &str) -> Result<()> {
+    eprintln!("[Wormhole] Received complete notification for: {}", file_id);
+
+    // The actual completion is handled in handle_incoming_chunk when is_final=true
+    // This message is for confirmation/acknowledgment
+
+    Ok(())
+}
+
+/// Handle wormhole rejection
+async fn handle_wormhole_reject(
+    app: &AppHandle,
+    reject: crate::wormhole::WormholeReject,
+) -> Result<()> {
+    eprintln!(
+        "[Wormhole] Received rejection for {}: {}",
+        reject.file_id, reject.reason
+    );
+
+    // Update database status
+    {
+        let state = app.state::<AppState>();
+        let conn = state.db_write.lock().map_err(|e| anyhow!("lock: {}", e))?;
+        crate::wormhole::update_wormhole_status(
+            &conn,
+            &reject.file_id,
+            crate::wormhole::WormholeStatus::Failed,
+        )?;
+    }
+
+    // Cancel any active transfer
+    if let Some(wormhole_state) = app.try_state::<crate::wormhole::WormholeState>() {
+        wormhole_state.cancel_transfer(&reject.file_id).await;
+    }
+
+    // Emit event to UI
+    let _ = app.emit(
+        "wormhole://transfer-failed",
+        serde_json::json!({
+            "file_id": reject.file_id,
+            "reason": reject.reason
+        }),
+    );
+
+    Ok(())
 }
 
 #[cfg(test)]

@@ -6,6 +6,7 @@ import { ErrorBoundary } from "./components/ErrorBoundary";
 import Overlay from "./overlay/Overlay";
 import Settings from "./settings/Settings";
 import Setup from "./setup/Setup";
+import Wormhole from "./wormhole/Wormhole";
 import { checkForUpdates } from "./utils/updater";
 import { isMacPlatform } from "./utils/platform";
 
@@ -13,6 +14,7 @@ function App() {
   const windowLabel = getCurrentWindow().label;
   const isSettings = windowLabel === "settings";
   const isSetup = windowLabel === "setup";
+  const isWormhole = windowLabel === "wormhole";
 
   useEffect(() => {
     if (isSettings) {
@@ -21,6 +23,14 @@ function App() {
       document.documentElement.classList.remove("settings-window");
     }
   }, [isSettings]);
+
+  useEffect(() => {
+    if (isWormhole) {
+      document.documentElement.classList.add("wormhole-window");
+    } else {
+      document.documentElement.classList.remove("wormhole-window");
+    }
+  }, [isWormhole]);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -35,7 +45,7 @@ function App() {
 
   // Auto-update check on startup (only in overlay/main window)
   useEffect(() => {
-    if (isSettings || isSetup) return;
+    if (isSettings || isSetup || isWormhole) return;
 
     const timer = setTimeout(async () => {
       try {
@@ -51,7 +61,7 @@ function App() {
     }, 3000);
 
     return () => clearTimeout(timer);
-  }, [isSettings, isSetup]);
+  }, [isSettings, isSetup, isWormhole]);
 
   if (isSettings) {
     return (
@@ -68,6 +78,16 @@ function App() {
       <ThemeProvider>
         <div className="w-full h-screen">
           <Setup />
+        </div>
+      </ThemeProvider>
+    );
+  }
+
+  if (isWormhole) {
+    return (
+      <ThemeProvider>
+        <div className="w-full h-screen">
+          <Wormhole />
         </div>
       </ThemeProvider>
     );
