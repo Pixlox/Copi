@@ -168,6 +168,6 @@ PRs are welcome.
 
 <div align="center">
 
-Made with ♥ by [Pixlox](https://pixlox.me) and [Megumi Labs](https://github.com/MegumiLabs) 
+Made with <3 by [Pixlox](https://pixlox.me) and [Megumi Labs](https://github.com/MegumiLabs) 
 
 </div>
