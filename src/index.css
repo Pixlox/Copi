@@ -211,6 +211,11 @@ html.settings-window, html.settings-window body {
   overflow: auto;
 }
 
+.platform-windows.settings-window,
+.platform-windows.settings-window body {
+  background: var(--settings-bg) !important;
+}
+
 input, button, .filter-pill, select, textarea {
   -webkit-app-region: no-drag;
 }
@@ -1628,6 +1633,9 @@ input::placeholder {
 .settings-sidebar-footer-divider {
   height: 0.5px;
   background: var(--border-subtle);
+  width: calc(100% + 32px);
+  margin-left: -16px;
+  margin-right: -16px;
 }
 
 .settings-sidebar-footer span {
@@ -2601,6 +2609,15 @@ input::placeholder {
 }
 
 .platform-windows.wormhole-window #root {
+  border-radius: 0;
+  background: var(--settings-bg);
+}
+
+.platform-macos.wormhole-window #root {
+  border-radius: 12px;
+}
+
+.platform-windows.settings-window #root {
   border-radius: 0;
   background: var(--settings-bg);
 }

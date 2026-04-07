@@ -469,6 +469,8 @@ fn main() {
             let tray_init_result = (|| -> Result<(), Box<dyn std::error::Error>> {
                 let settings_item =
                     MenuItem::with_id(&handle, "settings", "Settings\u{2026}", true, None::<&str>)?;
+                let wormhole_item =
+                    MenuItem::with_id(&handle, "open_wormhole", "Open Wormhole", true, None::<&str>)?;
                 let pause_item =
                     MenuItem::with_id(&handle, "pause", "Pause Monitoring", true, None::<&str>)?;
                 let quit = MenuItem::with_id(&handle, "quit", "Quit Copi", true, None::<&str>)?;
@@ -477,19 +479,39 @@ fn main() {
                     &[
                         &settings_item,
                         &PredefinedMenuItem::separator(&handle)?,
+                        &wormhole_item,
                         &pause_item,
                         &PredefinedMenuItem::separator(&handle)?,
                         &quit,
                     ],
                 )?;
+                if let Ok(running) = handle.state::<AppState>().clipboard_watcher_running.lock() {
+                    if !*running {
+                        let _ = pause_item.set_text("Resume Monitoring");
+                    }
+                }
+                let pause_item_for_events = pause_item.clone();
 
                 let mut tray_builder = TrayIconBuilder::with_id("copi-menubar")
                     .menu(&menu)
                     .tooltip("Copi")
                     .show_menu_on_left_click(true)
-                    .on_menu_event(|app, event| match event.id().as_ref() {
+                    .on_menu_event(move |app, event| match event.id().as_ref() {
                         "settings" => {
                             show_settings_window_inner(app);
+                        }
+                        "open_wormhole" => {
+                            let app_handle = app.clone();
+                            tauri::async_runtime::spawn(async move {
+                                if let Err(error) = wormhole::open_wormhole_window(app_handle).await {
+                                    eprintln!("[Tray] Failed to open wormhole: {}", error);
+                                    #[cfg(target_os = "windows")]
+                                    log_startup_line(&format!(
+                                        "tray open wormhole failed: {}",
+                                        error
+                                    ));
+                                }
+                            });
                         }
                         "pause" => {
                             let state = app.state::<AppState>();
@@ -497,8 +519,10 @@ fn main() {
                             *running = !*running;
                             if *running {
                                 eprintln!("[Tray] Clipboard monitoring resumed");
+                                let _ = pause_item_for_events.set_text("Pause Monitoring");
                             } else {
                                 eprintln!("[Tray] Clipboard monitoring paused");
+                                let _ = pause_item_for_events.set_text("Resume Monitoring");
                             }
                         }
                         "quit" => app.exit(0),

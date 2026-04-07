@@ -975,13 +975,34 @@ pub async fn open_wormhole_window(app: AppHandle) -> Result<(), String> {
         window.set_focus().map_err(|e| e.to_string())?;
     } else {
         // Create window if it doesn't exist
-        let window = WebviewWindowBuilder::new(&app, "wormhole", WebviewUrl::App("/".into()))
+        let mut builder = WebviewWindowBuilder::new(&app, "wormhole", WebviewUrl::App("/".into()))
             .title("Wormhole")
             .inner_size(420.0, 560.0)
             .min_inner_size(380.0, 480.0)
             .max_inner_size(500.0, 700.0)
             .center()
             .resizable(true)
+            .decorations(true);
+
+        #[cfg(target_os = "windows")]
+        {
+            builder = builder.transparent(false);
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            builder = builder
+                .transparent(true)
+                .title_bar_style(tauri::TitleBarStyle::Overlay)
+                .hidden_title(true);
+        }
+
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        {
+            builder = builder.transparent(true);
+        }
+
+        let window = builder
             .build()
             .map_err(|e| e.to_string())?;
 
