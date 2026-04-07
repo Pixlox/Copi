@@ -1513,6 +1513,7 @@ async fn run_session(
             display_name: peer_name.clone(),
         },
     );
+    crate::refresh_tray_menu_for_sync(&app);
 
     let peer_cursor = peer_cursors.get(&sync.device_id).copied().unwrap_or(0);
     eprintln!(
@@ -1685,6 +1686,7 @@ async fn run_session(
             display_name: peer_name,
         },
     );
+    crate::refresh_tray_menu_for_sync(&app);
 
     session_result
 }
@@ -3628,6 +3630,8 @@ pub fn apply_config_change(
             disable_runtime(sync).await;
         });
     }
+
+    crate::refresh_tray_menu_for_sync(app);
 }
 
 pub fn apply_metadata_sync_config_change(

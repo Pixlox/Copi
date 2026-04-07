@@ -1643,6 +1643,33 @@ input::placeholder {
   color: var(--text-tertiary);
 }
 
+.settings-wormhole-slot {
+  width: 100%;
+  overflow: hidden;
+  max-height: 0;
+  opacity: 0;
+  transform: translateY(6px) scale(0.985);
+  transition:
+    max-height 260ms cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 180ms ease,
+    transform 260ms cubic-bezier(0.22, 1, 0.36, 1);
+  pointer-events: none;
+}
+
+.settings-wormhole-slot.is-visible {
+  max-height: 48px;
+  opacity: 1;
+  transform: translateY(0) scale(1);
+  pointer-events: auto;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .settings-wormhole-slot {
+    transition: none;
+    transform: none;
+  }
+}
+
 .settings-wormhole-btn {
   display: flex;
   align-items: center;
@@ -1671,6 +1698,12 @@ input::placeholder {
 
 .settings-wormhole-btn svg {
   color: #a855f7;
+}
+
+.settings-wormhole-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+  transform: none;
 }
 
 /* ═══ Settings Content ═════════════════════════════════════════════ */

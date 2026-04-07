@@ -100,6 +100,104 @@ pub struct MenuBarState {
     pub tray_icon: Mutex<Option<TrayIcon<tauri::Wry>>>,
 }
 
+fn is_clipboard_monitoring_running(app: &tauri::AppHandle) -> bool {
+    app.try_state::<AppState>()
+        .and_then(|state| {
+            state
+                .clipboard_watcher_running
+                .lock()
+                .ok()
+                .map(|running| *running)
+        })
+        .unwrap_or(true)
+}
+
+fn create_tray_menu(
+    app: &tauri::AppHandle,
+    show_wormhole: bool,
+) -> Result<Menu<tauri::Wry>, Box<dyn std::error::Error>> {
+    let settings_item = MenuItem::with_id(app, "settings", "Settings\u{2026}", true, None::<&str>)?;
+    let pause_label = if is_clipboard_monitoring_running(app) {
+        "Pause Monitoring"
+    } else {
+        "Resume Monitoring"
+    };
+    let pause_item = MenuItem::with_id(app, "pause", pause_label, true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, "quit", "Quit Copi", true, None::<&str>)?;
+
+    let menu = if show_wormhole {
+        let wormhole_item =
+            MenuItem::with_id(app, "open_wormhole", "Open Wormhole", true, None::<&str>)?;
+        Menu::with_items(
+            app,
+            &[
+                &settings_item,
+                &PredefinedMenuItem::separator(app)?,
+                &wormhole_item,
+                &pause_item,
+                &PredefinedMenuItem::separator(app)?,
+                &quit_item,
+            ],
+        )?
+    } else {
+        Menu::with_items(
+            app,
+            &[
+                &settings_item,
+                &PredefinedMenuItem::separator(app)?,
+                &pause_item,
+                &PredefinedMenuItem::separator(app)?,
+                &quit_item,
+            ],
+        )?
+    };
+
+    Ok(menu)
+}
+
+fn apply_tray_menu(
+    app: &tauri::AppHandle,
+    show_wormhole: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(menu_state) = app.try_state::<MenuBarState>() else {
+        return Ok(());
+    };
+    let Ok(guard) = menu_state.tray_icon.lock() else {
+        return Ok(());
+    };
+    let Some(tray_icon) = guard.as_ref() else {
+        return Ok(());
+    };
+    let menu = create_tray_menu(app, show_wormhole)?;
+    tray_icon.set_menu(Some(menu))?;
+    Ok(())
+}
+
+async fn should_show_wormhole_entry(app: &tauri::AppHandle) -> bool {
+    let Some(state) = app.try_state::<AppState>() else {
+        return false;
+    };
+    let Some(sync) = state.sync.get() else {
+        return false;
+    };
+    if !sync.is_enabled() {
+        return false;
+    }
+    !sync.connected_peers().await.is_empty()
+}
+
+pub(crate) fn refresh_tray_menu_for_sync(app: &tauri::AppHandle) {
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let show_wormhole = should_show_wormhole_entry(&app_handle).await;
+        if let Err(error) = apply_tray_menu(&app_handle, show_wormhole) {
+            eprintln!("[Tray] Failed to refresh menu: {}", error);
+            #[cfg(target_os = "windows")]
+            log_startup_line(&format!("tray menu refresh failed: {}", error));
+        }
+    });
+}
+
 // ─── NSPanel Definition (EcoPaste pattern) ────────────────────────
 
 #[cfg(target_os = "macos")]
@@ -467,36 +565,13 @@ fn main() {
 
             // Tray icon
             let tray_init_result = (|| -> Result<(), Box<dyn std::error::Error>> {
-                let settings_item =
-                    MenuItem::with_id(&handle, "settings", "Settings\u{2026}", true, None::<&str>)?;
-                let wormhole_item =
-                    MenuItem::with_id(&handle, "open_wormhole", "Open Wormhole", true, None::<&str>)?;
-                let pause_item =
-                    MenuItem::with_id(&handle, "pause", "Pause Monitoring", true, None::<&str>)?;
-                let quit = MenuItem::with_id(&handle, "quit", "Quit Copi", true, None::<&str>)?;
-                let menu = Menu::with_items(
-                    &handle,
-                    &[
-                        &settings_item,
-                        &PredefinedMenuItem::separator(&handle)?,
-                        &wormhole_item,
-                        &pause_item,
-                        &PredefinedMenuItem::separator(&handle)?,
-                        &quit,
-                    ],
-                )?;
-                if let Ok(running) = handle.state::<AppState>().clipboard_watcher_running.lock() {
-                    if !*running {
-                        let _ = pause_item.set_text("Resume Monitoring");
-                    }
-                }
-                let pause_item_for_events = pause_item.clone();
+                let menu = create_tray_menu(&handle, false)?;
 
                 let mut tray_builder = TrayIconBuilder::with_id("copi-menubar")
                     .menu(&menu)
                     .tooltip("Copi")
                     .show_menu_on_left_click(true)
-                    .on_menu_event(move |app, event| match event.id().as_ref() {
+                    .on_menu_event(|app, event| match event.id().as_ref() {
                         "settings" => {
                             show_settings_window_inner(app);
                         }
@@ -519,11 +594,10 @@ fn main() {
                             *running = !*running;
                             if *running {
                                 eprintln!("[Tray] Clipboard monitoring resumed");
-                                let _ = pause_item_for_events.set_text("Pause Monitoring");
                             } else {
                                 eprintln!("[Tray] Clipboard monitoring paused");
-                                let _ = pause_item_for_events.set_text("Resume Monitoring");
                             }
+                            refresh_tray_menu_for_sync(app);
                         }
                         "quit" => app.exit(0),
                         _ => {}
@@ -551,6 +625,8 @@ fn main() {
                 if let Ok(mut guard) = app.state::<MenuBarState>().tray_icon.lock() {
                     *guard = Some(tray);
                 }
+
+                refresh_tray_menu_for_sync(&app.handle().clone());
 
                 Ok(())
             })();

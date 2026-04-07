@@ -1216,6 +1216,8 @@ function CollectionsSection({
 
 export default function Settings() {
   const [config, setConfig] = useState<CopiConfig | null>(null);
+  const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null);
+  const [showWormholeButton, setShowWormholeButton] = useState(false);
   const [activeSection, setActiveSection] = useState<Section>("general");
   const [dbSize, setDbSize] = useState(0);
   const [clipCount, setClipCount] = useState(0);
@@ -1260,10 +1262,37 @@ export default function Settings() {
 
   useEffect(() => {
     invoke<CopiConfig>("get_config").then(setConfig).catch(console.error);
+    invoke<SyncStatus>("sync_get_status").then(setSyncStatus).catch(() => {});
     void refreshStats();
     getVersion().then(setAppVersion).catch(() => {});
     fetchCollections();
   }, [fetchCollections, refreshStats]);
+
+  useEffect(() => {
+    const enabled = Boolean(syncStatus?.enabled);
+    const connected = Number(syncStatus?.connectedCount ?? 0) > 0;
+    setShowWormholeButton(enabled && connected);
+  }, [syncStatus]);
+
+  useEffect(() => {
+    const refreshSyncStatus = () => {
+      invoke<SyncStatus>("sync_get_status").then(setSyncStatus).catch(() => {});
+    };
+
+    const unlistenConnected = listen("sync:connected", refreshSyncStatus);
+    const unlistenDisconnected = listen("sync:disconnected", refreshSyncStatus);
+    const unlistenConfig = listen("sync:config-updated", refreshSyncStatus);
+    const unlistenPaired = listen("sync:paired", refreshSyncStatus);
+    const unlistenShown = listen("settings:shown", refreshSyncStatus);
+
+    return () => {
+      unlistenConnected.then((fn) => fn());
+      unlistenDisconnected.then((fn) => fn());
+      unlistenConfig.then((fn) => fn());
+      unlistenPaired.then((fn) => fn());
+      unlistenShown.then((fn) => fn());
+    };
+  }, []);
 
   // Listen to collections-changed event for real-time updates
   useEffect(() => {
@@ -1411,14 +1440,21 @@ export default function Settings() {
         </nav>
 
         <div className="settings-sidebar-footer">
-          <button 
-            className="settings-wormhole-btn"
-            onClick={() => invoke("open_wormhole_window")}
-            title="Open Wormhole - Send large files"
+          <div
+            className={`settings-wormhole-slot ${showWormholeButton ? "is-visible" : "is-hidden"}`}
+            aria-hidden={!showWormholeButton}
           >
-            <Shell size={14} />
-            <span>Open Wormhole</span>
-          </button>
+            <button
+              className="settings-wormhole-btn"
+              onClick={() => invoke("open_wormhole_window")}
+              title="Open Wormhole - Send large files"
+              tabIndex={showWormholeButton ? 0 : -1}
+              disabled={!showWormholeButton}
+            >
+              <Shell size={14} />
+              <span>Open Wormhole</span>
+            </button>
+          </div>
           <div className="settings-sidebar-footer-divider" />
           <span>{appVersion ? `v${appVersion}` : ""}</span>
         </div>
