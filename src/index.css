@@ -1625,6 +1625,11 @@ input::placeholder {
   gap: 8px;
 }
 
+.settings-sidebar-footer-divider {
+  height: 0.5px;
+  background: var(--border-subtle);
+}
+
 .settings-sidebar-footer span {
   font-size: 11px;
   color: var(--text-tertiary);
@@ -2553,9 +2558,9 @@ input::placeholder {
 }
 
 .wormhole-header {
-  display: flex;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
   align-items: center;
-  justify-content: space-between;
   padding: 12px 16px;
   padding-top: 8px;
   border-bottom: 1px solid var(--border-subtle);
@@ -2571,11 +2576,15 @@ input::placeholder {
   width: 70px;
 }
 
+.wormhole-header-side {
+  min-height: 1px;
+}
+
 .wormhole-header h1 {
   font-size: 15px;
   font-weight: 600;
   color: var(--text-primary);
-  flex: 1;
+  margin: 0;
   text-align: center;
 }
 
@@ -2583,6 +2592,17 @@ input::placeholder {
   display: flex;
   gap: 4px;
   -webkit-app-region: no-drag;
+  justify-self: end;
+}
+
+.platform-windows.wormhole-window,
+.platform-windows.wormhole-window body {
+  background: var(--settings-bg) !important;
+}
+
+.platform-windows.wormhole-window #root {
+  border-radius: 0;
+  background: var(--settings-bg);
 }
 
 .wormhole-header-btn {

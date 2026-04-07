@@ -39,5 +39,3 @@ gte-multilingual-base-onnx/
 *.db
 *.db-wal
 *.db-shm
-
-test_file_for_wormhole.dmg

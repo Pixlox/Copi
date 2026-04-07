@@ -21,6 +21,16 @@ import {
 } from "lucide-react";
 import { isMacPlatform } from "../utils/platform";
 
+interface DragPayloadFile {
+  path?: string;
+}
+
+interface DragPayload {
+  type: "enter" | "over" | "drop" | "leave";
+  paths?: string[];
+  files?: DragPayloadFile[];
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Types
 // ════════════════════════════════════════════════════════════════════════════
@@ -525,7 +535,16 @@ export default function Wormhole() {
   useEffect(() => {
     let dragDepth = 0;
 
-    const handleNativeDragEvent = (event: { payload: { type: "enter" | "over" | "drop" | "leave"; paths?: string[] } }) => {
+    const collectDroppedPaths = (payload: DragPayload): string[] => {
+      const direct = payload.paths ?? [];
+      const filePaths = (payload.files ?? [])
+        .map((file) => file.path)
+        .filter((path): path is string => typeof path === "string" && path.trim().length > 0);
+
+      return Array.from(new Set([...direct, ...filePaths].map((path) => path.trim()).filter((path) => path.length > 0)));
+    };
+
+    const handleNativeDragEvent = (event: { payload: DragPayload }) => {
       const payload = event.payload;
       if (payload.type === "enter") {
         dragDepth += 1;
@@ -549,16 +568,16 @@ export default function Wormhole() {
       if (payload.type === "drop") {
         dragDepth = 0;
         setIsDragActive(false);
-        void handleFilesDropped(payload.paths ?? []);
+        void handleFilesDropped(collectDroppedPaths(payload));
       }
     };
 
     const unlistenWindowPromise = getCurrentWindow().onDragDropEvent((event) => {
-      handleNativeDragEvent(event as { payload: { type: "enter" | "over" | "drop" | "leave"; paths?: string[] } });
+      handleNativeDragEvent(event as { payload: DragPayload });
     });
 
     const unlistenWebviewPromise = getCurrentWebview().onDragDropEvent((event) => {
-      handleNativeDragEvent(event as { payload: { type: "enter" | "over" | "drop" | "leave"; paths?: string[] } });
+      handleNativeDragEvent(event as { payload: DragPayload });
     });
 
     return () => {
@@ -633,7 +652,7 @@ export default function Wormhole() {
     <div className="wormhole-root">
       {/* Header */}
       <header className="wormhole-header" onMouseDown={handleWindowDragStart}>
-        {isMacPlatform && <div className="wormhole-header-spacer" />}
+        <div className="wormhole-header-side" />
         <h1>Wormhole</h1>
         <div className="wormhole-header-actions">
           <button 

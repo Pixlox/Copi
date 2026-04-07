@@ -25,6 +25,14 @@ function App() {
   }, [isSettings]);
 
   useEffect(() => {
+    if (isWormhole) {
+      document.documentElement.classList.add("wormhole-window");
+    } else {
+      document.documentElement.classList.remove("wormhole-window");
+    }
+  }, [isWormhole]);
+
+  useEffect(() => {
     const root = document.documentElement;
     if (isMacPlatform) {
       root.classList.add("platform-macos");

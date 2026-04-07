@@ -114,6 +114,15 @@ const RETENTION_OPTIONS = [
   { label: "Forever", value: "0" },
 ];
 
+const WORMHOLE_EXPIRATION_OPTIONS = [
+  { label: "1 hour", value: "1" },
+  { label: "6 hours", value: "6" },
+  { label: "12 hours", value: "12" },
+  { label: "24 hours", value: "24" },
+  { label: "48 hours", value: "48" },
+  { label: "72 hours", value: "72" },
+];
+
 const COLLECTION_COLORS = [
   "#0A84FF", "#34C759", "#FF9500", "#FF3B30",
   "#AF52DE", "#FF2D55", "#5AC8FA", "#FFD60A",
@@ -707,12 +716,11 @@ function SyncSection() {
           label="Wormhole Expiration"
           description="How long wormhole offers stay available"
         >
-          <select
-            className="settings-sync-input"
-            data-no-drag
+          <Picker
             value={String(config?.sync.wormhole_expiration_hours ?? 24)}
-            onChange={(event) => {
-              const hours = Number(event.target.value);
+            options={WORMHOLE_EXPIRATION_OPTIONS}
+            onChange={(value) => {
+              const hours = Number(value);
               void saveSyncConfig((cfg) => ({
                 ...cfg,
                 sync: {
@@ -722,14 +730,7 @@ function SyncSection() {
                 },
               }));
             }}
-          >
-            <option value="1">1 hour</option>
-            <option value="6">6 hours</option>
-            <option value="12">12 hours</option>
-            <option value="24">24 hours</option>
-            <option value="48">48 hours</option>
-            <option value="72">72 hours</option>
-          </select>
+          />
         </SettingRow>
       </SettingCard>
 
@@ -1416,8 +1417,9 @@ export default function Settings() {
             title="Open Wormhole - Send large files"
           >
             <Shell size={14} />
-            <span>Wormhole</span>
+            <span>Open Wormhole</span>
           </button>
+          <div className="settings-sidebar-footer-divider" />
           <span>{appVersion ? `v${appVersion}` : ""}</span>
         </div>
       </aside>
