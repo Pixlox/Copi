@@ -93,12 +93,18 @@ Exclude any app by name or bundle ID. Password managers don't capture if you don
 </td>
 </tr>
 </table>
+
 <table> 
 <td width="50%">
 
 **🔄 Copi Sync and Wormhole (new!)**
 
 Sync your clipboard, pins, and collections across your devices instantly with Copi. Works cross-platform, fast and secure. Send larger files across your devices through Copi Wormhole. 
+
+</td>
+
+<td width="20%">
+<img src="https://github.com/user-attachments/assets/3e281200-a7c1-48de-be80-6230d585c324" alt="Copi Wormhole demo" width="250">
 
 </td>
 </table>
