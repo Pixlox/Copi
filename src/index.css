@@ -1689,7 +1689,6 @@ input::placeholder {
 .settings-wormhole-btn:hover {
   background: linear-gradient(135deg, rgba(147, 51, 234, 0.25), rgba(59, 130, 246, 0.25));
   border-color: rgba(147, 51, 234, 0.35);
-  transform: translateY(-1px);
 }
 
 .settings-wormhole-btn:active {
