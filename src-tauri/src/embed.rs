@@ -1,7 +1,8 @@
+use lru::LruCache;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::value::Tensor;
-use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager};
@@ -9,15 +10,14 @@ use tokenizers::Tokenizer;
 
 const EMBED_DIMS: usize = 384;
 pub const EMBEDDING_MODEL_SIGNATURE: &str = "multilingual-e5-small-384-v1";
-const QUERY_CACHE_MAX: usize = 1024;
-const QUERY_CACHE_EVICT: usize = 256;
+const QUERY_CACHE_MAX: usize = 2048;
 const WORKER_CONCURRENCY: usize = 4;
 
 pub struct EmbeddingModel {
     pub session: Mutex<Session>,
     pub tokenizer: Tokenizer,
     pub dimensions: usize,
-    pub query_cache: Mutex<HashMap<String, Vec<f32>>>,
+    pub query_cache: Mutex<LruCache<String, Vec<f32>>>,
 }
 
 pub fn init_model(app: &tauri::AppHandle) -> Result<Arc<EmbeddingModel>, String> {
@@ -59,14 +59,39 @@ pub fn load_model_from_dir(dir: &Path) -> Result<Arc<EmbeddingModel>, String> {
     let tokenizer = Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| format!("Failed to load tokenizer: {}", e))?;
 
-    eprintln!("[Embed] ONNX session ready (multilingual-e5-small, 384d)");
+    eprintln!("[Embed] ONNX session ready (multilingual-e5-small, 384d, LRU cache)");
 
     Ok(Arc::new(EmbeddingModel {
         session: Mutex::new(session),
         tokenizer,
         dimensions: EMBED_DIMS,
-        query_cache: Mutex::new(HashMap::new()),
+        query_cache: Mutex::new(LruCache::new(NonZeroUsize::new(QUERY_CACHE_MAX).unwrap())),
     }))
+}
+
+pub fn classify_query_intent(query_embedding: &[f32]) -> Vec<(String, f32)> {
+    let mut scores: Vec<(String, f32)> = crate::centroids::ALL
+        .iter()
+        .map(|(name, centroid)| {
+            let similarity = cosine_similarity(query_embedding, *centroid);
+            ((*name).to_string(), similarity)
+        })
+        .collect();
+
+    scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    scores.into_iter().filter(|(_, s)| *s > 0.6).collect()
+}
+
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm_a == 0.0 || norm_b == 0.0 {
+        0.0
+    } else {
+        dot / (norm_a * norm_b)
+    }
 }
 
 pub fn embed_text(model: &EmbeddingModel, text: &str) -> Result<Vec<f32>, String> {
@@ -123,10 +148,14 @@ pub fn embed_text(model: &EmbeddingModel, text: &str) -> Result<Vec<f32>, String
     let mut embedding = vec![0.0f32; hidden_size];
     let mut count = 0usize;
 
-    for t in 0..seq_len_actual {
+    for (t, token_embedding) in slice
+        .chunks_exact(hidden_size)
+        .take(seq_len_actual)
+        .enumerate()
+    {
         if t < attention_mask.len() && attention_mask[t] == 1 {
-            for h in 0..hidden_size {
-                embedding[h] += slice[t * hidden_size + h];
+            for (dst, value) in embedding.iter_mut().zip(token_embedding.iter()) {
+                *dst += *value;
             }
             count += 1;
         }
@@ -134,8 +163,8 @@ pub fn embed_text(model: &EmbeddingModel, text: &str) -> Result<Vec<f32>, String
 
     if count > 0 {
         let inv = 1.0 / count as f32;
-        for h in 0..hidden_size {
-            embedding[h] *= inv;
+        for value in &mut embedding {
+            *value *= inv;
         }
     }
 
@@ -155,7 +184,7 @@ pub fn embed_query(model: &EmbeddingModel, query: &str) -> Result<Vec<f32>, Stri
         return Ok(vec![]);
     }
 
-    if let Ok(cache) = model.query_cache.lock() {
+    if let Ok(mut cache) = model.query_cache.lock() {
         if let Some(cached) = cache.get(&key) {
             return Ok(cached.clone());
         }
@@ -163,15 +192,9 @@ pub fn embed_query(model: &EmbeddingModel, query: &str) -> Result<Vec<f32>, Stri
 
     let prefixed = format!("query: {}", query);
     let embedding = embed_text(model, &prefixed)?;
+
     if let Ok(mut cache) = model.query_cache.lock() {
-        if cache.len() > QUERY_CACHE_MAX {
-            let keys_to_remove: Vec<String> =
-                cache.keys().take(QUERY_CACHE_EVICT).cloned().collect();
-            for k in keys_to_remove {
-                cache.remove(&k);
-            }
-        }
-        cache.insert(key, embedding.clone());
+        cache.put(key, embedding.clone());
     }
     Ok(embedding)
 }
@@ -185,12 +208,12 @@ fn collect_missing_embedding_ids(app: &tauri::AppHandle) -> Vec<i64> {
 
     conn.prepare(
         "SELECT c.id FROM clips c
-         LEFT JOIN clip_embeddings e ON c.id = e.rowid
-         WHERE e.rowid IS NULL
-           AND c.deleted = 0
-           AND (c.content_type != 'image' OR c.ocr_text IS NOT NULL)
-           AND (c.content != '' OR c.ocr_text IS NOT NULL)
-         ORDER BY c.created_at DESC",
+        LEFT JOIN clip_embeddings e ON c.id = e.rowid
+        WHERE e.rowid IS NULL
+        AND c.deleted = 0
+        AND (c.content_type != 'image' OR c.ocr_text IS NOT NULL)
+        AND (c.content != '' OR c.ocr_text IS NOT NULL)
+        ORDER BY c.created_at DESC",
     )
     .ok()
     .map(|mut stmt| {
@@ -366,18 +389,6 @@ fn embed_single_clip(model: &EmbeddingModel, app: &tauri::AppHandle, clip_id: i6
             return EmbedOutcome::Failed;
         }
     };
-    let sync_id: Option<String> = conn
-        .query_row("SELECT sync_id FROM clips WHERE id = ?1", [clip_id], |r| {
-            r.get(0)
-        })
-        .ok();
-    let sync_version: Option<i64> = conn
-        .query_row(
-            "SELECT sync_version FROM clips WHERE id = ?1",
-            [clip_id],
-            |r| r.get(0),
-        )
-        .ok();
     let _ = conn.execute("DELETE FROM clip_embeddings WHERE rowid = ?", [clip_id]);
     match conn.execute(
         "INSERT INTO clip_embeddings(rowid, embedding) VALUES (?1, ?2)",
@@ -393,21 +404,19 @@ fn embed_single_clip(model: &EmbeddingModel, app: &tauri::AppHandle, clip_id: i6
 
 fn update_search_progress(app: &tauri::AppHandle, success: bool) {
     let state = app.state::<crate::AppState>();
-    match state.search_status.lock() {
-        Ok(mut status) => {
-            if !advance_search_status(&mut status, success) {
-                return;
-            }
-            if status.phase == "idle" {
-                eprintln!(
-                    "[Embed] Indexing complete: {} success, {} failed",
-                    status.completed_items, status.failed_items
-                );
-            }
-            let _ = app.emit("search-status-updated", status.clone());
+    let lock = state.search_status.lock();
+    if let Ok(mut status) = lock {
+        if !advance_search_status(&mut status, success) {
+            return;
         }
-        Err(_) => {}
-    };
+        if status.phase == "idle" {
+            eprintln!(
+                "[Embed] Indexing complete: {} success, {} failed",
+                status.completed_items, status.failed_items
+            );
+        }
+        let _ = app.emit("search-status-updated", status.clone());
+    }
 }
 
 fn advance_search_status(status: &mut crate::search::SearchStatusPayload, success: bool) -> bool {
@@ -439,23 +448,88 @@ fn update_search_status(
     semantic_ready: bool,
 ) {
     let state = app.state::<crate::AppState>();
-    match state.search_status.lock() {
-        Ok(mut status) => {
-            status.phase = phase.to_string();
-            status.queued_items = queued_items;
-            status.completed_items = completed_items;
-            status.failed_items = failed_items;
-            status.total_items = total_items;
-            status.semantic_ready = semantic_ready;
-            let _ = app.emit("search-status-updated", status.clone());
-        }
-        Err(_) => {}
-    };
+    let lock = state.search_status.lock();
+    if let Ok(mut status) = lock {
+        status.phase = phase.to_string();
+        status.queued_items = queued_items;
+        status.completed_items = completed_items;
+        status.failed_items = failed_items;
+        status.total_items = total_items;
+        status.semantic_ready = semantic_ready;
+        let _ = app.emit("search-status-updated", status.clone());
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn find_near_duplicates(embeddings: &[(i64, Vec<f32>)], threshold: f32) -> Vec<Vec<i64>> {
+        let mut groups: Vec<Vec<i64>> = Vec::new();
+        let mut used: std::collections::HashSet<i64> = std::collections::HashSet::new();
+
+        for (i, (id_a, emb_a)) in embeddings.iter().enumerate() {
+            if used.contains(id_a) {
+                continue;
+            }
+
+            let mut group = vec![*id_a];
+            used.insert(*id_a);
+
+            for (id_b, emb_b) in embeddings.iter().skip(i + 1) {
+                if used.contains(id_b) {
+                    continue;
+                }
+
+                if cosine_similarity(emb_a, emb_b) >= threshold {
+                    group.push(*id_b);
+                    used.insert(*id_b);
+                }
+            }
+
+            if group.len() > 1 {
+                groups.push(group);
+            }
+        }
+
+        groups
+    }
+
+    fn cluster_embeddings(
+        embeddings: &[(i64, Vec<f32>)],
+        min_similarity: f32,
+    ) -> Vec<(Vec<i64>, Vec<f32>)> {
+        if embeddings.is_empty() {
+            return vec![];
+        }
+
+        let dims = embeddings[0].1.len();
+        let mut clusters: Vec<(Vec<i64>, Vec<f32>)> = Vec::new();
+
+        for (id, embedding) in embeddings {
+            let mut assigned = false;
+
+            for (cluster_ids, centroid) in &mut clusters {
+                if cosine_similarity(embedding, centroid) < min_similarity {
+                    continue;
+                }
+
+                cluster_ids.push(*id);
+                let n = cluster_ids.len() as f32;
+                for (idx, value) in embedding.iter().enumerate().take(dims) {
+                    centroid[idx] = (centroid[idx] * (n - 1.0) + *value) / n;
+                }
+                assigned = true;
+                break;
+            }
+
+            if !assigned {
+                clusters.push((vec![*id], embedding.clone()));
+            }
+        }
+
+        clusters
+    }
 
     #[test]
     fn advance_status_counts_success_and_failure() {
@@ -512,5 +586,51 @@ mod tests {
         assert!(!advance_search_status(&mut status, true));
         assert_eq!(status.completed_items, 0);
         assert_eq!(status.failed_items, 0);
+    }
+
+    #[test]
+    fn cosine_similarity_range() {
+        // Same vectors should have similarity 1.0
+        let a = vec![1.0, 0.0, 0.0];
+        let b = vec![1.0, 0.0, 0.0];
+        assert!((cosine_similarity(&a, &b) - 1.0).abs() < 0.001);
+
+        // Orthogonal vectors should have similarity 0.0
+        let c = vec![1.0, 0.0];
+        let d = vec![0.0, 1.0];
+        assert!(cosine_similarity(&c, &d).abs() < 0.001);
+
+        // Opposite vectors should have similarity -1.0
+        let e = vec![1.0, 0.0];
+        let f = vec![-1.0, 0.0];
+        assert!((cosine_similarity(&e, &f) - (-1.0)).abs() < 0.001);
+    }
+
+    #[test]
+    fn near_duplicate_detection() {
+        let embeddings = vec![
+            (1, vec![1.0, 0.0, 0.0, 0.0]),
+            (2, vec![0.99, 0.01, 0.0, 0.0]), // Near duplicate of 1
+            (3, vec![0.0, 1.0, 0.0, 0.0]),
+            (4, vec![0.0, 0.99, 0.01, 0.0]), // Near duplicate of 3
+        ];
+
+        let duplicates = find_near_duplicates(&embeddings, 0.95);
+        assert_eq!(duplicates.len(), 2);
+        assert!(duplicates.iter().any(|g| g.contains(&1) && g.contains(&2)));
+        assert!(duplicates.iter().any(|g| g.contains(&3) && g.contains(&4)));
+    }
+
+    #[test]
+    fn cluster_embeddings_groups_similar() {
+        let embeddings = vec![
+            (1, vec![1.0, 0.0]),
+            (2, vec![0.95, 0.05]),
+            (3, vec![0.0, 1.0]),
+            (4, vec![0.05, 0.95]),
+        ];
+
+        let clusters = cluster_embeddings(&embeddings, 0.9);
+        assert_eq!(clusters.len(), 2);
     }
 }

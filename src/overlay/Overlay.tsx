@@ -2,6 +2,7 @@ import { useState, useCallback, useMemo, useRef, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
+import { message } from "@tauri-apps/plugin-dialog";
 import { useSearch, FilterType } from "../hooks/useSearch";
 import { useKeyboard } from "../hooks/useKeyboard";
 import ActionsSheet, { buildSheetActions } from "./ActionsSheet";
@@ -136,6 +137,23 @@ function Overlay() {
       mounted = false;
       unlisten.then((fn) => fn());
       unlistenShown.then((fn) => fn());
+    };
+  }, []);
+
+  useEffect(() => {
+    const unlistenPastePermissionHint = listen<string>("paste-permission-hint", (event) => {
+      const hint = (event.payload || "").trim();
+      if (!hint) {
+        return;
+      }
+      void message(hint, {
+        title: "Enable macOS Permissions for Paste",
+        kind: "warning",
+      }).catch(() => undefined);
+    });
+
+    return () => {
+      unlistenPastePermissionHint.then((fn) => fn());
     };
   }, []);
 

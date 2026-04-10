@@ -408,6 +408,16 @@ function PrivacySection({
           <Plus size={14} />
         </button>
       </div>
+
+      {isMacPlatform && (
+        <>
+          <SettingDivider />
+          <SettingRow
+            label="Auto-paste Permissions"
+            description="To paste into other apps, enable Copi in macOS Accessibility and Input Monitoring, then restart Copi."
+          />
+        </>
+      )}
     </SettingCard>
   );
 }
@@ -485,7 +495,7 @@ function SyncSection() {
   const [manualTargetAddr, setManualTargetAddr] = useState("");
   const [manualPin, setManualPin] = useState("");
   const [manualPairingBusy, setManualPairingBusy] = useState(false);
-  const [countdownTick, setCountdownTick] = useState(0);
+  const [, setCountdownTick] = useState(0);
 
   const formatError = (e: unknown): string =>
     typeof e === "string"
@@ -620,12 +630,9 @@ function SyncSection() {
     return () => clearInterval(interval);
   }, [pairingCode]);
 
-  // Compute remaining time using the tick to force re-render
   const codeRemainingSeconds = pairingCode
     ? Math.max(0, pairingCode.expires_at - Math.floor(Date.now() / 1000))
     : 0;
-  // Use countdownTick to suppress the unused variable warning
-  void countdownTick;
 
   return (
     <>

@@ -181,7 +181,10 @@ impl PeerWriter {
             .write_all(&frame_len)
             .await
             .context("write frame len")?;
-        writer.write_all(&payload).await.context("write frame msg")?;
+        writer
+            .write_all(&payload)
+            .await
+            .context("write frame msg")?;
         writer.flush().await.context("flush msg")?;
         Ok(())
     }
@@ -281,7 +284,6 @@ impl SecureReceiver {
         self.next_nonce = nonce + 1;
         Ok(msg)
     }
-
 }
 
 fn serialize_secure_payload(msg: &Msg) -> Result<Vec<u8>> {
@@ -561,7 +563,10 @@ impl SyncState {
     // ─── Wormhole Methods ─────────────────────────────────────────
 
     /// Broadcast a wormhole file offer to all connected peers
-    pub async fn broadcast_wormhole_offer(&self, offer: crate::wormhole::WormholeOffer) -> Result<()> {
+    pub async fn broadcast_wormhole_offer(
+        &self,
+        offer: crate::wormhole::WormholeOffer,
+    ) -> Result<()> {
         if !self.is_enabled() {
             return Ok(());
         }
@@ -1644,26 +1649,30 @@ async fn run_session(
                         eprintln!("[Sync] Failed to parse message from {}: {}", peer_id, error);
                         eprintln!(
                             "[Sync] Parse raw prefix from {}: {:?} bytes={:02X?}",
-                            peer_id,
-                            prefix,
-                            bytes
+                            peer_id, prefix, bytes
                         );
                         break Err(anyhow!("invalid message from peer"));
                     }
                 };
                 let msg = match outer {
-                    Msg::Secure { nonce, payload } => match secure_receiver.decrypt_msg(nonce, &payload) {
-                        Ok(msg) => msg,
-                        Err(error) => {
-                            eprintln!("[Sync] Failed to decrypt message from {}: {}", peer_id, error);
-                            break Err(anyhow!("failed to decrypt message"));
+                    Msg::Secure { nonce, payload } => {
+                        match secure_receiver.decrypt_msg(nonce, &payload) {
+                            Ok(msg) => msg,
+                            Err(error) => {
+                                eprintln!(
+                                    "[Sync] Failed to decrypt message from {}: {}",
+                                    peer_id, error
+                                );
+                                break Err(anyhow!("failed to decrypt message"));
+                            }
                         }
-                    },
+                    }
                     _ => {
                         break Err(anyhow!("received unencrypted message from trusted peer"));
                     }
                 };
-                if let Err(error) = handle_message(&app, &sync, &peer_id, &secure_writer, msg).await {
+                if let Err(error) = handle_message(&app, &sync, &peer_id, &secure_writer, msg).await
+                {
                     break Err(error);
                 }
             }
@@ -1738,28 +1747,16 @@ async fn handle_message(
         Msg::Ping => writer.send(&Msg::Pong).await,
         Msg::Pong => Ok(()),
         // Wormhole message handling
-        Msg::WormholeOffer(offer) => {
-            handle_wormhole_offer(app, peer_id, offer).await
-        }
-        Msg::WormholeRetract { file_id } => {
-            handle_wormhole_retract(app, &file_id).await
-        }
-        Msg::WormholeRequest(request) => {
-            handle_wormhole_request(app, peer_id, request).await
-        }
-        Msg::WormholeChunk(chunk) => {
-            handle_wormhole_chunk(app, chunk).await
-        }
-        Msg::WormholeComplete { file_id } => {
-            handle_wormhole_complete(app, &file_id).await
-        }
+        Msg::WormholeOffer(offer) => handle_wormhole_offer(app, peer_id, offer).await,
+        Msg::WormholeRetract { file_id } => handle_wormhole_retract(app, &file_id).await,
+        Msg::WormholeRequest(request) => handle_wormhole_request(app, peer_id, request).await,
+        Msg::WormholeChunk(chunk) => handle_wormhole_chunk(app, chunk).await,
+        Msg::WormholeComplete { file_id } => handle_wormhole_complete(app, &file_id).await,
         Msg::WormholeAck { file_id } => {
             eprintln!("[Wormhole] Received ack for file: {}", file_id);
             Ok(())
         }
-        Msg::WormholeReject(reject) => {
-            handle_wormhole_reject(app, reject).await
-        }
+        Msg::WormholeReject(reject) => handle_wormhole_reject(app, reject).await,
         _ => Ok(()),
     }
 }
@@ -3139,9 +3136,7 @@ pub async fn sync_pair_with(
         .map_err(|e| e.to_string())?;
 
     let mut reader = BufReader::new(read_half);
-    let frame = read_frame(&mut reader)
-        .await
-        .map_err(|e| e.to_string())?;
+    let frame = read_frame(&mut reader).await.map_err(|e| e.to_string())?;
     let Some(frame) = frame else {
         return Err("pairing connection closed".to_string());
     };
@@ -3871,7 +3866,7 @@ async fn handle_wormhole_chunk(
 }
 
 /// Handle wormhole transfer complete notification
-async fn handle_wormhole_complete(app: &AppHandle, file_id: &str) -> Result<()> {
+async fn handle_wormhole_complete(_app: &AppHandle, file_id: &str) -> Result<()> {
     eprintln!("[Wormhole] Received complete notification for: {}", file_id);
 
     // The actual completion is handled in handle_incoming_chunk when is_final=true
@@ -3942,7 +3937,10 @@ mod tests {
     #[test]
     fn parse_target_addr_defaults_to_sync_port() {
         let parsed = parse_target_addr("192.168.1.120").unwrap();
-        assert_eq!(parsed, format!("192.168.1.120:{}", SYNC_PORT).parse().unwrap());
+        assert_eq!(
+            parsed,
+            format!("192.168.1.120:{}", SYNC_PORT).parse().unwrap()
+        );
     }
 
     #[test]

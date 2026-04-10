@@ -48,12 +48,55 @@ enum SearchPhase {
     Semantic,
 }
 
+struct SemanticQueryPlan {
+    embedding: Vec<f32>,
+    intents: Vec<(String, f32)>,
+}
+
 #[derive(Default, Clone)]
 struct ScoreEntry {
     score: f64,
 }
 
 const SEL: &str = "id, content, content_type, source_app, COALESCE(source_device, ''), COALESCE(is_file, 0), created_at, pinned, content_highlighted, ocr_text, COALESCE(copy_count, 0)";
+const AUTH_INTENT_TERMS: &[&str] = &[
+    "auth",
+    "password",
+    "passcode",
+    "token",
+    "otp",
+    "2fa",
+    "secret",
+    "credential",
+    "verification",
+    "login",
+    "signin",
+    "pin",
+];
+const MEETING_INTENT_TERMS: &[&str] = &[
+    "meeting", "agenda", "invite", "zoom", "calendar", "followup", "minutes", "standup",
+];
+const RECIPE_INTENT_TERMS: &[&str] = &[
+    "recipe",
+    "ingredients",
+    "oven",
+    "bake",
+    "cook",
+    "teaspoon",
+    "tablespoon",
+    "cup",
+    "preheat",
+];
+const ERROR_INTENT_TERMS: &[&str] = &[
+    "error",
+    "exception",
+    "panic",
+    "traceback",
+    "failed",
+    "failure",
+    "warning",
+    "stack trace",
+];
 
 fn row_to_clip(r: &rusqlite::Row) -> rusqlite::Result<ClipResult> {
     Ok(ClipResult {
@@ -453,8 +496,8 @@ fn search_sync(
         return do_filter_search(&conn, &parsed, filter, collection_id);
     }
 
-    let (semantic_results, semantic_results_relaxed) = match phase {
-        SearchPhase::Fast => (None, None),
+    let (semantic_results, semantic_results_relaxed, semantic_intents) = match phase {
+        SearchPhase::Fast => (None, None, Vec::new()),
         SearchPhase::Semantic => {
             let model = state
                 .model
@@ -462,23 +505,33 @@ fn search_sync(
                 .ok()
                 .and_then(|guard| guard.as_ref().cloned());
             if let Some(model) = model.as_ref() {
-                let strict =
-                    do_vector_candidates(&conn, model, &parsed, filter, collection_id, true);
-                let relaxed = if parsed.has_temporal {
-                    Some(do_vector_candidates(
+                if let Some(plan) = prepare_semantic_query(model, &parsed) {
+                    let strict = do_vector_candidates(
                         &conn,
-                        model,
+                        &plan.embedding,
                         &parsed,
                         filter,
                         collection_id,
-                        false,
-                    ))
+                        true,
+                    );
+                    let relaxed = if parsed.has_temporal {
+                        Some(do_vector_candidates(
+                            &conn,
+                            &plan.embedding,
+                            &parsed,
+                            filter,
+                            collection_id,
+                            false,
+                        ))
+                    } else {
+                        None
+                    };
+                    (Some(strict), relaxed, plan.intents)
                 } else {
-                    None
-                };
-                (Some(strict), relaxed)
+                    (None, None, Vec::new())
+                }
             } else {
-                (None, None)
+                (None, None, Vec::new())
             }
         }
     };
@@ -490,6 +543,7 @@ fn search_sync(
         collection_id,
         semantic_results.as_deref(),
         semantic_results_relaxed.as_deref(),
+        &semantic_intents,
     )
 }
 
@@ -637,6 +691,7 @@ fn do_ranked_search(
     collection_id: Option<i64>,
     semantic_candidates: Option<&[(i64, f64)]>,
     semantic_candidates_relaxed: Option<&[(i64, f64)]>,
+    semantic_intents: &[(String, f32)],
 ) -> Result<Vec<ClipResult>, String> {
     let (mut scores, mut temporal_relaxed) = collect_ranked_scores(
         conn,
@@ -667,7 +722,13 @@ fn do_ranked_search(
 
     let initial_ids = sort_scored_ids(scores.clone(), 80);
     let clips = fetch_clips_by_ids(conn, &initial_ids)?;
-    apply_clip_boosts(&mut scores, &clips, parsed, temporal_relaxed);
+    apply_clip_boosts(
+        &mut scores,
+        &clips,
+        parsed,
+        temporal_relaxed,
+        semantic_intents,
+    );
 
     let ids = sort_scored_ids(scores, 50);
     fetch_clips_by_ids(conn, &ids)
@@ -709,22 +770,82 @@ fn do_fts_candidates(
     query_id_scores(conn, &sql, &param_refs)
 }
 
+fn do_source_candidates(
+    conn: &rusqlite::Connection,
+    parsed: &ParsedQuery,
+    filter: &str,
+    collection_id: Option<i64>,
+    include_temporal: bool,
+) -> Result<Vec<(i64, f64)>, String> {
+    if parsed.source_hints.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut params: Vec<Box<dyn ToSql>> = Vec::new();
+    let mut hint_conditions = Vec::new();
+    for hint in &parsed.source_hints {
+        hint_conditions.push("LOWER(c.source_app) LIKE ?".to_string());
+        params.push(Box::new(format!("%{}%", hint.to_lowercase())));
+    }
+
+    let mut conditions = vec!["c.deleted = 0".to_string(), format!("({})", hint_conditions.join(" OR "))];
+    apply_filters(
+        &mut conditions,
+        &mut params,
+        parsed,
+        filter,
+        collection_id,
+        "c.",
+        include_temporal,
+    );
+
+    let sql = format!(
+        "SELECT c.id, LOWER(COALESCE(c.source_app, ''))
+         FROM clips c
+         WHERE {}
+         ORDER BY c.pinned DESC, COALESCE(c.copy_count, 0) DESC, c.created_at DESC
+         LIMIT 60",
+        conditions.join(" AND ")
+    );
+    let param_refs: Vec<&dyn ToSql> = params.iter().map(|param| param.as_ref()).collect();
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(&param_refs[..], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| e.to_string())?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        let (id, source_app) = row.map_err(|e| e.to_string())?;
+        let best_score = parsed
+            .source_hints
+            .iter()
+            .map(|hint| source_hint_score(&source_app, hint))
+            .fold(0.0, f64::max);
+        if best_score > 0.0 {
+            results.push((id, best_score));
+        }
+    }
+
+    results.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| right.0.cmp(&left.0))
+    });
+    Ok(results)
+}
+
 fn do_vector_candidates(
     conn: &rusqlite::Connection,
-    model: &std::sync::Arc<crate::embed::EmbeddingModel>,
+    embedding: &[f32],
     parsed: &ParsedQuery,
     filter: &str,
     collection_id: Option<i64>,
     include_temporal: bool,
 ) -> Vec<(i64, f64)> {
-    let semantic_query = build_semantic_query_text(parsed);
-    let Ok(embedding) = crate::embed::embed_query(model, &semantic_query) else {
-        return vec![];
-    };
-    if embedding.len() != model.dimensions {
-        return vec![];
-    }
-
     let bytes: Vec<u8> = embedding
         .iter()
         .flat_map(|value| value.to_le_bytes())
@@ -756,6 +877,28 @@ fn do_vector_candidates(
     );
     let param_refs: Vec<&dyn ToSql> = params.iter().map(|param| param.as_ref()).collect();
     query_id_scores(conn, &sql, &param_refs).unwrap_or_default()
+}
+
+fn prepare_semantic_query(
+    model: &std::sync::Arc<crate::embed::EmbeddingModel>,
+    parsed: &ParsedQuery,
+) -> Option<SemanticQueryPlan> {
+    let semantic_query = build_semantic_query_text(parsed);
+    if semantic_query.is_empty() {
+        return None;
+    }
+
+    let embedding = crate::embed::embed_query(model, &semantic_query).ok()?;
+    if embedding.len() != model.dimensions {
+        return None;
+    }
+
+    let intents = crate::embed::classify_query_intent(&embedding)
+        .into_iter()
+        .take(3)
+        .collect();
+
+    Some(SemanticQueryPlan { embedding, intents })
 }
 
 fn build_semantic_query_text(parsed: &ParsedQuery) -> String {
@@ -981,9 +1124,11 @@ fn collect_ranked_scores(
     include_temporal: bool,
 ) -> Result<(HashMap<i64, ScoreEntry>, bool), String> {
     let fts = do_fts_candidates(conn, parsed, filter, collection_id, include_temporal)?;
+    let source = do_source_candidates(conn, parsed, filter, collection_id, include_temporal)?;
 
     let mut scores: HashMap<i64, ScoreEntry> = HashMap::new();
     add_ranked_scores(&mut scores, &fts, 4.4);
+    add_ranked_scores(&mut scores, &source, 5.2);
     if let Some(vec_candidates) = semantic_candidates {
         add_distance_scores(&mut scores, vec_candidates, 5.0);
     }
@@ -996,6 +1141,7 @@ fn apply_clip_boosts(
     clips: &[ClipResult],
     parsed: &ParsedQuery,
     temporal_relaxed: bool,
+    semantic_intents: &[(String, f32)],
 ) {
     let now = chrono::Local::now().timestamp();
     let semantic_lower = parsed.semantic.to_lowercase();
@@ -1030,6 +1176,8 @@ fn apply_clip_boosts(
             entry.score += 2.8 * semantic_boost_factor;
         }
 
+        entry.score += semantic_intent_bonus(clip, &text, semantic_intents);
+
         if let Some(content_type) = parsed.content_type.as_deref() {
             if clip.content_type == content_type {
                 entry.score += 1.8;
@@ -1043,6 +1191,16 @@ fn apply_clip_boosts(
                 .any(|app| clip.source_app.to_lowercase().contains(&app.to_lowercase()))
         {
             entry.score += 1.6;
+        }
+
+        if !parsed.source_hints.is_empty() {
+            let source_lower = clip.source_app.to_lowercase();
+            let source_hint_bonus: f64 = parsed
+                .source_hints
+                .iter()
+                .map(|hint| source_hint_score(&source_lower, hint))
+                .fold(0.0, f64::max);
+            entry.score += source_hint_bonus * 2.1;
         }
 
         if parsed.content_type.as_deref() == Some("image")
@@ -1070,6 +1228,81 @@ fn apply_clip_boosts(
             }
         }
     }
+}
+
+fn semantic_intent_bonus(clip: &ClipResult, text: &str, semantic_intents: &[(String, f32)]) -> f64 {
+    semantic_intents
+        .iter()
+        .take(3)
+        .map(|(intent, similarity)| {
+            let strength = (((*similarity as f64) - 0.6) / 0.35).clamp(0.0, 1.0);
+            if strength == 0.0 || !clip_matches_intent(clip, text, intent) {
+                return 0.0;
+            }
+
+            let base = match intent.as_str() {
+                "code" => 2.2,
+                "url" => 2.0,
+                "image" => 1.8,
+                "auth" => 1.9,
+                "meeting" => 1.7,
+                "recipe" => 1.7,
+                "error" => 1.9,
+                _ => 0.0,
+            };
+            base * strength
+        })
+        .sum()
+}
+
+fn clip_matches_intent(clip: &ClipResult, text: &str, intent: &str) -> bool {
+    match intent {
+        "code" => clip.content_type == "code" || looks_like_code_clip(text),
+        "url" => {
+            clip.content_type == "url" || text.contains("http://") || text.contains("https://")
+        }
+        "image" => clip.content_type == "image",
+        "auth" => text_contains_any(text, AUTH_INTENT_TERMS),
+        "meeting" => text_contains_any(text, MEETING_INTENT_TERMS),
+        "recipe" => text_contains_any(text, RECIPE_INTENT_TERMS),
+        "error" => text_contains_any(text, ERROR_INTENT_TERMS),
+        _ => false,
+    }
+}
+
+fn looks_like_code_clip(text: &str) -> bool {
+    text.contains("fn ")
+        || text.contains("def ")
+        || text.contains("class ")
+        || text.contains("const ")
+        || text.contains("let ")
+        || text.contains("select ")
+        || text.contains("insert ")
+}
+
+fn text_contains_any(text: &str, terms: &[&str]) -> bool {
+    terms.iter().any(|term| text.contains(term))
+}
+
+fn source_hint_score(source_app: &str, hint: &str) -> f64 {
+    let source_app = source_app.trim().to_lowercase();
+    let hint = hint.trim().to_lowercase();
+    if source_app.is_empty() || hint.is_empty() {
+        return 0.0;
+    }
+    if source_app == hint {
+        return 1.5;
+    }
+    if source_app.starts_with(&format!("{hint} "))
+        || source_app.ends_with(&format!(" {hint}"))
+        || source_app.contains(&format!(" {hint} "))
+    {
+        return 1.15;
+    }
+    if source_app.contains(&hint) {
+        return 0.8;
+    }
+    0.0
 }
 
 fn temporal_center(parsed: &ParsedQuery) -> Option<i64> {
@@ -1279,6 +1512,29 @@ mod tests {
         .unwrap();
     }
 
+    fn test_clip(
+        id: i64,
+        content: &str,
+        content_type: &str,
+        source_app: &str,
+        created_at: i64,
+        ocr_text: Option<&str>,
+    ) -> ClipResult {
+        ClipResult {
+            id,
+            content: content.to_string(),
+            content_type: content_type.to_string(),
+            source_app: source_app.to_string(),
+            source_device: String::new(),
+            is_file: false,
+            created_at,
+            pinned: false,
+            content_highlighted: None,
+            ocr_text: ocr_text.map(str::to_string),
+            copy_count: 0,
+        }
+    }
+
     #[test]
     fn clip_push_key_prefers_sync_id_then_hash() {
         let conn = setup_test_db();
@@ -1330,7 +1586,7 @@ mod tests {
         );
 
         let parsed = query_parser::parse_query("flight info");
-        let results = do_ranked_search(&conn, &parsed, "all", None, None, None).unwrap();
+        let results = do_ranked_search(&conn, &parsed, "all", None, None, None, &[]).unwrap();
         assert_eq!(results.first().map(|clip| clip.id), Some(1));
     }
 
@@ -1358,6 +1614,87 @@ mod tests {
 
         let parsed = query_parser::parse_query("url from slack yesterday");
         let results = do_filter_search(&conn, &parsed, "all", None).unwrap();
+        assert_eq!(results.first().map(|clip| clip.id), Some(1));
+    }
+
+    #[test]
+    fn ambiguous_from_phrase_finds_content_match() {
+        let conn = setup_test_db();
+        insert_clip(
+            &conn,
+            1,
+            "hello from Australia! bring sunscreen",
+            "text",
+            "Notes",
+            1_710_000_000,
+            None,
+        );
+        insert_clip(
+            &conn,
+            2,
+            "weather packing checklist",
+            "text",
+            "Australia",
+            1_710_000_100,
+            None,
+        );
+
+        let parsed = query_parser::parse_query("from australia");
+        let results = do_ranked_search(&conn, &parsed, "all", None, None, None, &[]).unwrap();
+        assert_eq!(results.first().map(|clip| clip.id), Some(1));
+    }
+
+    #[test]
+    fn unknown_source_hint_finds_niche_app() {
+        let conn = setup_test_db();
+        insert_clip(
+            &conn,
+            1,
+            "daily flashcard review",
+            "text",
+            "Anki",
+            1_710_000_000,
+            None,
+        );
+        insert_clip(
+            &conn,
+            2,
+            "flashcard export notes",
+            "text",
+            "Notes",
+            1_710_000_100,
+            None,
+        );
+
+        let parsed = query_parser::parse_query("from anki");
+        let results = do_ranked_search(&conn, &parsed, "all", None, None, None, &[]).unwrap();
+        assert_eq!(results.first().map(|clip| clip.id), Some(1));
+    }
+
+    #[test]
+    fn unknown_source_hint_finds_synced_windows_app() {
+        let conn = setup_test_db();
+        insert_clip(
+            &conn,
+            1,
+            "C:\\Users\\omar\\Downloads\\invoice.pdf",
+            "text",
+            "File Explorer",
+            1_710_000_000,
+            None,
+        );
+        insert_clip(
+            &conn,
+            2,
+            "invoice follow-up email",
+            "text",
+            "Mail",
+            1_710_000_100,
+            None,
+        );
+
+        let parsed = query_parser::parse_query("from file explorer");
+        let results = do_ranked_search(&conn, &parsed, "all", None, None, None, &[]).unwrap();
         assert_eq!(results.first().map(|clip| clip.id), Some(1));
     }
 
@@ -1442,8 +1779,45 @@ mod tests {
         );
 
         let parsed = query_parser::parse_query("boarding pass screenshot");
-        let results = do_ranked_search(&conn, &parsed, "all", None, None, None).unwrap();
+        let results = do_ranked_search(&conn, &parsed, "all", None, None, None, &[]).unwrap();
         assert_eq!(results.first().map(|clip| clip.id), Some(1));
+    }
+
+    #[test]
+    fn semantic_intent_bonus_prefers_auth_like_clip() {
+        let parsed = query_parser::parse_query("that thing");
+        let clips = vec![
+            test_clip(
+                1,
+                "Your one-time password is 483921. Use this login code within 10 minutes.",
+                "text",
+                "Messages",
+                1_710_000_000,
+                None,
+            ),
+            test_clip(
+                2,
+                "Quarterly planning notes for next week",
+                "text",
+                "Notes",
+                1_710_000_000,
+                None,
+            ),
+        ];
+        let mut scores = HashMap::from([(1, ScoreEntry::default()), (2, ScoreEntry::default())]);
+
+        apply_clip_boosts(
+            &mut scores,
+            &clips,
+            &parsed,
+            false,
+            &[(String::from("auth"), 0.92)],
+        );
+
+        assert!(
+            scores.get(&1).unwrap().score > scores.get(&2).unwrap().score,
+            "auth intent should boost the clip containing login credentials"
+        );
     }
 
     #[test]
@@ -1543,7 +1917,7 @@ mod tests {
                 if parsed.query_is_empty_after_parse || parsed.semantic.is_empty() {
                     let _ = do_filter_search(&conn, &parsed, "all", None).unwrap();
                 } else {
-                    let _ = do_ranked_search(&conn, &parsed, "all", None, None, None).unwrap();
+                    let _ = do_ranked_search(&conn, &parsed, "all", None, None, None, &[]).unwrap();
                 }
             }
         }
@@ -1631,7 +2005,7 @@ mod tests {
                 if parsed.query_is_empty_after_parse || parsed.semantic.is_empty() {
                     let _ = do_filter_search(&conn, &parsed, "all", None).unwrap();
                 } else {
-                    let _ = do_ranked_search(&conn, &parsed, "all", None, None, None).unwrap();
+                    let _ = do_ranked_search(&conn, &parsed, "all", None, None, None, &[]).unwrap();
                 }
             }
         }
@@ -1707,7 +2081,7 @@ mod tests {
         );
 
         let parsed = query_parser::parse_query("receipt");
-        let results = do_ranked_search(&conn, &parsed, "all", None, None, None).unwrap();
+        let results = do_ranked_search(&conn, &parsed, "all", None, None, None, &[]).unwrap();
         assert_eq!(results.first().map(|c| c.id), Some(1));
     }
 
@@ -1734,7 +2108,7 @@ mod tests {
         );
 
         let parsed = query_parser::parse_query("error");
-        let results = do_ranked_search(&conn, &parsed, "all", None, None, None).unwrap();
+        let results = do_ranked_search(&conn, &parsed, "all", None, None, None, &[]).unwrap();
         assert_eq!(results.first().map(|c| c.id), Some(1));
     }
 
@@ -1873,7 +2247,7 @@ mod tests {
         );
 
         let parsed = query_parser::parse_query("todo list");
-        let results = do_ranked_search(&conn, &parsed, "all", None, None, None).unwrap();
+        let results = do_ranked_search(&conn, &parsed, "all", None, None, None, &[]).unwrap();
         assert_eq!(results.first().map(|c| c.id), Some(1));
     }
 
@@ -1900,7 +2274,7 @@ mod tests {
         );
 
         let parsed = query_parser::parse_query("zoom link");
-        let results = do_ranked_search(&conn, &parsed, "all", None, None, None).unwrap();
+        let results = do_ranked_search(&conn, &parsed, "all", None, None, None, &[]).unwrap();
         assert_eq!(results.first().map(|c| c.id), Some(1));
     }
 
@@ -1927,7 +2301,7 @@ mod tests {
         );
 
         let parsed = query_parser::parse_query("meeting notes");
-        let results = do_ranked_search(&conn, &parsed, "all", None, None, None).unwrap();
+        let results = do_ranked_search(&conn, &parsed, "all", None, None, None, &[]).unwrap();
         assert_eq!(results.first().map(|c| c.id), Some(1));
     }
 
@@ -1954,7 +2328,7 @@ mod tests {
         );
 
         let parsed = query_parser::parse_query("tracking number");
-        let results = do_ranked_search(&conn, &parsed, "all", None, None, None).unwrap();
+        let results = do_ranked_search(&conn, &parsed, "all", None, None, None, &[]).unwrap();
         assert_eq!(results.first().map(|c| c.id), Some(1));
     }
 
@@ -1981,7 +2355,7 @@ mod tests {
         );
 
         let parsed = query_parser::parse_query("password");
-        let results = do_ranked_search(&conn, &parsed, "all", None, None, None).unwrap();
+        let results = do_ranked_search(&conn, &parsed, "all", None, None, None, &[]).unwrap();
         assert_eq!(results.first().map(|c| c.id), Some(1));
     }
 
@@ -2017,7 +2391,7 @@ mod tests {
         );
 
         let parsed = query_parser::parse_query("that thing about the privacy policy");
-        let results = do_ranked_search(&conn, &parsed, "all", None, None, None).unwrap();
+        let results = do_ranked_search(&conn, &parsed, "all", None, None, None, &[]).unwrap();
         assert_eq!(results.first().map(|c| c.id), Some(1));
     }
 
@@ -2044,7 +2418,7 @@ mod tests {
         );
 
         let parsed = query_parser::parse_query("that ip address for the staging server");
-        let results = do_ranked_search(&conn, &parsed, "all", None, None, None).unwrap();
+        let results = do_ranked_search(&conn, &parsed, "all", None, None, None, &[]).unwrap();
         assert_eq!(results.first().map(|c| c.id), Some(1));
     }
 
@@ -2071,7 +2445,7 @@ mod tests {
         );
 
         let parsed = query_parser::parse_query("that apology email I wrote");
-        let results = do_ranked_search(&conn, &parsed, "all", None, None, None).unwrap();
+        let results = do_ranked_search(&conn, &parsed, "all", None, None, None, &[]).unwrap();
         assert_eq!(results.first().map(|c| c.id), Some(1));
     }
 }

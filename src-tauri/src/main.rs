@@ -10,6 +10,13 @@ use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::{Emitter, Manager};
 use tauri_plugin_global_shortcut::ShortcutState;
 
+#[cfg(target_os = "macos")]
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+
+#[cfg(target_os = "macos")]
+static PASTE_PERMISSION_HINT_EMITTED: AtomicBool = AtomicBool::new(false);
+
+mod centroids;
 mod clipboard;
 mod collections;
 mod db;
@@ -87,6 +94,7 @@ pub struct AppState {
     pub suppress_next_clipboard_capture: AtomicBool,
     pub suppressed_clipboard_change_count: AtomicI64,
     pub previous_frontmost_app: Mutex<Option<String>>,
+    pub last_non_copi_frontmost_app: Mutex<Option<String>>,
     pub previous_foreground_window: Mutex<Option<isize>>,
     pub overlay_drag_ignore_until_ms: AtomicU64,
     pub search_generation: AtomicU64,
@@ -414,6 +422,7 @@ fn main() {
                 suppress_next_clipboard_capture: AtomicBool::new(false),
                 suppressed_clipboard_change_count: AtomicI64::new(i64::MIN),
                 previous_frontmost_app: Mutex::new(None),
+                last_non_copi_frontmost_app: Mutex::new(None),
                 previous_foreground_window: Mutex::new(None),
                 overlay_drag_ignore_until_ms: AtomicU64::new(0),
                 search_generation: AtomicU64::new(0),
@@ -464,6 +473,9 @@ fn main() {
             });
             // Initialize wormhole state
             app.manage(wormhole::WormholeState::new());
+
+            #[cfg(target_os = "macos")]
+            start_frontmost_app_tracker(&handle);
 
             let shortcut_plugin_result = handle.plugin(
                 tauri_plugin_global_shortcut::Builder::new()
@@ -1030,9 +1042,7 @@ fn show_overlay_inner(app: &tauri::AppHandle) {
 
     // Save previous frontmost target for paste-on-select
     #[cfg(target_os = "macos")]
-    if let Ok(mut guard) = app.state::<AppState>().previous_frontmost_app.try_lock() {
-        *guard = crate::macos::get_frontmost_app_bundle_id();
-    }
+    capture_previous_paste_target(app);
 
     #[cfg(target_os = "windows")]
     if let Ok(mut guard) = app
@@ -1095,8 +1105,9 @@ fn hide_overlay_inner(app: &tauri::AppHandle, paste: bool) {
         #[cfg(target_os = "macos")]
         {
             let target_bundle_id = restore_previous_app(app);
-            wait_for_frontmost_app(target_bundle_id.as_deref(), 450);
-            simulate_paste();
+            wait_for_frontmost_app(target_bundle_id.as_deref(), 1100);
+            let result = simulate_paste();
+            maybe_emit_macos_paste_hint(app, &result);
         }
 
         #[cfg(target_os = "windows")]
@@ -1367,46 +1378,189 @@ fn rounded_rect_coverage(
 // ─── macOS Helpers ────────────────────────────────────────────────
 
 #[cfg(target_os = "macos")]
-fn restore_previous_app(app: &tauri::AppHandle) -> Option<String> {
-    let bundle_id = app
-        .state::<AppState>()
-        .previous_frontmost_app
+#[derive(Clone, Copy, Debug)]
+enum PasteMethod {
+    OsaScript,
+    CgEvent,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug)]
+enum PasteOutcome {
+    Success {
+        method: PasteMethod,
+        osascript_error: Option<String>,
+    },
+    Failed {
+        osascript_error: Option<String>,
+    },
+}
+
+#[cfg(target_os = "macos")]
+fn start_frontmost_app_tracker(app: &tauri::AppHandle) {
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(120));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            interval.tick().await;
+            let Some(state) = app_handle.try_state::<AppState>() else {
+                continue;
+            };
+
+            let Some(bundle_id) = crate::macos::get_frontmost_app_bundle_id() else {
+                continue;
+            };
+            if bundle_id.is_empty() || bundle_id == "com.copi.app" {
+                continue;
+            }
+
+            let lock_result = state.last_non_copi_frontmost_app.try_lock();
+            if let Ok(mut guard) = lock_result {
+                *guard = Some(bundle_id);
+            }
+        }
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn capture_previous_paste_target(app: &tauri::AppHandle) {
+    let state = app.state::<AppState>();
+
+    let current_frontmost = crate::macos::get_frontmost_app_bundle_id()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty());
+
+    if let Some(bundle_id) = current_frontmost
+        .as_ref()
+        .filter(|id| id.as_str() != "com.copi.app")
+    {
+        if let Ok(mut guard) = state.last_non_copi_frontmost_app.try_lock() {
+            *guard = Some(bundle_id.clone());
+        }
+    }
+
+    let fallback_target = state
+        .last_non_copi_frontmost_app
         .try_lock()
         .ok()
         .and_then(|guard| guard.clone())
         .filter(|id| !id.trim().is_empty());
 
-    let Some(bundle_id) = bundle_id else {
-        return None;
-    };
+    let target = current_frontmost
+        .filter(|id| id != "com.copi.app")
+        .or(fallback_target);
 
-    match std::process::Command::new("open")
-        .arg("-b")
-        .arg(&bundle_id)
-        .status()
-    {
-        Ok(status) if !status.success() => {
-            eprintln!(
-                "[Paste] Reactivate command for '{}' exited with {}",
-                bundle_id, status
-            );
+    if let Ok(mut guard) = state.previous_frontmost_app.try_lock() {
+        *guard = target.clone();
+    }
+
+    if let Some(bundle_id) = target {
+        eprintln!("[Paste] Target app before overlay: {}", bundle_id);
+    } else {
+        eprintln!("[Paste] No non-Copi app target found before overlay");
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_previous_paste_target(app: &tauri::AppHandle) -> Option<String> {
+    let state = app.state::<AppState>();
+    state
+        .previous_frontmost_app
+        .try_lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .filter(|id| !id.trim().is_empty())
+        .or_else(|| {
+            state
+                .last_non_copi_frontmost_app
+                .try_lock()
+                .ok()
+                .and_then(|guard| guard.clone())
+                .filter(|id| !id.trim().is_empty())
+        })
+}
+
+#[cfg(target_os = "macos")]
+fn restore_previous_app(app: &tauri::AppHandle) -> Option<String> {
+    let bundle_id = resolve_previous_paste_target(app)?;
+    if bundle_id == "com.copi.app" {
+        return None;
+    }
+
+    let mut restored = false;
+
+    match activate_app_with_osascript(&bundle_id) {
+        Ok(()) => {
+            restored = true;
         }
-        Ok(_) => {}
         Err(error) => {
             eprintln!(
-                "[Paste] Failed to reactivate '{}' before paste: {}",
+                "[Paste] AppleScript activate failed for '{}': {}",
                 bundle_id, error
             );
+            match std::process::Command::new("open")
+                .arg("-b")
+                .arg(&bundle_id)
+                .status()
+            {
+                Ok(status) if !status.success() => {
+                    eprintln!(
+                        "[Paste] Reactivate command for '{}' exited with {}",
+                        bundle_id, status
+                    );
+                }
+                Ok(_) => {
+                    restored = true;
+                }
+                Err(open_error) => {
+                    eprintln!(
+                        "[Paste] Failed to reactivate '{}' before paste: {}",
+                        bundle_id, open_error
+                    );
+                }
+            }
         }
+    }
+
+    if !restored {
+        return None;
     }
 
     Some(bundle_id)
 }
 
 #[cfg(target_os = "macos")]
+fn activate_app_with_osascript(bundle_id: &str) -> Result<(), String> {
+    let escaped = bundle_id.replace('\\', "\\\\").replace('"', "\\\"");
+    run_osascript(&format!("tell application id \"{}\" to activate", escaped))
+}
+
+#[cfg(target_os = "macos")]
+fn run_osascript(script: &str) -> Result<(), String> {
+    match std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+    {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if stderr.is_empty() {
+                Err(format!("osascript exited with {}", output.status))
+            } else {
+                Err(stderr)
+            }
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn wait_for_frontmost_app(target_bundle_id: Option<&str>, timeout_ms: u64) {
     let Some(target_bundle_id) = target_bundle_id else {
-        std::thread::sleep(std::time::Duration::from_millis(90));
+        std::thread::sleep(std::time::Duration::from_millis(120));
         return;
     };
 
@@ -1431,48 +1585,45 @@ fn wait_for_frontmost_app(target_bundle_id: Option<&str>, timeout_ms: u64) {
 }
 
 #[cfg(target_os = "macos")]
-fn simulate_paste() {
+fn simulate_paste() -> PasteOutcome {
     std::thread::sleep(std::time::Duration::from_millis(35));
 
-    if try_simulate_paste_with_osascript() {
-        return;
-    }
-
-    eprintln!("[Paste] osascript failed, falling back to CGEventPost");
-    simulate_paste_with_cg_event();
-}
-
-#[cfg(target_os = "macos")]
-fn try_simulate_paste_with_osascript() -> bool {
-    const SCRIPT: &str = "tell application \"System Events\" to keystroke \"v\" using command down";
-
-    match std::process::Command::new("osascript")
-        .arg("-e")
-        .arg(SCRIPT)
-        .output()
-    {
-        Ok(output) if output.status.success() => true,
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            if stderr.is_empty() {
-                eprintln!(
-                    "[Paste] osascript returned non-zero status: {}",
-                    output.status
-                );
-            } else {
-                eprintln!("[Paste] osascript error: {}", stderr);
+    match try_simulate_paste_with_osascript() {
+        Ok(()) => {
+            eprintln!("[Paste] Pasted via AppleScript");
+            PasteOutcome::Success {
+                method: PasteMethod::OsaScript,
+                osascript_error: None,
             }
-            false
         }
-        Err(error) => {
-            eprintln!("[Paste] Failed to launch osascript: {}", error);
-            false
+        Err(osascript_error) => {
+            eprintln!(
+                "[Paste] osascript paste failed: {}; falling back to CGEventPost",
+                osascript_error
+            );
+            if simulate_paste_with_cg_event() {
+                eprintln!("[Paste] Pasted via CGEventPost fallback");
+                PasteOutcome::Success {
+                    method: PasteMethod::CgEvent,
+                    osascript_error: Some(osascript_error),
+                }
+            } else {
+                PasteOutcome::Failed {
+                    osascript_error: Some(osascript_error),
+                }
+            }
         }
     }
 }
 
 #[cfg(target_os = "macos")]
-fn simulate_paste_with_cg_event() {
+fn try_simulate_paste_with_osascript() -> Result<(), String> {
+    const SCRIPT: &str = "tell application \"System Events\" to keystroke \"v\" using command down";
+    run_osascript(SCRIPT)
+}
+
+#[cfg(target_os = "macos")]
+fn simulate_paste_with_cg_event() -> bool {
     // Use CGEventPost for low latency where it is permitted.
     // kVK_ANSI_V = 0x09, kCGHIDEventTap = 0, kCGEventFlagMaskCommand = 1 << 20
     extern "C" {
@@ -1490,6 +1641,8 @@ fn simulate_paste_with_cg_event() {
     const K_CG_HID_EVENT_TAP: u32 = 0;
     const K_CG_EVENT_FLAG_MASK_COMMAND: u64 = 1 << 20;
 
+    let mut posted = false;
+
     unsafe {
         let source = std::ptr::null();
         let key_down = CGEventCreateKeyboardEvent(source, K_VK_ANSI_V, true);
@@ -1497,6 +1650,7 @@ fn simulate_paste_with_cg_event() {
             CGEventSetFlags(key_down, K_CG_EVENT_FLAG_MASK_COMMAND);
             CGEventPost(K_CG_HID_EVENT_TAP, key_down);
             CFRelease(key_down);
+            posted = true;
         }
 
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -1506,8 +1660,66 @@ fn simulate_paste_with_cg_event() {
             CGEventSetFlags(key_up, K_CG_EVENT_FLAG_MASK_COMMAND);
             CGEventPost(K_CG_HID_EVENT_TAP, key_up);
             CFRelease(key_up);
+            posted = true;
         }
     }
+
+    posted
+}
+
+#[cfg(target_os = "macos")]
+fn maybe_emit_macos_paste_hint(app: &tauri::AppHandle, outcome: &PasteOutcome) {
+    let osascript_error = match outcome {
+        PasteOutcome::Success {
+            method,
+            osascript_error,
+        } => {
+            eprintln!("[Paste] Auto-paste method used: {:?}", method);
+            osascript_error.as_deref()
+        }
+        PasteOutcome::Failed {
+            osascript_error: Some(error),
+        } => Some(error.as_str()),
+        PasteOutcome::Failed {
+            osascript_error: None,
+        } => None,
+    };
+
+    let Some(error) = osascript_error else {
+        return;
+    };
+
+    if !looks_like_macos_permission_error(error) {
+        return;
+    }
+
+    if PASTE_PERMISSION_HINT_EMITTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    let hint_message = "Copi could copy the clip but macOS blocked auto-paste.\n\nEnable these for Copi in System Settings > Privacy & Security:\n- Accessibility\n- Input Monitoring\n\nThen restart Copi and try again.";
+
+    let _ = app.emit("paste-permission-hint", hint_message.to_string());
+
+    app.dialog()
+        .message(hint_message)
+        .title("Enable macOS Permissions for Paste")
+        .kind(MessageDialogKind::Warning)
+        .buttons(MessageDialogButtons::Ok)
+        .show(|_| {});
+}
+
+#[cfg(target_os = "macos")]
+fn looks_like_macos_permission_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("not authorized")
+        || lower.contains("not permitted")
+        || lower.contains("assistive access")
+        || lower.contains("accessibility")
+        || lower.contains("input monitoring")
+        || lower.contains("system events")
+        || lower.contains("-1743")
+        || lower.contains("-1719")
 }
 
 #[cfg(target_os = "windows")]

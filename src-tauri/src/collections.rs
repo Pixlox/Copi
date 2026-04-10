@@ -90,8 +90,7 @@ pub fn delete_collection(app: tauri::AppHandle, id: i64) -> Result<(), String> {
                 |row| row.get::<_, i64>(0),
             )
             .map_err(|e| e.to_string())?;
-        rows
-            .filter_map(|r| r.ok())
+        rows.filter_map(|r| r.ok())
             .filter_map(|clip_id| clip_push_key_by_id(&conn, clip_id))
             .collect()
     };

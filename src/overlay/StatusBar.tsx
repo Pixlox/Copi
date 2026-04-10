@@ -1,3 +1,4 @@
+import { AppWindow, Clock3, FileCode2, FileText, Image, Link2 } from "lucide-react";
 import type { SearchStatus } from "../hooks/useSearch";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -18,26 +19,119 @@ function formatCount(count: number): string {
   return count.toLocaleString();
 }
 
-function detectFilters(query: string): string[] {
-  const badges: string[] = [];
+type FilterBadge = {
+  key: string;
+  label: string;
+  icon: typeof AppWindow;
+};
+
+const SOURCE_STOP_WORDS = new Set([
+  "yesterday",
+  "today",
+  "last",
+  "this",
+  "around",
+  "about",
+  "at",
+  "before",
+  "after",
+]);
+const LANGUAGE_HINTS = new Set([
+  "arabic",
+  "german",
+  "deutsch",
+  "english",
+  "spanish",
+  "espanol",
+  "french",
+  "francais",
+  "hebrew",
+  "hindi",
+  "italian",
+  "japanese",
+  "japan",
+  "nihongo",
+  "korean",
+  "hangul",
+  "portuguese",
+  "russian",
+  "thai",
+  "ukrainian",
+  "vietnamese",
+  "chinese",
+  "mandarin",
+  "cantonese",
+]);
+
+function toBadgeKey(text: string): string {
+  return text.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-");
+}
+
+function normalizeWhitespace(text: string): string {
+  return text.trim().replace(/\s+/g, " ");
+}
+
+function cleanSourceCandidate(candidate: string): string {
+  const words = normalizeWhitespace(candidate).split(" ");
+  const kept: string[] = [];
+  for (const word of words) {
+    if (SOURCE_STOP_WORDS.has(word.toLowerCase())) {
+      break;
+    }
+    kept.push(word);
+  }
+  return normalizeWhitespace(kept.join(" "));
+}
+
+function detectSourceFilter(query: string): FilterBadge | null {
+  const match = query.match(
+    /\b(?:from|in|via|on|copied\s+from|pasted\s+from)\s+([A-Za-z][A-Za-z0-9 .:&'/_-]{1,40})/i
+  );
+  if (!match?.[1]) {
+    return null;
+  }
+
+  const label = cleanSourceCandidate(match[1]);
+  if (!label || LANGUAGE_HINTS.has(label.toLowerCase())) {
+    return null;
+  }
+
+  if (!/[A-Za-z0-9]/.test(label)) {
+    return null;
+  }
+
+  return {
+    key: `source-${toBadgeKey(label)}`,
+    label,
+    icon: AppWindow,
+  };
+}
+
+function detectFilters(query: string): FilterBadge[] {
+  const badges: FilterBadge[] = [];
   const lower = query.toLowerCase();
 
-  // Temporal
   if (/\b(yesterday|today|last\s+(week|month|hour|day)|\d+\s+days?\s+ago|recently|this\s+(morning|afternoon|evening)|around|tonight|friday|monday|tuesday|wednesday|thursday|saturday|sunday)\b/.test(lower)) {
-    badges.push("⏱ time");
+    badges.push({ key: "time", label: "Time", icon: Clock3 });
   }
 
-  // Source app (from/in/via + word)
-  const appMatch = lower.match(/\b(?:from|in|via)\s+([a-z][a-z0-9. ]{1,30})/);
-  if (appMatch) {
-    badges.push(`📱 ${appMatch[1].trim()}`);
+  const sourceFilter = detectSourceFilter(query);
+  if (sourceFilter) {
+    badges.push(sourceFilter);
   }
 
-  // Content type
-  if (/\b(urls?|links?)\b/.test(lower)) badges.push("🔗 URLs");
-  if (/\bcode\b/.test(lower)) badges.push("⌨️ Code");
-  if (/\b(images?|photos?)\b/.test(lower)) badges.push("🖼 Images");
-  if (/\btext\b/.test(lower)) badges.push("📝 Text");
+  if (/\b(urls?|links?)\b/.test(lower)) {
+    badges.push({ key: "urls", label: "URLs", icon: Link2 });
+  }
+  if (/\bcode\b/.test(lower)) {
+    badges.push({ key: "code", label: "Code", icon: FileCode2 });
+  }
+  if (/\b(images?|photos?)\b/.test(lower)) {
+    badges.push({ key: "images", label: "Images", icon: Image });
+  }
+  if (/\btext\b/.test(lower)) {
+    badges.push({ key: "text", label: "Text", icon: FileText });
+  }
 
   return badges;
 }
@@ -185,8 +279,11 @@ function StatusBar({
         {syncEnabled && syncBadge && (
           <span className="temporal-badge">{syncBadge}</span>
         )}
-        {filters.map((f) => (
-          <span key={f} className="temporal-badge">{f}</span>
+        {filters.map(({ key, label, icon: Icon }) => (
+          <span key={key} className="temporal-badge inline-flex items-center gap-1">
+            <Icon size={11} strokeWidth={2.1} />
+            <span>{label}</span>
+          </span>
         ))}
       </div>
       <div className="flex items-center gap-3" style={{ color: "var(--text-tertiary)" }}>

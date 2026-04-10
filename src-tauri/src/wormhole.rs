@@ -34,7 +34,6 @@ const CHUNK_SIZE_XLARGE: usize = 512 * 1024; // >1GB: 512KB
 /// transport / parser thresholds.
 const CHUNK_SIZE_MAX_SAFE: usize = 64 * 1024;
 
-
 /// Progress event throttling
 const PROGRESS_EMIT_INTERVAL_MS: u64 = 100;
 const PROGRESS_EMIT_MIN_BYTES: u64 = 1_000_000; // 1MB
@@ -280,7 +279,12 @@ impl WormholeState {
         total_bytes: u64,
         is_upload: bool,
     ) -> Arc<ActiveTransfer> {
-        let transfer = Arc::new(ActiveTransfer::new(file_id.clone(), file_name, total_bytes, is_upload));
+        let transfer = Arc::new(ActiveTransfer::new(
+            file_id.clone(),
+            file_name,
+            total_bytes,
+            is_upload,
+        ));
         self.active_transfers
             .write()
             .await
@@ -450,23 +454,6 @@ pub fn detect_mime_type(file_name: &str) -> Option<String> {
     Some(mime.to_string())
 }
 
-/// Format bytes for human display
-pub fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-
-    if bytes < KB {
-        format!("{} B", bytes)
-    } else if bytes < MB {
-        format!("{:.1} KB", bytes as f64 / KB as f64)
-    } else if bytes < GB {
-        format!("{:.1} MB", bytes as f64 / MB as f64)
-    } else {
-        format!("{:.2} GB", bytes as f64 / GB as f64)
-    }
-}
-
 // ─── Database Operations ──────────────────────────────────────────
 
 /// Initialize wormhole database table
@@ -499,7 +486,10 @@ pub fn init_wormhole_table(conn: &rusqlite::Connection) -> rusqlite::Result<()> 
 }
 
 /// Insert a new wormhole file record
-pub fn insert_wormhole_file(conn: &rusqlite::Connection, file: &WormholeFile) -> rusqlite::Result<()> {
+pub fn insert_wormhole_file(
+    conn: &rusqlite::Connection,
+    file: &WormholeFile,
+) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO wormhole_files (
             id, file_name, file_size, mime_type, checksum,
@@ -541,7 +531,6 @@ pub fn update_wormhole_status(
     Ok(())
 }
 
-/// Update wormhole transfer progress
 pub fn update_wormhole_progress(
     conn: &rusqlite::Connection,
     file_id: &str,
@@ -579,7 +568,10 @@ pub fn mark_transfer_completed(
 }
 
 /// Get wormhole file by ID
-pub fn get_wormhole_file(conn: &rusqlite::Connection, file_id: &str) -> rusqlite::Result<Option<WormholeFile>> {
+pub fn get_wormhole_file(
+    conn: &rusqlite::Connection,
+    file_id: &str,
+) -> rusqlite::Result<Option<WormholeFile>> {
     conn.query_row(
         "SELECT id, file_name, file_size, mime_type, checksum,
                 origin_device_id, origin_device_name, is_local, status,
@@ -648,12 +640,6 @@ pub fn list_wormhole_files(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<
     Ok(files)
 }
 
-/// Delete wormhole file record
-pub fn delete_wormhole_file(conn: &rusqlite::Connection, file_id: &str) -> rusqlite::Result<()> {
-    conn.execute("DELETE FROM wormhole_files WHERE id = ?1", [file_id])?;
-    Ok(())
-}
-
 /// Get expired files
 pub fn get_expired_files(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<WormholeFile>> {
     let now = chrono::Utc::now().to_rfc3339();
@@ -715,10 +701,7 @@ pub fn clear_completed_files(conn: &rusqlite::Connection) -> rusqlite::Result<us
 
 /// Offer a file for transfer via Wormhole
 #[tauri::command]
-pub async fn wormhole_offer_file(
-    path: String,
-    app: AppHandle,
-) -> Result<WormholeFile, String> {
+pub async fn wormhole_offer_file(path: String, app: AppHandle) -> Result<WormholeFile, String> {
     let path = PathBuf::from(&path);
 
     // Validate file exists
@@ -754,17 +737,18 @@ pub async fn wormhole_offer_file(
 
     // Get device info
     let state = app.state::<AppState>();
-    let sync = state
-        .sync
-        .get()
-        .ok_or("Sync not initialized")?;
+    let sync = state.sync.get().ok_or("Sync not initialized")?;
 
     let device_id = sync.device_id.clone();
     let device_name = sync.device_name.clone();
 
     // Get expiration time from config (default 24h)
     let expiration_hours = crate::settings::get_config_sync(app.clone())
-        .map(|c| c.sync.wormhole_expiration_hours.unwrap_or(DEFAULT_EXPIRATION_HOURS))
+        .map(|c| {
+            c.sync
+                .wormhole_expiration_hours
+                .unwrap_or(DEFAULT_EXPIRATION_HOURS)
+        })
         .unwrap_or(DEFAULT_EXPIRATION_HOURS);
 
     let now = chrono::Utc::now();
@@ -852,10 +836,7 @@ pub async fn wormhole_retract(file_id: String, app: AppHandle) -> Result<(), Str
 
 /// Request download of a file
 #[tauri::command]
-pub async fn wormhole_request_download(
-    file_id: String,
-    app: AppHandle,
-) -> Result<(), String> {
+pub async fn wormhole_request_download(file_id: String, app: AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
 
     // Get file info
@@ -933,7 +914,10 @@ pub async fn wormhole_list_files(app: AppHandle) -> Result<Vec<WormholeFile>, St
 
 /// Get a single wormhole file by ID
 #[tauri::command]
-pub async fn wormhole_get_file(file_id: String, app: AppHandle) -> Result<Option<WormholeFile>, String> {
+pub async fn wormhole_get_file(
+    file_id: String,
+    app: AppHandle,
+) -> Result<Option<WormholeFile>, String> {
     let state = app.state::<AppState>();
     let conn = state.db_read_pool.get().map_err(|e| e.to_string())?;
     get_wormhole_file(&conn, &file_id).map_err(|e| e.to_string())
@@ -967,8 +951,8 @@ pub async fn wormhole_get_pending_count(app: AppHandle) -> Result<usize, String>
 /// Open wormhole window
 #[tauri::command]
 pub async fn open_wormhole_window(app: AppHandle) -> Result<(), String> {
-    use tauri::WebviewWindowBuilder;
     use tauri::WebviewUrl;
+    use tauri::WebviewWindowBuilder;
 
     if let Some(window) = app.get_webview_window("wormhole") {
         window.show().map_err(|e| e.to_string())?;
@@ -1002,9 +986,7 @@ pub async fn open_wormhole_window(app: AppHandle) -> Result<(), String> {
             builder = builder.transparent(true);
         }
 
-        let window = builder
-            .build()
-            .map_err(|e| e.to_string())?;
+        let window = builder.build().map_err(|e| e.to_string())?;
 
         // Apply vibrancy on macOS
         #[cfg(target_os = "macos")]
@@ -1107,7 +1089,12 @@ pub async fn stream_file_to_peer(
         .ok_or_else(|| anyhow!("Wormhole state not initialized"))?;
 
     let transfer = wormhole_state
-        .start_transfer(file_id.to_string(), file.file_name.clone(), file.file_size, true)
+        .start_transfer(
+            file_id.to_string(),
+            file.file_name.clone(),
+            file.file_size,
+            true,
+        )
         .await;
 
     // Mark transfer started
@@ -1164,7 +1151,10 @@ pub async fn stream_file_to_peer(
 
         offset += bytes_read as u64;
 
-        // Update progress and emit event
+        if let Ok(conn) = state.db_write.lock() {
+            let _ = update_wormhole_progress(&conn, file_id, offset);
+        }
+
         if let Some(progress) = transfer.update_progress(bytes_read as u64).await {
             let _ = app.emit("wormhole://transfer-progress", &progress);
         }
@@ -1194,10 +1184,7 @@ pub async fn stream_file_to_peer(
 }
 
 /// Handle incoming file chunk (called when we receive WormholeChunk)
-pub async fn handle_incoming_chunk(
-    app: &AppHandle,
-    chunk: WormholeChunk,
-) -> Result<()> {
+pub async fn handle_incoming_chunk(app: &AppHandle, chunk: WormholeChunk) -> Result<()> {
     let state = app.state::<AppState>();
     let wormhole_state = app
         .try_state::<WormholeState>()
@@ -1230,7 +1217,10 @@ pub async fn handle_incoming_chunk(
     }
 
     // Determine and persist download path for this transfer
-    let download_path = if let Some(existing) = wormhole_state.get_pending_download_path(&chunk.file_id).await {
+    let download_path = if let Some(existing) = wormhole_state
+        .get_pending_download_path(&chunk.file_id)
+        .await
+    {
         existing
     } else {
         let file = {
@@ -1297,7 +1287,11 @@ pub async fn handle_incoming_chunk(
         .await
         .context("write chunk data")?;
 
-    // Update progress
+    let bytes_transferred = chunk.offset + chunk.data.len() as u64;
+    if let Ok(conn) = state.db_write.lock() {
+        let _ = update_wormhole_progress(&conn, &chunk.file_id, bytes_transferred);
+    }
+
     if let Some(progress) = transfer.update_progress(chunk.data.len() as u64).await {
         let _ = app.emit("wormhole://transfer-progress", &progress);
     }
@@ -1331,12 +1325,17 @@ pub async fn handle_incoming_chunk(
             }
 
             wormhole_state.remove_transfer(&chunk.file_id).await;
-            wormhole_state.clear_pending_download_path(&chunk.file_id).await;
+            wormhole_state
+                .clear_pending_download_path(&chunk.file_id)
+                .await;
 
-            let _ = app.emit("wormhole://transfer-failed", serde_json::json!({
-                "file_id": chunk.file_id,
-                "reason": "Checksum verification failed"
-            }));
+            let _ = app.emit(
+                "wormhole://transfer-failed",
+                serde_json::json!({
+                    "file_id": chunk.file_id,
+                    "reason": "Checksum verification failed"
+                }),
+            );
 
             return Err(anyhow!("Checksum verification failed"));
         }
@@ -1352,12 +1351,17 @@ pub async fn handle_incoming_chunk(
         }
 
         wormhole_state.remove_transfer(&chunk.file_id).await;
-        wormhole_state.clear_pending_download_path(&chunk.file_id).await;
+        wormhole_state
+            .clear_pending_download_path(&chunk.file_id)
+            .await;
 
-        let _ = app.emit("wormhole://transfer-complete", serde_json::json!({
-            "file_id": chunk.file_id,
-            "path": download_path.to_string_lossy()
-        }));
+        let _ = app.emit(
+            "wormhole://transfer-complete",
+            serde_json::json!({
+                "file_id": chunk.file_id,
+                "path": download_path.to_string_lossy()
+            }),
+        );
 
         eprintln!(
             "[Wormhole] Download complete: {} -> {}",

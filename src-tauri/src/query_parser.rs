@@ -10,6 +10,7 @@ pub struct ParsedQuery {
     pub temporal_confidence: f32,
     pub content_type: Option<String>,
     pub source_apps: Vec<String>,
+    pub source_hints: Vec<String>,
     pub languages: Vec<String>,
     pub is_pinned: Option<bool>,
     pub min_length: Option<usize>,
@@ -281,15 +282,43 @@ const INTENT_EXPANSIONS: &[(&[&str], &[&str])] = &[
     // === Auth & Security ===
     (
         &["auth code", "verification code", "login code", "otp", "2fa"],
-        &["verification", "passcode", "one-time", "token", "signin"],
+        &[
+            "verification",
+            "passcode",
+            "one-time",
+            "token",
+            "signin",
+            "pin",
+            "security",
+        ],
     ),
     (
         &["password", "credentials", "login"],
-        &["username", "password", "email", "account", "secret"],
+        &[
+            "username",
+            "password",
+            "email",
+            "account",
+            "secret",
+            "credential",
+        ],
     ),
     (
         &["api key", "access token", "bearer token"],
-        &["secret", "bearer", "authorization", "token"],
+        &["secret", "bearer", "authorization", "token", "key", "auth"],
+    ),
+    // NEW: Auth/security related searches
+    (
+        &["that thing", "that code", "that login"],
+        &["password", "credential", "auth", "login", "code"],
+    ),
+    (
+        &["secret", "token", "key"],
+        &["api", "secret", "key", "token", "password"],
+    ),
+    (
+        &["ssh key", "private key"],
+        &["ssh", "key", "pem", "private", "connect"],
     ),
     // === Meetings & Calendar ===
     (
@@ -458,6 +487,43 @@ const INTENT_EXPANSIONS: &[(&[&str], &[&str])] = &[
     (
         &["message", "text message"],
         &["sms", "chat", "imessage", "conversation"],
+    ),
+    // NEW: General context searches
+    (
+        &["from slack", "slack message", "slack"],
+        &["slack", "message", "workspace", "channel", "chat"],
+    ),
+    (
+        &["from discord", "discord message"],
+        &["discord", "message", "server", "channel", "chat"],
+    ),
+    (
+        &["from teams", "teams message"],
+        &["teams", "microsoft", "message", "chat", "meeting"],
+    ),
+    (
+        &["from whatsapp", "whatsapp"],
+        &["whatsapp", "message", "chat", "conversation"],
+    ),
+    (
+        &["from email", "gmail", "outlook email"],
+        &["email", "gmail", "outlook", "inbox", "message"],
+    ),
+    (
+        &["from notion", "notion page"],
+        &["notion", "page", "doc", "workspace"],
+    ),
+    (
+        &["from figma", "figma design"],
+        &["figma", "design", "prototype", "link"],
+    ),
+    (
+        &["from vscode", "vscode", "from code"],
+        &["vscode", "code", "editor", "terminal", "snippet"],
+    ),
+    (
+        &["from terminal", "from terminal"],
+        &["terminal", "command", "bash", "shell", "zsh"],
     ),
     (
         &["deadline", "boss said", "due date"],
@@ -684,11 +750,12 @@ pub fn parse_query(raw: &str) -> ParsedQuery {
     }
     parsed.languages = languages;
 
-    let (source_apps, source_spans) = extract_source_apps(&remaining);
+    let (source_apps, source_hints, source_spans) = extract_source_apps(&remaining);
     if !source_spans.is_empty() {
         remaining = remove_spans(&remaining, &source_spans);
     }
     parsed.source_apps = source_apps;
+    parsed.source_hints = source_hints;
 
     let (content_type, is_pinned, min_length, is_multiline, meta_spans) = extract_meta(&remaining);
     if !meta_spans.is_empty() {
@@ -740,6 +807,7 @@ fn empty_query() -> ParsedQuery {
         temporal_confidence: 0.0,
         content_type: None,
         source_apps: vec![],
+        source_hints: vec![],
         languages: vec![],
         is_pinned: None,
         min_length: None,
@@ -798,8 +866,9 @@ fn extract_languages(q: &str) -> (Vec<String>, Vec<(usize, usize)>) {
     (langs, spans)
 }
 
-fn extract_source_apps(q: &str) -> (Vec<String>, Vec<(usize, usize)>) {
+fn extract_source_apps(q: &str) -> (Vec<String>, Vec<String>, Vec<(usize, usize)>) {
     let mut apps = Vec::new();
+    let mut hints = Vec::new();
     let mut spans = Vec::new();
     for re in [&*RE_SOURCE_STRICT, &*RE_SOURCE_FALLBACK] {
         for captures in re.captures_iter(q) {
@@ -815,6 +884,9 @@ fn extract_source_apps(q: &str) -> (Vec<String>, Vec<(usize, usize)>) {
             }
             let mapped = map_source_app(&captured);
             if mapped.is_empty() {
+                if captured.len() >= 2 && !hints.iter().any(|existing| existing == &captured) {
+                    hints.push(captured);
+                }
                 continue;
             }
             for value in mapped {
@@ -828,22 +900,27 @@ fn extract_source_apps(q: &str) -> (Vec<String>, Vec<(usize, usize)>) {
             break;
         }
     }
-    (apps, spans)
+    (apps, hints, spans)
 }
 
 fn map_source_app(captured: &str) -> Vec<String> {
-    if let Some((_, mapped)) = APP_MAP.iter().find(|(name, _)| *name == captured) {
+    if let Some((_, mapped)) = APP_MAP
+        .iter()
+        .find(|(name, mapped)| *name == captured || mapped.iter().any(|alias| *alias == captured))
+    {
         return mapped.iter().map(|value| (*value).to_string()).collect();
     }
 
     for (name, mapped) in APP_MAP {
-        if captured.contains(name) || name.contains(captured) {
+        if captured.len() >= 3
+            && (captured.contains(name)
+                || name.contains(captured)
+                || mapped
+                    .iter()
+                    .any(|alias| captured.contains(alias) || alias.contains(&captured)))
+        {
             return mapped.iter().map(|value| (*value).to_string()).collect();
         }
-    }
-
-    if captured.len() >= 2 {
-        return vec![captured.to_string()];
     }
 
     Vec::new()
@@ -1753,6 +1830,28 @@ mod tests {
         let parsed = parse_query("from Arc");
         assert!(parsed.source_apps.iter().any(|app| app == "arc"));
         assert!(parsed.semantic.is_empty());
+    }
+
+    #[test]
+    fn ambiguous_from_phrase_stays_semantic() {
+        let parsed = parse_query("from australia");
+        assert!(parsed.source_apps.is_empty());
+        assert!(parsed.source_hints.iter().any(|hint| hint == "australia"));
+        assert!(parsed.semantic.contains("australia"));
+        assert!(parsed.keywords.contains(&"australia".to_string()));
+    }
+
+    #[test]
+    fn unknown_source_app_becomes_hint() {
+        let parsed = parse_query("from File Explorer");
+        assert!(parsed.source_apps.is_empty());
+        assert!(
+            parsed
+                .source_hints
+                .iter()
+                .any(|hint| hint == "file explorer")
+        );
+        assert!(parsed.semantic.to_lowercase().contains("file explorer"));
     }
 
     #[test]
