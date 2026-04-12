@@ -31,13 +31,15 @@ Search by meaning, all locally.
 
 ---
 
-## Why Copi?
+## Overview
 
-Copi's a simple clipboard manager, with one distinct feature: semantic search through an embeddings model.
+Copi utilises semantic search through an embeddings model, and allows for search via natural language, letting you search with meaning. 
 
-Type *"japanese from arc about 3 weeks ago"* and it finds the japanese you copied three weeks ago. Type *"auth code from slack"* and it surfaces the 2FA code from this morning. Type *"that youtube video"* and it knows you mean a URL. 
+Type *"japanese from arc about 3 weeks ago"* and it finds the japanese you copied three weeks ago. 
 
-Copi _understands_ what you mean, and it does this entirely offline using a small AI model that runs on your machine. All free.
+Type *"auth code from slack"* and it surfaces the 2FA code from this morning. 
+
+Type *"that youtube video"* and it knows you mean a URL. 
 
 ---
 
@@ -97,7 +99,7 @@ Exclude any app by name or bundle ID. Password managers don't capture if you don
 <table> 
 <td width="50%">
 
-**🔄 Copi Sync and Wormhole (new!)**
+**🔄 Copi Sync and Wormhole**
 
 Sync your clipboard, pins, and collections across your devices instantly with Copi. Works cross-platform, fast and secure. Send larger files across your devices through Copi Wormhole. 
 
@@ -144,7 +146,7 @@ On first launch, Copi needs to download the embedding model.
 
 - Content classification - text, URL, code or image
 - OCR via platform specific APIs (Apple Vision on macOS, Windows Media OCR on Windows)
-- [Multilingual-e5-small](https://huggingface.co/intfloat/multilingual-e5-small) embeddings to semantically search your clips. All offline via ONNX runtime.
+- [Multilingual-e5-small](https://huggingface.co/intfloat/multilingual-e5-small) embeddings to semantically search your clips. On device via ONNX runtime.
 - SQLite to store everything and vector search. Blends BM25 keyword scores, vector cosine distance, recency, and more.
 
 ---
@@ -174,6 +176,6 @@ PRs are welcome.
 
 <div align="center">
 
-Made with <3 by [Pixlox](https://pixlox.me) and [Megumi Labs](https://github.com/MegumiLabs) 
+Made with <3 by [Pixlox](https://pixlox.me) and [Megumi Labs](https://github.com/MegumiLabs).
 
 </div>
