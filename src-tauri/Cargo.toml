@@ -40,7 +40,7 @@ tokenizers = { version = "=0.20.4", default-features = false, features = ["onig"
 syntect = "5"
 
 # Caching and performance
-lru = "0.12"
+lru = "0.16"
 
 # LAN sync dependencies
 mdns-sd = "0.11"                    # mDNS service discovery (Bonjour/Avahi)
@@ -51,7 +51,7 @@ anyhow = "1"
 chacha20poly1305 = { version = "0.10", features = ["std"] }
 hkdf = "0.12"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
-rand = "0.8"
+rand = "0.10"
 dirs = "5"                          # Platform-specific directories (for Downloads folder)
 
 # Desktop-only plugins
